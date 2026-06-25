@@ -12,9 +12,11 @@ import (
 )
 
 var (
-	ErrRunTraceNotFound   = errors.New("run trace not found")
-	ErrRunTraceNotFailed  = errors.New("run trace is not failed")
-	ErrRegressionNotFound = errors.New("regression case not found")
+	ErrRunTraceNotFound        = errors.New("run trace not found")
+	ErrRunTraceNotFailed       = errors.New("run trace is not failed")
+	ErrRegressionNotFound      = errors.New("regression case not found")
+	ErrRegressionNotReplayable = errors.New("regression case is not replayable")
+	ErrRegressionUnsupported   = errors.New("regression kind is not supported")
 )
 
 // RegressionCase is a durable fixture generated from a failed agentic run.
@@ -54,6 +56,33 @@ type RegressionSpan struct {
 	Status     string            `json:"status"`
 	DurationMs int64             `json:"durationMs,omitempty"`
 	Data       map[string]string `json:"data,omitempty"`
+}
+
+// RegressionRun records a replay attempt for a regression case.
+type RegressionRun struct {
+	ID         string                  `json:"id"`
+	CaseID     string                  `json:"caseId"`
+	TraceID    string                  `json:"traceId"`
+	RunTraceID string                  `json:"runTraceId,omitempty"`
+	StartedAt  time.Time               `json:"startedAt"`
+	EndedAt    time.Time               `json:"endedAt,omitempty"`
+	DurationMs int64                   `json:"durationMs,omitempty"`
+	Kind       string                  `json:"kind"`
+	Provider   string                  `json:"provider"`
+	Model      string                  `json:"model"`
+	WorkDir    string                  `json:"workDir,omitempty"`
+	Status     string                  `json:"status"` // running, passed, failed, unsupported
+	Error      string                  `json:"error,omitempty"`
+	Checks     []RegressionCheckResult `json:"checks,omitempty"`
+	Metadata   map[string]string       `json:"metadata,omitempty"`
+}
+
+type RegressionCheckResult struct {
+	Name     string `json:"name"`
+	Target   string `json:"target"`
+	Expected string `json:"expected"`
+	Observed string `json:"observed"`
+	Passed   bool   `json:"passed"`
 }
 
 // CreateRegressionCase turns a failed run trace into a durable regression fixture.
@@ -120,6 +149,106 @@ func (t *Tracker) RegressionCase(id string) (RegressionCase, error) {
 		}
 	}
 	return RegressionCase{}, ErrRegressionNotFound
+}
+
+func NewRegressionRun(c RegressionCase, provider, model, workDir, runTraceID string) RegressionRun {
+	if provider == "" {
+		provider = c.Provider
+	}
+	if model == "" {
+		model = c.Model
+	}
+	if workDir == "" {
+		workDir = c.WorkDir
+	}
+	now := time.Now().UTC()
+	return RegressionRun{
+		ID:         NewTraceID("regrun"),
+		CaseID:     c.ID,
+		TraceID:    c.TraceID,
+		RunTraceID: runTraceID,
+		StartedAt:  now,
+		Kind:       c.Kind,
+		Provider:   provider,
+		Model:      model,
+		WorkDir:    workDir,
+		Status:     "running",
+		Metadata: map[string]string{
+			"replayable": fmt.Sprintf("%v", c.Replayable),
+		},
+	}
+}
+
+func FinishRegressionRun(run *RegressionRun, c RegressionCase, passed bool, observed string, detail string) {
+	if run == nil {
+		return
+	}
+	now := time.Now().UTC()
+	run.EndedAt = now
+	run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
+	if observed == "" {
+		if passed {
+			observed = "ok"
+		} else {
+			observed = "failed"
+		}
+	}
+	if passed {
+		run.Status = "passed"
+	} else if run.Status == "unsupported" {
+		// Keep explicit unsupported status.
+	} else {
+		run.Status = "failed"
+	}
+	if detail != "" {
+		run.Error = detail
+	}
+	run.Checks = evaluateRegressionChecks(c, observed)
+}
+
+func MarkRegressionRunUnsupported(run *RegressionRun, c RegressionCase, detail string) {
+	if run == nil {
+		return
+	}
+	run.Status = "unsupported"
+	FinishRegressionRun(run, c, false, "unsupported", detail)
+}
+
+func (t *Tracker) RecordRegressionRun(run RegressionRun) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if run.ID == "" {
+		run.ID = NewTraceID("regrun")
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now().UTC()
+	}
+	if run.EndedAt.IsZero() {
+		run.EndedAt = time.Now().UTC()
+	}
+	if run.DurationMs == 0 {
+		run.DurationMs = run.EndedAt.Sub(run.StartedAt).Milliseconds()
+	}
+	if run.Status == "" {
+		run.Status = "failed"
+	}
+	t.regressionRuns = append(t.regressionRuns, run)
+	if len(t.regressionRuns) > 1000 {
+		t.regressionRuns = t.regressionRuns[len(t.regressionRuns)-500:]
+	}
+	t.appendRegressionRunToFile(run)
+}
+
+func (t *Tracker) RegressionRuns(limit int) []RegressionRun {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if limit <= 0 || limit > len(t.regressionRuns) {
+		limit = len(t.regressionRuns)
+	}
+	start := len(t.regressionRuns) - limit
+	result := make([]RegressionRun, limit)
+	copy(result, t.regressionRuns[start:])
+	return result
 }
 
 func buildRegressionCase(trace RunTrace) RegressionCase {
@@ -206,6 +335,24 @@ func regressionReplay(trace RunTrace, inputs map[string]string) (bool, string) {
 	return false, "No replay input is available for this run kind."
 }
 
+func evaluateRegressionChecks(c RegressionCase, observed string) []RegressionCheckResult {
+	results := make([]RegressionCheckResult, 0, len(c.Checks))
+	for _, check := range c.Checks {
+		got := observed
+		if check.Target != "run.status" && observed == "ok" {
+			got = "ok"
+		}
+		results = append(results, RegressionCheckResult{
+			Name:     check.Name,
+			Target:   check.Target,
+			Expected: check.Expected,
+			Observed: got,
+			Passed:   got == check.Expected,
+		})
+	}
+	return results
+}
+
 func (t *Tracker) writeRegressionCase(c RegressionCase) error {
 	path := filepath.Join(t.regressionDir, sanitizeRegressionID(c.ID)+".json")
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -248,6 +395,34 @@ func (t *Tracker) loadRegressionCases() {
 	sort.SliceStable(t.regressionCases, func(i, j int) bool {
 		return t.regressionCases[i].CreatedAt.Before(t.regressionCases[j].CreatedAt)
 	})
+}
+
+func (t *Tracker) regressionRunTodayFile() string {
+	return filepath.Join(t.regressionRunDir, time.Now().Format("2006-01-02")+".jsonl")
+}
+
+func (t *Tracker) appendRegressionRunToFile(run RegressionRun) {
+	f, err := os.OpenFile(t.regressionRunTodayFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	data, _ := json.Marshal(run)
+	f.Write(data)
+	f.Write([]byte("\n"))
+}
+
+func (t *Tracker) loadRegressionRunsToday() {
+	data, err := os.ReadFile(t.regressionRunTodayFile())
+	if err != nil {
+		return
+	}
+	for _, line := range splitLines(data) {
+		var run RegressionRun
+		if json.Unmarshal(line, &run) == nil {
+			t.regressionRuns = append(t.regressionRuns, run)
+		}
+	}
 }
 
 func sanitizeRegressionID(s string) string {

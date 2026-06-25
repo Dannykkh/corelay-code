@@ -180,6 +180,77 @@ func TestRunTraceRegressionAPI(t *testing.T) {
 	}
 }
 
+func TestRunRegressionChronosAPI(t *testing.T) {
+	workDir := t.TempDir()
+	tracker := observability.NewTracker(t.TempDir())
+	started := time.Now().UTC().Add(-time.Second)
+	tracker.RecordRun(observability.RunTrace{
+		ID:        "run_failed_replay",
+		Kind:      "chronos",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		WorkDir:   workDir,
+		Status:    "failed",
+		Error:     "verify failed",
+		Metadata: map[string]string{
+			"task":          "repair replay regression",
+			"verifyCommand": "go test ./...",
+			"maxCycles":     "1",
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "chronos",
+			Name:      "chronos.run",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "failed",
+		}},
+	})
+	c, err := tracker.CreateRegressionCase("run_failed_replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &agentLoopFakeProvider{text: "[COMPLETE]"}
+	s := New(provider, "fake-model", 0)
+	s.SetWorkDir(workDir)
+	s.SetTracker(tracker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/regressions/"+c.ID+"/run", nil)
+	req.SetPathValue("id", c.ID)
+	rec := httptest.NewRecorder()
+	s.handleRunRegressionCase(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run regression status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+	events := agentSSEEventTypes(t, rec.Body.String())
+	for _, want := range []string{"regression", "status", "text", "done", "regression_result", "stream_end"} {
+		if events[want] == 0 {
+			t.Fatalf("missing SSE event %q in %v\nbody=%s", want, events, rec.Body.String())
+		}
+	}
+
+	regressionRuns := tracker.RegressionRuns(10)
+	if len(regressionRuns) != 1 {
+		t.Fatalf("regression runs=%d, want 1", len(regressionRuns))
+	}
+	if regressionRuns[0].CaseID != c.ID || regressionRuns[0].Status != "passed" || regressionRuns[0].RunTraceID == "" {
+		t.Fatalf("unexpected regression run: %+v", regressionRuns[0])
+	}
+	runTraces := tracker.RecentRuns(10)
+	if len(runTraces) != 2 {
+		t.Fatalf("run traces=%d, want original failure + replay", len(runTraces))
+	}
+	replayTrace := runTraces[len(runTraces)-1]
+	if replayTrace.ID != regressionRuns[0].RunTraceID || replayTrace.Status != "ok" || replayTrace.Metadata["source"] != "regression" {
+		t.Fatalf("unexpected replay trace: %+v", replayTrace)
+	}
+}
+
 func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	t.Setenv("ANICLEW_MEMORY", "off")
 	t.Setenv("ANICLEW_AUTOSKILL", "off")

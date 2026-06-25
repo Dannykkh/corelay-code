@@ -212,6 +212,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/run-traces", s.handleRunTraces)
 	mux.HandleFunc("POST /api/run-traces/{id}/regression", s.handleCreateRegressionCase)
 	mux.HandleFunc("GET /api/regressions", s.handleRegressionCases)
+	mux.HandleFunc("POST /api/regressions/{id}/run", s.handleRunRegressionCase)
+	mux.HandleFunc("GET /api/regression-runs", s.handleRegressionRuns)
 	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("POST /api/feedback", s.handleAddFeedback)
 	mux.HandleFunc("GET /api/feedback", s.handleFeedbackStats)

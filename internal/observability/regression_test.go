@@ -78,3 +78,35 @@ func TestTrackerCreateRegressionCaseRejectsPassingRun(t *testing.T) {
 		t.Fatalf("CreateRegressionCase() error = %v, want ErrRunTraceNotFailed", err)
 	}
 }
+
+func TestTrackerRecordRegressionRunPersistsAndLoads(t *testing.T) {
+	dir := t.TempDir()
+	tracker := NewTracker(dir)
+	c := RegressionCase{
+		ID:         "reg_case",
+		TraceID:    "run_failed",
+		Kind:       "chronos",
+		Replayable: true,
+		Checks: []RegressionCheck{{
+			Name:     "run completes without failure",
+			Target:   "run.status",
+			Expected: "ok",
+			Observed: "failed",
+		}},
+	}
+	run := NewRegressionRun(c, "fake", "fake-model", dir, "run_replay")
+	FinishRegressionRun(&run, c, true, "ok", "")
+	tracker.RecordRegressionRun(run)
+
+	reloaded := NewTracker(dir)
+	runs := reloaded.RegressionRuns(1)
+	if len(runs) != 1 {
+		t.Fatalf("runs=%d, want 1", len(runs))
+	}
+	if runs[0].CaseID != "reg_case" || runs[0].RunTraceID != "run_replay" || runs[0].Status != "passed" {
+		t.Fatalf("unexpected regression run: %+v", runs[0])
+	}
+	if len(runs[0].Checks) != 1 || !runs[0].Checks[0].Passed {
+		t.Fatalf("unexpected check results: %+v", runs[0].Checks)
+	}
+}
