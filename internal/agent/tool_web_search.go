@@ -469,7 +469,8 @@ func fuseSearchResults(opts webSearchOptions, byProvider map[string][]webSearchR
 		providers []string
 	}
 	fused := map[string]*fusedResult{}
-	for provider, results := range byProvider {
+	for _, provider := range orderedSearchProviderNames(byProvider) {
+		results := byProvider[provider]
 		for _, raw := range results {
 			if strings.TrimSpace(raw.URL) == "" {
 				continue
@@ -540,6 +541,43 @@ func fuseSearchResults(opts webSearchOptions, byProvider map[string][]webSearchR
 		results[i].Rank = i + 1
 	}
 	return results
+}
+
+func orderedSearchProviderNames(byProvider map[string][]webSearchResult) []string {
+	names := make([]string, 0, len(byProvider))
+	for name := range byProvider {
+		names = append(names, name)
+	}
+	sort.SliceStable(names, func(i, j int) bool {
+		ri := searchProviderOrderRank(names[i])
+		rj := searchProviderOrderRank(names[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return names[i] < names[j]
+	})
+	return names
+}
+
+func searchProviderOrderRank(name string) int {
+	switch name {
+	case "duckduckgo":
+		return 10
+	case "google":
+		return 20
+	case "naver-web":
+		return 30
+	case "naver-blog":
+		return 40
+	case "bing":
+		return 50
+	case "yahoo":
+		return 60
+	case "ollama":
+		return 70
+	default:
+		return 100
+	}
 }
 
 func enrichSearchResult(raw webSearchResult, provider string, opts webSearchOptions) webSearchResult {
