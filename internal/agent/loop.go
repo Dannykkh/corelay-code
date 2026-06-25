@@ -705,7 +705,7 @@ func RunLoopWithOptions(
 				select {
 				case <-ctx.Done():
 					stopHeartbeat()
-					finishMakerSpan("error", map[string]string{"error": ctx.Err().Error()})
+					finishMakerSpan("failed", map[string]string{"error": ctx.Err().Error()})
 					failRun(opts.Recorder, ctx.Err().Error())
 					return
 				case <-time.After(2 * time.Second):
@@ -714,7 +714,7 @@ func RunLoopWithOptions(
 		}
 		if err != nil {
 			stopHeartbeat()
-			finishMakerSpan("error", map[string]string{"error": err.Error()})
+			finishMakerSpan("failed", map[string]string{"error": err.Error()})
 			failRun(opts.Recorder, fmt.Sprintf("Failed after 3 retries: %s", err.Error()))
 			eventCh <- Event{Type: "error", Data: fmt.Sprintf("Failed after 3 retries: %s", err.Error())}
 			return

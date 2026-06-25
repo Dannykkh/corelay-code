@@ -210,6 +210,8 @@ func (s *Server) Start() error {
 	// Observability
 	mux.HandleFunc("GET /api/traces", s.handleTraces)
 	mux.HandleFunc("GET /api/run-traces", s.handleRunTraces)
+	mux.HandleFunc("POST /api/run-traces/{id}/regression", s.handleCreateRegressionCase)
+	mux.HandleFunc("GET /api/regressions", s.handleRegressionCases)
 	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("POST /api/feedback", s.handleAddFeedback)
 	mux.HandleFunc("GET /api/feedback", s.handleFeedbackStats)
@@ -1438,6 +1440,52 @@ func (s *Server) handleRunTraces(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(q, "%d", &limit)
 	}
 	writeJSON(w, tracker.RecentRuns(limit))
+}
+
+func (s *Server) handleCreateRegressionCase(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	tracker := s.tracker
+	s.mu.RUnlock()
+	if tracker == nil {
+		writeError(w, 500, "Observability tracker not initialized")
+		return
+	}
+	traceID := strings.TrimSpace(r.PathValue("id"))
+	if traceID == "" {
+		var body struct {
+			TraceID string `json:"traceId"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		traceID = strings.TrimSpace(body.TraceID)
+	}
+	c, err := tracker.CreateRegressionCase(traceID)
+	if err != nil {
+		switch {
+		case errors.Is(err, observability.ErrRunTraceNotFound):
+			writeError(w, 404, "Run trace not found")
+		case errors.Is(err, observability.ErrRunTraceNotFailed):
+			writeError(w, 409, "Run trace is not failed")
+		default:
+			writeError(w, 500, err.Error())
+		}
+		return
+	}
+	writeJSON(w, c)
+}
+
+func (s *Server) handleRegressionCases(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	tracker := s.tracker
+	s.mu.RUnlock()
+	if tracker == nil {
+		writeJSON(w, []any{})
+		return
+	}
+	limit := 50
+	if q := r.URL.Query().Get("limit"); q != "" {
+		fmt.Sscanf(q, "%d", &limit)
+	}
+	writeJSON(w, tracker.RegressionCases(limit))
 }
 
 func (s *Server) handleAddFeedback(w http.ResponseWriter, r *http.Request) {

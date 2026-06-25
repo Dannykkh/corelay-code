@@ -78,26 +78,33 @@ type ProviderMetrics struct {
 
 // Tracker collects and queries request traces.
 type Tracker struct {
-	mu        sync.RWMutex
-	traces    []RequestTrace
-	runTraces []RunTrace
-	dir       string // persistence directory
-	runDir    string
+	mu              sync.RWMutex
+	traces          []RequestTrace
+	runTraces       []RunTrace
+	regressionCases []RegressionCase
+	dir             string // persistence directory
+	runDir          string
+	regressionDir   string
 }
 
 func NewTracker(baseDir string) *Tracker {
 	dir := filepath.Join(baseDir, "traces")
 	runDir := filepath.Join(baseDir, "run-traces")
+	regressionDir := filepath.Join(baseDir, "regressions")
 	os.MkdirAll(dir, 0755)
 	os.MkdirAll(runDir, 0755)
+	os.MkdirAll(regressionDir, 0755)
 	t := &Tracker{
-		traces:    make([]RequestTrace, 0, 10000),
-		runTraces: make([]RunTrace, 0, 1000),
-		dir:       dir,
-		runDir:    runDir,
+		traces:          make([]RequestTrace, 0, 10000),
+		runTraces:       make([]RunTrace, 0, 1000),
+		regressionCases: make([]RegressionCase, 0, 1000),
+		dir:             dir,
+		runDir:          runDir,
+		regressionDir:   regressionDir,
 	}
 	t.loadToday()
 	t.loadRunToday()
+	t.loadRegressionCases()
 	return t
 }
 

@@ -122,6 +122,64 @@ func TestRunTracesAPI(t *testing.T) {
 	}
 }
 
+func TestRunTraceRegressionAPI(t *testing.T) {
+	tracker := observability.NewTracker(t.TempDir())
+	started := time.Now().UTC().Add(-time.Second)
+	tracker.RecordRun(observability.RunTrace{
+		ID:        "run_failed_api",
+		Kind:      "chronos",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		Status:    "failed",
+		Error:     "verify failed",
+		Metadata: map[string]string{
+			"task":          "repair api regression",
+			"verifyCommand": "go test ./...",
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "chronos",
+			Name:      "chronos.run",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "failed",
+		}},
+	})
+
+	s := New(nil, "", 0)
+	s.SetTracker(tracker)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/run-traces/run_failed_api/regression", nil)
+	createReq.SetPathValue("id", "run_failed_api")
+	createRec := httptest.NewRecorder()
+	s.handleCreateRegressionCase(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create regression status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created observability.RegressionCase
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create regression json: %v", err)
+	}
+	if created.TraceID != "run_failed_api" || !created.Replayable || created.Failure.Error != "verify failed" {
+		t.Fatalf("unexpected created regression: %+v", created)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/regressions?limit=1", nil)
+	listRec := httptest.NewRecorder()
+	s.handleRegressionCases(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list regressions status=%d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listed []observability.RegressionCase
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("list regressions json: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != created.ID {
+		t.Fatalf("unexpected listed regressions: %+v", listed)
+	}
+}
+
 func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	t.Setenv("ANICLEW_MEMORY", "off")
 	t.Setenv("ANICLEW_AUTOSKILL", "off")
