@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	maxToolResultSize = 50000 // 50KB per tool result
+	maxToolResultSize = 50000  // 50KB per tool result
 	maxMessageSize    = 100000 // 100KB per message
-	maxTotalMessages  = 200   // conversation cap
+	maxTotalMessages  = 200    // conversation cap
 )
 
 // NormalizeMessages prepares messages for the LLM API.
@@ -21,6 +21,7 @@ func NormalizeMessages(messages []types.Message) []types.Message {
 		return messages
 	}
 
+	messages = HoistToolResults(messages)
 	messages = mergeConsecutiveSameRole(messages)
 	messages = truncateLargeContent(messages)
 	messages = ensureAlternatingRoles(messages)
@@ -161,9 +162,40 @@ func truncateArrayContent(content json.RawMessage) json.RawMessage {
 // HoistToolResults moves tool results that appear in assistant messages
 // to proper user-role tool_result messages.
 func HoistToolResults(messages []types.Message) []types.Message {
-	// Tool results should be in user messages, not assistant messages
-	// This fixes cases where the agent loop incorrectly places them
-	return messages // TODO: implement if needed
+	result := make([]types.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role != "assistant" || !isArrayContent(msg.Content) {
+			result = append(result, msg)
+			continue
+		}
+
+		var blocks []types.ContentBlockParam
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			result = append(result, msg)
+			continue
+		}
+
+		var assistantBlocks []types.ContentBlockParam
+		var toolResults []types.ContentBlockParam
+		for _, block := range blocks {
+			if block.Type == "tool_result" {
+				toolResults = append(toolResults, block)
+			} else {
+				assistantBlocks = append(assistantBlocks, block)
+			}
+		}
+		if len(toolResults) == 0 {
+			result = append(result, msg)
+			continue
+		}
+		if len(assistantBlocks) > 0 {
+			content, _ := json.Marshal(assistantBlocks)
+			result = append(result, types.Message{Role: "assistant", Content: content})
+		}
+		content, _ := json.Marshal(toolResults)
+		result = append(result, types.Message{Role: "user", Content: content})
+	}
+	return result
 }
 
 // ── Helpers ──

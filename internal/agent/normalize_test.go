@@ -95,6 +95,47 @@ func TestCapMessageCount(t *testing.T) {
 	}
 }
 
+func TestHoistToolResultsMovesAssistantToolResultsToUser(t *testing.T) {
+	content := json.RawMessage(`[
+		{"type":"text","text":"reading"},
+		{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}
+	]`)
+	messages := []types.Message{{Role: "assistant", Content: content}}
+
+	result := HoistToolResults(messages)
+
+	if len(result) != 2 {
+		t.Fatalf("messages = %d, want 2", len(result))
+	}
+	if result[0].Role != "assistant" {
+		t.Fatalf("first role = %q", result[0].Role)
+	}
+	if result[1].Role != "user" {
+		t.Fatalf("second role = %q", result[1].Role)
+	}
+	var toolBlocks []types.ContentBlockParam
+	if err := json.Unmarshal(result[1].Content, &toolBlocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(toolBlocks) != 1 || toolBlocks[0].Type != "tool_result" || toolBlocks[0].ToolUseID != "toolu_1" {
+		t.Fatalf("tool result blocks = %+v", toolBlocks)
+	}
+}
+
+func TestNormalizeMessagesHoistsToolResultsBeforeRoleRepair(t *testing.T) {
+	content := json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]`)
+	messages := []types.Message{{Role: "assistant", Content: content}}
+
+	result := NormalizeMessages(messages)
+
+	if len(result) != 1 {
+		t.Fatalf("messages = %d, want 1", len(result))
+	}
+	if result[0].Role != "user" {
+		t.Fatalf("role = %q, want user", result[0].Role)
+	}
+}
+
 func TestNormalizeMessages_Integration(t *testing.T) {
 	messages := []types.Message{
 		makeMsg("user", "hello"),
