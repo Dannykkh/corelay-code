@@ -2506,6 +2506,7 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	provider := s.activeProvider
 	model := s.activeModel
 	workDir := s.workDir
+	tracker := s.tracker
 	s.mu.RUnlock()
 
 	if provider == nil {
@@ -2514,14 +2515,23 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name          string `json:"name"`
-		VerifyCommand string `json:"verifyCommand"`
+		Name          string               `json:"name"`
+		Objective     string               `json:"objective"`
+		VerifyCommand string               `json:"verifyCommand"`
+		WorkstreamID  string               `json:"workstreamId"`
+		Capacity      agent.CapacityConfig `json:"capacity"`
 		Tasks         []struct {
-			ID          string   `json:"id"`
-			Name        string   `json:"name"`
-			Description string   `json:"description"`
-			Files       []string `json:"files"`
-			DependsOn   []string `json:"dependsOn"`
+			ID          string                   `json:"id"`
+			Name        string                   `json:"name"`
+			Description string                   `json:"description"`
+			Kind        string                   `json:"kind"`
+			Role        string                   `json:"role"`
+			Provider    string                   `json:"provider"`
+			Model       string                   `json:"model"`
+			ReadOnly    bool                     `json:"readOnly"`
+			Resources   agent.AgentTaskResources `json:"resources"`
+			Files       []string                 `json:"files"`
+			DependsOn   []string                 `json:"dependsOn"`
 		} `json:"tasks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -2539,20 +2549,88 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 
 	home, _ := os.UserHomeDir()
 	baseDir := filepath.Join(home, ".claude-proxy")
-
-	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
-		Name:          body.Name,
+	teamName := strings.TrimSpace(body.Name)
+	if teamName == "" {
+		teamName = "api-team"
+	}
+	objective := strings.TrimSpace(body.Objective)
+	if objective == "" {
+		objective = teamName
+	}
+	plan := agent.TeamPlan{
+		Version:       1,
+		Name:          teamName,
+		Objective:     objective,
 		VerifyCommand: body.VerifyCommand,
-	})
+		Capacity:      body.Capacity,
+		Tasks:         make([]agent.AgentTask, 0, len(body.Tasks)),
+	}
 
 	for _, t := range body.Tasks {
-		team.AddTask(agent.TeamTask{
+		kind := agent.TaskKind(strings.TrimSpace(t.Kind))
+		files := serverTeamTaskFiles(string(kind), t.ReadOnly, t.Files)
+		dependsOn := compactStringList(t.DependsOn)
+		plan.Tasks = append(plan.Tasks, agent.AgentTask{
 			ID:          t.ID,
 			Name:        t.Name,
+			Kind:        kind,
+			Role:        t.Role,
+			Goal:        t.Description,
 			Description: t.Description,
-			Files:       t.Files,
-			DependsOn:   t.DependsOn,
+			Files:       files,
+			DependsOn:   dependsOn,
+			ReadOnly:    t.ReadOnly,
+			Provider:    t.Provider,
+			Model:       t.Model,
+			Resources:   t.Resources,
 		})
+	}
+	if err := agent.ValidateTeamPlan(plan); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	traceID := observability.NewTraceID("run")
+
+	var ws *workstream.Workstream
+	var wsStore *workstream.Store
+	workstreamContext := ""
+	if strings.TrimSpace(body.WorkstreamID) != "" {
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(strings.TrimSpace(body.WorkstreamID))
+		if err != nil {
+			writeError(w, 404, err.Error())
+			return
+		}
+		ws = loaded
+		workstreamContext = workstream.RenderContext(*ws, 2000)
+		if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+			Type:    "team_run_started",
+			Message: "Team run started",
+			Data: map[string]string{
+				"provider":  provider.Name(),
+				"model":     model,
+				"traceId":   traceID,
+				"teamName":  teamName,
+				"objective": objective,
+				"taskCount": fmt.Sprintf("%d", len(plan.Tasks)),
+			},
+		}); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+
+	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
+		Name:              teamName,
+		VerifyCommand:     body.VerifyCommand,
+		Capacity:          body.Capacity,
+		WorkstreamContext: workstreamContext,
+		ProviderFactory: func(name string) (types.Provider, error) {
+			return providers.Create(name, &types.ProviderConfig{})
+		},
+	})
+	for _, task := range plan.ToTeamTasks() {
+		team.AddTask(task)
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2560,26 +2638,69 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(200)
 
+	sessionEvent, _ := json.Marshal(agent.Event{
+		Type: "session",
+		Data: map[string]string{"workDir": workDir, "traceId": traceID},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", sessionEvent)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	if ws != nil {
+		workstreamEvent, _ := json.Marshal(agent.Event{
+			Type: "workstream",
+			Data: map[string]any{
+				"id":         ws.ID,
+				"title":      ws.Title,
+				"status":     ws.Status,
+				"nextAction": ws.NextAction,
+				"traceId":    traceID,
+			},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", workstreamEvent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
 	eventCh := make(chan agent.Event, 64)
+	traceStartedAt := time.Now().UTC()
 
 	go func() {
 		defer close(eventCh)
+		verification := agent.ReceiptVerification{Status: "not-run", Source: "none"}
+		runStatus := "completed"
+		failureDetail := ""
 
 		if err := team.ExecuteWaves(r.Context(), eventCh); err != nil {
+			runStatus = "failed"
+			failureDetail = err.Error()
 			eventCh <- agent.Event{Type: "error", Data: err.Error()}
+			eventCh <- agent.Event{Type: "text", Data: "\n\n" + team.Summary()}
+			receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification)
+			recordServerTeamRun(tracker, wsStore, ws, traceID, traceStartedAt, receipt, receiptPath, failureDetail)
+			team.Shutdown()
+			eventCh <- agent.Event{Type: "done", Data: nil}
+			return
 		}
 
 		// Verify if command configured
 		if body.VerifyCommand != "" {
 			passed, detail := team.Verify(r.Context())
 			if passed {
+				verification = agent.ReceiptVerification{Status: "passed", Source: "team-verify"}
 				eventCh <- agent.Event{Type: "status", Data: "Verification PASSED"}
 			} else {
+				runStatus = "failed"
+				failureDetail = detail
+				verification = agent.ReceiptVerification{Status: "failed", Source: "team-verify"}
 				eventCh <- agent.Event{Type: "status", Data: "Verification FAILED: " + detail}
 			}
 		}
 
 		eventCh <- agent.Event{Type: "text", Data: "\n\n" + team.Summary()}
+		receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification)
+		recordServerTeamRun(tracker, wsStore, ws, traceID, traceStartedAt, receipt, receiptPath, failureDetail)
 		team.Shutdown()
 		eventCh <- agent.Event{Type: "done", Data: nil}
 	}()
@@ -2591,6 +2712,162 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 			f.Flush()
 		}
 	}
+	fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func emitServerTeamReceipt(eventCh chan<- agent.Event, team *agent.Team, plan agent.TeamPlan, baseDir, workDir, status string, verification agent.ReceiptVerification) (agent.TeamRunReceipt, string) {
+	receipt := team.BuildRunReceipt(plan, status, verification)
+	path, err := agent.WriteTeamRunReceipt(baseDir, workDir, receipt)
+	if err != nil {
+		eventCh <- agent.Event{Type: "status", Data: "Team receipt write failed: " + err.Error()}
+		return receipt, ""
+	}
+	eventCh <- agent.Event{Type: "status", Data: "Team receipt saved: " + path}
+	return receipt, path
+}
+
+func recordServerTeamRun(tracker *observability.Tracker, wsStore *workstream.Store, ws *workstream.Workstream, traceID string, startedAt time.Time, receipt agent.TeamRunReceipt, receiptPath string, detail string) {
+	status := "ok"
+	if receipt.Status == "failed" || receipt.Verification.Status == "failed" {
+		status = "failed"
+	}
+	if !startedAt.IsZero() {
+		startedAt = startedAt.UTC()
+	} else {
+		startedAt = time.Now().UTC()
+	}
+	endedAt := time.Now().UTC()
+	durationMs := endedAt.Sub(startedAt).Milliseconds()
+	metadata := map[string]string{
+		"source":       "api.team",
+		"teamName":     receipt.TeamName,
+		"planName":     receipt.PlanName,
+		"objective":    receipt.Objective,
+		"taskCount":    fmt.Sprintf("%d", receipt.TaskCount),
+		"completed":    fmt.Sprintf("%d", receipt.Completed),
+		"failed":       fmt.Sprintf("%d", receipt.Failed),
+		"toolCalls":    fmt.Sprintf("%d", receipt.ToolCalls),
+		"verification": receipt.Verification.Status,
+		"receipt":      receiptPath,
+	}
+	workstreamID := ""
+	if ws != nil {
+		workstreamID = ws.ID
+	}
+	trace := observability.RunTrace{
+		ID:           traceID,
+		Kind:         "team",
+		StartedAt:    startedAt,
+		EndedAt:      endedAt,
+		DurationMs:   durationMs,
+		Provider:     receipt.Provider,
+		Model:        receipt.Model,
+		WorkDir:      receipt.WorkDir,
+		WorkstreamID: workstreamID,
+		Status:       status,
+		Error:        detail,
+		Metadata:     metadata,
+		Spans: []observability.RunSpan{
+			{
+				ID:         "team-run",
+				Name:       "team.run",
+				StartedAt:  startedAt,
+				EndedAt:    endedAt,
+				DurationMs: durationMs,
+				Status:     status,
+				Data: map[string]string{
+					"teamName":     receipt.TeamName,
+					"taskCount":    fmt.Sprintf("%d", receipt.TaskCount),
+					"completed":    fmt.Sprintf("%d", receipt.Completed),
+					"failed":       fmt.Sprintf("%d", receipt.Failed),
+					"verification": receipt.Verification.Status,
+				},
+			},
+			{
+				ID:         "team-receipt",
+				Name:       "team.receipt",
+				StartedAt:  endedAt,
+				EndedAt:    endedAt,
+				DurationMs: 0,
+				Status:     "ok",
+				Data:       map[string]string{"path": receiptPath},
+			},
+		},
+	}
+	if tracker != nil {
+		tracker.RecordRun(trace)
+	}
+	if wsStore == nil || ws == nil {
+		return
+	}
+	verification := workstream.VerificationResult{
+		Status:  receipt.Verification.Status,
+		Source:  "team",
+		Summary: "team run completed",
+	}
+	if verification.Status == "" {
+		verification.Status = "not-run"
+	}
+	if status == "failed" {
+		verification.Status = "failed"
+		if detail != "" {
+			verification.Summary = detail
+		} else {
+			verification.Summary = "team run failed"
+		}
+	}
+	if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+		log.Printf("[workstream] record team verification failed: %v", err)
+	}
+	eventType := "team_run_completed"
+	message := "Team run completed"
+	if status == "failed" {
+		eventType = "team_run_failed"
+		message = "Team run failed"
+	}
+	data := map[string]string{
+		"provider":     receipt.Provider,
+		"model":        receipt.Model,
+		"traceId":      traceID,
+		"teamName":     receipt.TeamName,
+		"taskCount":    fmt.Sprintf("%d", receipt.TaskCount),
+		"completed":    fmt.Sprintf("%d", receipt.Completed),
+		"failed":       fmt.Sprintf("%d", receipt.Failed),
+		"verification": receipt.Verification.Status,
+		"receipt":      receiptPath,
+	}
+	if detail != "" {
+		data["error"] = detail
+	}
+	if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+		Type:    eventType,
+		Message: message,
+		Data:    data,
+	}); err != nil {
+		log.Printf("[workstream] record team completion failed: %v", err)
+	}
+}
+
+func serverTeamTaskFiles(kind string, readOnly bool, files []string) []string {
+	cleaned := compactStringList(files)
+	if len(cleaned) == 0 && !readOnly && strings.TrimSpace(kind) == "" {
+		return []string{"**"}
+	}
+	return cleaned
+}
+
+func compactStringList(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+	return cleaned
 }
 
 // ── Chronos (Autonomous Loop) ──

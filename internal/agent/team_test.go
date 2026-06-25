@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -144,6 +146,89 @@ func TestCheckFileOwnership(t *testing.T) {
 	if !ok {
 		t.Error("Unowned files should be allowed")
 	}
+}
+
+func TestSelectWaveBatchRespectsModelResources(t *testing.T) {
+	team := &Team{
+		config: TeamConfig{
+			Name:     "test",
+			Capacity: CapacityConfig{ModelSlots: 2, ToolSlots: 2, WebFetchSlots: 2, TestSlots: 1, MaxParallelTasks: 3, FileScopeLock: true},
+		},
+	}
+	batch := team.selectWaveBatch([]*TeamTask{
+		{ID: "a", Kind: TaskKindImplement, Files: []string{"src/api/**"}, Resources: AgentTaskResources{ModelSlots: 2}},
+		{ID: "b", Kind: TaskKindImplement, Files: []string{"src/ui/**"}, Resources: AgentTaskResources{ModelSlots: 1}},
+		{ID: "c", Kind: TaskKindReview, ReadOnly: true, Resources: AgentTaskResources{ModelSlots: 1}},
+	})
+
+	if len(batch) != 1 || batch[0].ID != "a" {
+		t.Fatalf("batch = %s, want only a because it consumes both model slots", teamTaskIDs(batch))
+	}
+}
+
+func TestSelectWaveBatchRespectsFileScopeLocks(t *testing.T) {
+	team := &Team{
+		config: TeamConfig{
+			Name:     "test",
+			Capacity: CapacityConfig{ModelSlots: 3, ToolSlots: 2, WebFetchSlots: 2, TestSlots: 1, MaxParallelTasks: 3, FileScopeLock: true},
+		},
+	}
+	batch := team.selectWaveBatch([]*TeamTask{
+		{ID: "a", Kind: TaskKindImplement, Files: []string{"src/api/**"}},
+		{ID: "b", Kind: TaskKindImplement, Files: []string{"src/api/handler.go"}},
+		{ID: "c", Kind: TaskKindReview, ReadOnly: true},
+	})
+
+	if got := teamTaskIDs(batch); got != "a,c" {
+		t.Fatalf("batch = %s, want a,c; b conflicts with a's file scope", got)
+	}
+}
+
+func TestExecuteToolWithOptionsUsesWorkerScopedOwnership(t *testing.T) {
+	oldChecker := FileOwnershipChecker
+	oldWorkerID := activeWorkerID
+	defer func() {
+		FileOwnershipChecker = oldChecker
+		activeWorkerID = oldWorkerID
+	}()
+
+	globalCalled := false
+	FileOwnershipChecker = func(string, string) (bool, string) {
+		globalCalled = true
+		return true, ""
+	}
+	activeWorkerID = "worker-t2"
+
+	team := &Team{
+		config: TeamConfig{Name: "test"},
+		tasks: []*TeamTask{
+			{ID: "t1", AssignedTo: "worker-t1", Status: "running", Files: []string{"src/api/**"}},
+			{ID: "t2", AssignedTo: "worker-t2", Status: "running", Files: []string{"src/ui/**"}},
+		},
+	}
+	input, _ := json.Marshal(map[string]string{
+		"file_path": "src/ui/App.tsx",
+		"content":   "blocked",
+	})
+
+	out, isErr := ExecuteToolWithOptions("Write", input, t.TempDir(), ToolExecutionOptions{
+		WorkerID:         "worker-t1",
+		OwnershipChecker: team.CheckFileOwnership,
+	})
+	if !isErr || !strings.Contains(out, "OWNERSHIP BLOCKED") {
+		t.Fatalf("expected ownership block, got isErr=%v out=%q", isErr, out)
+	}
+	if globalCalled {
+		t.Fatal("global ownership checker should not be used when options provide a checker")
+	}
+}
+
+func teamTaskIDs(tasks []*TeamTask) string {
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		ids = append(ids, task.ID)
+	}
+	return strings.Join(ids, ",")
 }
 
 func TestTeamSummary(t *testing.T) {

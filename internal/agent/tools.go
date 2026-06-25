@@ -116,15 +116,25 @@ func AllToolDefs(workDir string) []types.ToolDef {
 	return filterEgressTools(all)
 }
 
-// FileOwnershipChecker is set by Team to enforce file ownership at execution time.
+// FileOwnershipChecker is the legacy fallback ownership guard. Team workers use
+// explicit ToolExecutionOptions so parallel workers do not share worker IDs.
 // Returns (allowed, reason). If nil, all writes are allowed.
 var FileOwnershipChecker func(workerID, filePath string) (bool, string)
 
-// activeWorkerID is set per-goroutine to identify the current worker.
+// activeWorkerID is the legacy fallback worker identifier.
 var activeWorkerID string
+
+type ToolExecutionOptions struct {
+	WorkerID         string
+	OwnershipChecker func(workerID, filePath string) (bool, string)
+}
 
 // ExecuteTool runs a tool and returns the result text.
 func ExecuteTool(name string, input json.RawMessage, workDir string) (string, bool) {
+	return ExecuteToolWithOptions(name, input, workDir, ToolExecutionOptions{})
+}
+
+func ExecuteToolWithOptions(name string, input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	// ── Air-gap: refuse internet-egress tools (defense in depth — they are
 	//    already stripped from AllToolDefs, this catches forced/cached calls) ──
 	if OfflineMode() && egressTools[name] {
@@ -132,14 +142,22 @@ func ExecuteTool(name string, input json.RawMessage, workDir string) (string, bo
 	}
 
 	// ── File ownership enforcement for write tools ──
-	if FileOwnershipChecker != nil && activeWorkerID != "" {
+	ownershipChecker := opts.OwnershipChecker
+	if ownershipChecker == nil {
+		ownershipChecker = FileOwnershipChecker
+	}
+	workerID := strings.TrimSpace(opts.WorkerID)
+	if workerID == "" {
+		workerID = activeWorkerID
+	}
+	if ownershipChecker != nil && workerID != "" {
 		if name == "Write" || name == "Edit" {
 			var args struct {
 				FilePath string `json:"file_path"`
 			}
 			json.Unmarshal(input, &args)
 			if args.FilePath != "" {
-				allowed, reason := FileOwnershipChecker(activeWorkerID, args.FilePath)
+				allowed, reason := ownershipChecker(workerID, args.FilePath)
 				if !allowed {
 					return fmt.Sprintf("[OWNERSHIP BLOCKED] %s", reason), true
 				}

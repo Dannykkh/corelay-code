@@ -19,27 +19,39 @@ import (
 
 // TeamConfig holds team-level settings.
 type TeamConfig struct {
-	Name          string        `json:"name"`
-	MaxWaveSize   int           `json:"maxWaveSize"`   // max agents per wave (default 5)
-	CycleTimeout  time.Duration `json:"cycleTimeout"`  // per-wave timeout
-	VerifyCommand string        `json:"verifyCommand"` // verification command
+	Name              string          `json:"name"`
+	MaxWaveSize       int             `json:"maxWaveSize"`   // max agents per wave (default 5)
+	CycleTimeout      time.Duration   `json:"cycleTimeout"`  // per-wave timeout
+	VerifyCommand     string          `json:"verifyCommand"` // verification command
+	Capacity          CapacityConfig  `json:"capacity,omitempty"`
+	WorkstreamContext string          `json:"-"`
+	ProviderFactory   ProviderFactory `json:"-"`
 }
+
+type ProviderFactory func(name string) (types.Provider, error)
 
 // TeamTask represents a task with dependencies.
 type TeamTask struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Description  string    `json:"description"`
-	Files        []string  `json:"files"`       // owned files (exclusive)
-	DependsOn    []string  `json:"dependsOn"`   // task IDs that must complete first
-	Status       string    `json:"status"`       // pending, running, completed, failed
-	AssignedTo   string    `json:"assignedTo"`   // worker agent ID
-	Result       string    `json:"result,omitempty"`
-	ToolCalls    int       `json:"toolCalls"`
-	Wave         int       `json:"wave"`         // computed wave number
-	CreatedAt    time.Time `json:"createdAt"`
-	StartedAt    time.Time `json:"startedAt,omitempty"`
-	FinishedAt   time.Time `json:"finishedAt,omitempty"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Kind        TaskKind           `json:"kind,omitempty"`
+	Role        string             `json:"role,omitempty"`
+	Provider    string             `json:"provider,omitempty"`
+	Model       string             `json:"model,omitempty"`
+	ReadOnly    bool               `json:"readOnly,omitempty"`
+	Resources   AgentTaskResources `json:"resources,omitempty"`
+	Files       []string           `json:"files"`      // owned files (exclusive)
+	DependsOn   []string           `json:"dependsOn"`  // task IDs that must complete first
+	Status      string             `json:"status"`     // pending, running, completed, failed
+	AssignedTo  string             `json:"assignedTo"` // worker agent ID
+	Result      string             `json:"result,omitempty"`
+	OutputPath  string             `json:"outputPath,omitempty"`
+	ToolCalls   int                `json:"toolCalls"`
+	Wave        int                `json:"wave"` // computed wave number
+	CreatedAt   time.Time          `json:"createdAt"`
+	StartedAt   time.Time          `json:"startedAt,omitempty"`
+	FinishedAt  time.Time          `json:"finishedAt,omitempty"`
 }
 
 // Team manages the Lead/Worker orchestration.
@@ -57,14 +69,14 @@ type Team struct {
 }
 
 type workerState struct {
-	ID          string
-	Name        string
-	TaskID      string
-	Status      string // running, idle, shutdown
-	StartedAt   time.Time
-	IdleSince   time.Time
-	cancel      context.CancelFunc
-	onIdle      []func(string) // callbacks when worker becomes idle
+	ID        string
+	Name      string
+	TaskID    string
+	Status    string // running, idle, shutdown
+	StartedAt time.Time
+	IdleSince time.Time
+	cancel    context.CancelFunc
+	onIdle    []func(string) // callbacks when worker becomes idle
 }
 
 // NewTeam creates a team orchestrator.
@@ -75,6 +87,11 @@ func NewTeam(provider types.Provider, model, workDir, baseDir string, cfg TeamCo
 	if cfg.CycleTimeout <= 0 {
 		cfg.CycleTimeout = 5 * time.Minute
 	}
+	localProvider := false
+	if provider != nil {
+		localProvider = isLocalProvider(provider.Name())
+	}
+	cfg.Capacity = cfg.Capacity.Normalized(localProvider)
 	return &Team{
 		config:   cfg,
 		tasks:    make([]*TeamTask, 0),
@@ -227,31 +244,158 @@ func (t *Team) executeWave(ctx context.Context, waveIdx int, taskIDs []string) e
 	waveCtx, cancel := context.WithTimeout(ctx, t.config.CycleTimeout)
 	defer cancel()
 
-	var wg sync.WaitGroup
-
+	pending := make([]*TeamTask, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
 		task := t.getTask(taskID)
 		if task == nil {
 			continue
 		}
-
-		wg.Add(1)
-		go func(tt *TeamTask) {
-			defer wg.Done()
-			t.executeTask(waveCtx, tt)
-		}(task)
+		pending = append(pending, task)
 	}
 
-	wg.Wait()
+	batchIndex := 0
+	for len(pending) > 0 {
+		if err := waveCtx.Err(); err != nil {
+			return err
+		}
+		batch := t.selectWaveBatch(pending)
+		if len(batch) == 0 {
+			return fmt.Errorf("no runnable tasks fit configured capacity in wave %d", waveIdx)
+		}
+		batchIndex++
+		if len(batch) < len(pending) {
+			ids := make([]string, 0, len(batch))
+			for _, task := range batch {
+				ids = append(ids, task.ID)
+			}
+			t.report(fmt.Sprintf("Wave %d batch %d: %d/%d tasks (%s)", waveIdx+1, batchIndex, len(batch), len(pending), strings.Join(ids, ", ")))
+		}
 
-	// Check all tasks in wave completed
-	for _, taskID := range taskIDs {
-		task := t.getTask(taskID)
-		if task != nil && task.Status != "completed" {
-			return fmt.Errorf("task %s did not complete (status: %s)", taskID, task.Status)
+		if err := t.runWaveBatch(waveCtx, batch); err != nil {
+			return err
+		}
+
+		completedBatch := map[string]bool{}
+		for _, task := range batch {
+			completedBatch[task.ID] = true
+		}
+		nextPending := pending[:0]
+		for _, task := range pending {
+			if !completedBatch[task.ID] {
+				nextPending = append(nextPending, task)
+			}
+		}
+		pending = nextPending
+	}
+
+	return nil
+}
+
+func (t *Team) selectWaveBatch(tasks []*TeamTask) []*TeamTask {
+	candidates := append([]*TeamTask(nil), tasks...)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].ID < candidates[j].ID
+	})
+
+	capacity := t.config.Capacity
+	if capacity.MaxParallelTasks <= 0 {
+		capacity = capacity.Normalized(false)
+	}
+	selected := make([]*TeamTask, 0, capacity.MaxParallelTasks)
+	used := AgentTaskResources{}
+
+	for _, task := range candidates {
+		if capacity.MaxParallelTasks > 0 && len(selected) >= capacity.MaxParallelTasks {
+			break
+		}
+		need := teamTaskResources(task)
+		if !resourcesFit(capacity, used, need) {
+			continue
+		}
+		if capacity.FileScopeLock && conflictsWithSelectedTeamTask(task, selected) {
+			continue
+		}
+		selected = append(selected, task)
+		used.ModelSlots += need.ModelSlots
+		used.ToolSlots += need.ToolSlots
+		used.WebFetchSlots += need.WebFetchSlots
+		used.TestSlots += need.TestSlots
+	}
+
+	return selected
+}
+
+func teamTaskResources(task *TeamTask) AgentTaskResources {
+	if task == nil {
+		return AgentTaskResources{ModelSlots: 1}
+	}
+	resources := task.Resources
+	if resources.ModelSlots <= 0 {
+		resources.ModelSlots = 1
+	}
+	if resources.TestSlots <= 0 && task.Kind == TaskKindVerify {
+		resources.TestSlots = 1
+	}
+	return resources
+}
+
+func resourcesFit(capacity CapacityConfig, used, need AgentTaskResources) bool {
+	return resourceSlotFits(capacity.ModelSlots, used.ModelSlots, need.ModelSlots) &&
+		resourceSlotFits(capacity.ToolSlots, used.ToolSlots, need.ToolSlots) &&
+		resourceSlotFits(capacity.WebFetchSlots, used.WebFetchSlots, need.WebFetchSlots) &&
+		resourceSlotFits(capacity.TestSlots, used.TestSlots, need.TestSlots)
+}
+
+func resourceSlotFits(limit, used, need int) bool {
+	if limit <= 0 {
+		return true
+	}
+	return used+need <= limit
+}
+
+func conflictsWithSelectedTeamTask(task *TeamTask, selected []*TeamTask) bool {
+	for _, other := range selected {
+		if teamTasksConflict(task, other) {
+			return true
 		}
 	}
+	return false
+}
 
+func teamTasksConflict(a, b *TeamTask) bool {
+	if a == nil || b == nil || a.ReadOnly || b.ReadOnly {
+		return false
+	}
+	if len(a.Files) == 0 || len(b.Files) == 0 {
+		return true
+	}
+	for _, left := range a.Files {
+		for _, right := range b.Files {
+			if ownershipPatternsOverlap(left, right) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (t *Team) runWaveBatch(waveCtx context.Context, batch []*TeamTask) error {
+	var wg sync.WaitGroup
+	for _, task := range batch {
+		task := task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t.executeTask(waveCtx, task)
+		}()
+	}
+	wg.Wait()
+
+	for _, task := range batch {
+		if task.Status != "completed" {
+			return fmt.Errorf("task %s did not complete (status: %s)", task.ID, task.Status)
+		}
+	}
 	return nil
 }
 
@@ -276,11 +420,12 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 
 	log.Printf("[Team] Worker %s starting task %s: %s", workerID, task.ID, task.Name)
 
-	// Set file ownership checker for this worker
-	FileOwnershipChecker = func(wID, filePath string) (bool, string) {
-		return t.CheckFileOwnership(wID, filePath)
+	provider, model, err := t.resolveTaskRuntime(task)
+	if err != nil {
+		workerCancel()
+		t.failStartedTask(task, workerID, err)
+		return
 	}
-	activeWorkerID = workerID
 
 	// Build worker prompt with full context
 	prompt := t.buildWorkerPrompt(task)
@@ -292,12 +437,20 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	}
 
 	innerEventCh := make(chan Event, 100)
-	go RunLoop(workerCtx, t.provider, t.model, messages, t.workDir, "auto", innerEventCh)
+	go RunLoopWithOptions(workerCtx, provider, model, messages, t.workDir, RunOptions{
+		ResponseLang:      "auto",
+		WorkstreamContext: t.config.WorkstreamContext,
+		WorkerID:          workerID,
+		OwnershipChecker:  t.CheckFileOwnership,
+	}, innerEventCh)
 
 	// Disk-based output: write to file instead of accumulating in memory
 	outputDir := filepath.Join(t.baseDir, "teams", t.config.Name, "output")
 	os.MkdirAll(outputDir, 0755)
 	outputPath := filepath.Join(outputDir, task.ID+".txt")
+	t.mu.Lock()
+	task.OutputPath = outputPath
+	t.mu.Unlock()
 	outputFile, _ := os.Create(outputPath)
 
 	var result string
@@ -373,6 +526,58 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 
 	t.report(fmt.Sprintf("Worker %s: %s — %s (%d tools, %.1fs)",
 		workerID, task.ID, task.Status, toolCalls, task.FinishedAt.Sub(task.StartedAt).Seconds()))
+}
+
+func (t *Team) resolveTaskRuntime(task *TeamTask) (types.Provider, string, error) {
+	provider := t.provider
+	model := t.model
+
+	providerName := strings.TrimSpace(task.Provider)
+	if providerName != "" {
+		if provider != nil && provider.Name() == providerName {
+			// Reuse the team provider.
+		} else if t.config.ProviderFactory != nil {
+			next, err := t.config.ProviderFactory(providerName)
+			if err != nil {
+				return nil, "", fmt.Errorf("create task provider %q: %w", providerName, err)
+			}
+			provider = next
+		} else {
+			return nil, "", fmt.Errorf("task requested provider %q but no provider factory is configured", providerName)
+		}
+	}
+	if provider == nil {
+		return nil, "", fmt.Errorf("no provider configured")
+	}
+
+	if taskModel := strings.TrimSpace(task.Model); taskModel != "" {
+		model = taskModel
+	}
+	if strings.TrimSpace(model) == "" {
+		return nil, "", fmt.Errorf("no model configured")
+	}
+	return provider, model, nil
+}
+
+func (t *Team) failStartedTask(task *TeamTask, workerID string, err error) {
+	t.mu.Lock()
+	task.Result = "Runtime error: " + err.Error()
+	task.FinishedAt = time.Now()
+	task.Status = "failed"
+	if w := t.workers[workerID]; w != nil {
+		w.Status = "idle"
+		w.IdleSince = time.Now()
+	}
+	t.mu.Unlock()
+
+	t.mailbox.Send(TeamMessage{
+		From:    workerID,
+		To:      "lead",
+		Type:    MsgIdleNotify,
+		Text:    fmt.Sprintf("Task %s failed: %s", task.ID, err.Error()),
+		Summary: fmt.Sprintf("%s: failed", task.ID),
+	})
+	t.report(fmt.Sprintf("Worker %s: %s — failed (%s)", workerID, task.ID, err.Error()))
 }
 
 func (t *Team) buildWorkerPrompt(task *TeamTask) string {

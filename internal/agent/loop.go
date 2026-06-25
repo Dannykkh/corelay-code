@@ -322,6 +322,10 @@ func RunLoopWithOptions(
 	}
 
 	tools := AllToolDefs(workDir)
+	toolExecOptions := ToolExecutionOptions{
+		WorkerID:         opts.WorkerID,
+		OwnershipChecker: opts.OwnershipChecker,
+	}
 
 	// Plan mode: "/plan <task>" makes the agent explore read-only and produce a
 	// step-by-step plan WITHOUT editing — the Claude-Code plan-then-execute flow.
@@ -1018,7 +1022,7 @@ func RunLoopWithOptions(
 					hookRegistry.Execute(hooks.HookPreToolUse, map[string]string{
 						"TOOL_NAME": t.Name, "WORK_DIR": workDir,
 					})
-					r, isErr := ExecuteTool(t.Name, t.Input, workDir)
+					r, isErr := ExecuteToolWithOptions(t.Name, t.Input, workDir, toolExecOptions)
 					hookRegistry.Execute(hooks.HookPostToolUse, map[string]string{
 						"TOOL_NAME": t.Name, "WORK_DIR": workDir,
 						"TOOL_ERROR": fmt.Sprintf("%v", isErr),
@@ -1128,7 +1132,7 @@ func RunLoopWithOptions(
 				checkpointFile(workDir, diffFile, resolvePath(diffFile, workDir))
 			}
 
-			result, isError := ExecuteTool(tu.Name, tu.Input, workDir)
+			result, isError := ExecuteToolWithOptions(tu.Name, tu.Input, workDir, toolExecOptions)
 
 			// ── Post-tool hook ──
 			hookRegistry.Execute(hooks.HookPostToolUse, map[string]string{

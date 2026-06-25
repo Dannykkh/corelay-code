@@ -4,6 +4,8 @@ type RunOptions struct {
 	ResponseLang      string
 	WorkstreamContext string
 	Recorder          RunRecorder
+	WorkerID          string
+	OwnershipChecker  func(workerID, filePath string) (bool, string)
 }
 
 type RunRecorder interface {
