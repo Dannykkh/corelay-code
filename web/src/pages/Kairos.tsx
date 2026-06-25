@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { fetchJSON, postJSON, putJSON } from '../lib/api';
+import { listWorkstreams, type Workstream } from '../lib/workstreams';
 
 export function KairosPage() {
   const [status, setStatus] = useState<any>(null);
@@ -7,7 +8,8 @@ export function KairosPage() {
   const [logs, setLogs] = useState<any[]>([]);
   const [gitStatus, setGitStatus] = useState<any>(null);
   const [notifications, setNotifications] = useState<any[]>([]);
-  const [newTask, setNewTask] = useState({ id: '', type: 'custom', description: '' });
+  const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
+  const [newTask, setNewTask] = useState({ id: '', type: 'custom', description: '', workstreamId: '' });
   const sseRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -36,16 +38,18 @@ export function KairosPage() {
   }, []);
 
   async function load() {
-    const [s, t, l, g] = await Promise.all([
+    const [s, t, l, g, w] = await Promise.all([
       fetchJSON('/api/kairos'),
       fetchJSON('/api/kairos/tasks'),
       fetchJSON('/api/kairos/logs'),
       fetchJSON('/api/kairos/git').catch(() => null),
+      listWorkstreams().catch(() => []),
     ]);
     setStatus(s);
     setTasks(Array.isArray(t) ? t : []);
     setLogs(Array.isArray(l) ? l : []);
     setGitStatus(g);
+    setWorkstreams(Array.isArray(w) ? w : []);
   }
 
   async function start() { await postJSON('/api/kairos/start', {}); load(); }
@@ -54,10 +58,15 @@ export function KairosPage() {
 
   async function addTask() {
     if (!newTask.id || !newTask.description) return;
-    await postJSON('/api/kairos/tasks', newTask);
-    setNewTask({ id: '', type: 'custom', description: '' });
+    await postJSON('/api/kairos/tasks', {
+      ...newTask,
+      workstreamId: newTask.workstreamId || undefined,
+    });
+    setNewTask({ id: '', type: 'custom', description: '', workstreamId: '' });
     load();
   }
+
+  const workstreamById = new Map(workstreams.map((ws) => [ws.id, ws]));
 
   return (
     <div className="p-6 w-full">
@@ -150,11 +159,18 @@ export function KairosPage() {
       {/* Add Task */}
       <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-4 mb-4">
         <div className="text-xs text-[var(--color-text2)] uppercase mb-3">Add Background Task</div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <input value={newTask.id} onChange={(e) => setNewTask({ ...newTask, id: e.target.value })}
             placeholder="Task ID" className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm text-[var(--color-text)] w-32" />
           <input value={newTask.description} onChange={(e) => setNewTask({ ...newTask, description: e.target.value })}
-            placeholder="Description (e.g., Run tests every hour)" className="flex-1 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm text-[var(--color-text)]" />
+            placeholder="Description (e.g., Run tests every hour)" className="flex-1 min-w-64 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm text-[var(--color-text)]" />
+          <select value={newTask.workstreamId} onChange={(e) => setNewTask({ ...newTask, workstreamId: e.target.value })}
+            className="w-56 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm text-[var(--color-text)]">
+            <option value="">No workstream</option>
+            {workstreams.map((ws) => (
+              <option key={ws.id} value={ws.id}>{ws.title}</option>
+            ))}
+          </select>
           <button onClick={addTask} className="px-4 py-2 bg-[var(--color-accent)] text-white rounded-lg text-sm">Add</button>
         </div>
       </div>
@@ -168,6 +184,11 @@ export function KairosPage() {
               <div>
                 <span className="text-sm font-mono text-[var(--color-accent)]">{t.id}</span>
                 <span className="text-sm ml-2">{t.description}</span>
+                {t.workstreamId && (
+                  <span className="text-xs ml-2 text-[var(--color-text2)]">
+                    {workstreamById.get(t.workstreamId)?.title || t.workstreamId}
+                  </span>
+                )}
               </div>
               <span className="text-xs text-[var(--color-text2)]">{t.type}</span>
             </div>

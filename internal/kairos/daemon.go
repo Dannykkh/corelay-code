@@ -6,10 +6,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aniclew/aniclew/internal/types"
+	"github.com/aniclew/aniclew/internal/workstream"
 )
 
 // State represents what the daemon is doing.
@@ -24,22 +26,23 @@ const (
 
 // Task represents a background task the daemon can execute.
 type Task struct {
-	ID          string    `json:"id"`
-	Type        string    `json:"type"` // "pr-review", "test-run", "lint", "custom"
-	Description string    `json:"description"`
-	Command     string    `json:"command,omitempty"`
-	CronExpr    string    `json:"cron,omitempty"` // "0 0 * * *" = midnight
-	CreatedAt   time.Time `json:"createdAt"`
-	LastRun     time.Time `json:"lastRun,omitempty"`
-	Enabled     bool      `json:"enabled"`
+	ID           string    `json:"id"`
+	Type         string    `json:"type"` // "pr-review", "test-run", "lint", "custom"
+	Description  string    `json:"description"`
+	Command      string    `json:"command,omitempty"`
+	CronExpr     string    `json:"cron,omitempty"` // "0 0 * * *" = midnight
+	WorkstreamID string    `json:"workstreamId,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	LastRun      time.Time `json:"lastRun,omitempty"`
+	Enabled      bool      `json:"enabled"`
 }
 
 // LogEntry records what the daemon did.
 type LogEntry struct {
-	Time    time.Time `json:"time"`
-	Action  string    `json:"action"`
-	Detail  string    `json:"detail"`
-	Cost    float64   `json:"cost,omitempty"`
+	Time   time.Time `json:"time"`
+	Action string    `json:"action"`
+	Detail string    `json:"detail"`
+	Cost   float64   `json:"cost,omitempty"`
 }
 
 // Config for the daemon.
@@ -249,6 +252,7 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	d.mu.RLock()
 	provider := d.provider
 	model := d.model
+	workDir := d.workDir
 	d.mu.RUnlock()
 
 	if provider == nil {
@@ -256,8 +260,39 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 		return
 	}
 
+	var wsStore *workstream.Store
+	var ws *workstream.Workstream
+	workstreamContext := ""
+	if task.WorkstreamID != "" {
+		if workDir == "" {
+			d.addLog("task-error", "No workspace configured for workstream task")
+			return
+		}
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(task.WorkstreamID)
+		if err != nil {
+			d.addLog("task-error", err.Error())
+			return
+		}
+		ws = loaded
+		workstreamContext = workstream.RenderContext(*ws, 2000)
+		if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+			Type:    "kairos_task_started",
+			Message: "KAIROS task started",
+			Data: map[string]string{
+				"taskId":      task.ID,
+				"description": task.Description,
+				"provider":    provider.Name(),
+				"model":       model,
+			},
+		}); err != nil {
+			d.addLog("task-error", err.Error())
+			return
+		}
+	}
+
 	// Build a prompt for the task
-	prompt := buildTaskPrompt(task, autonomy)
+	prompt := buildTaskPrompt(task, autonomy, workstreamContext)
 
 	req := &types.MessagesRequest{
 		Model: model,
@@ -270,6 +305,7 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	ch, err := provider.StreamMessage(ctx, req, nil)
 	if err != nil {
 		d.addLog("task-error", err.Error())
+		d.recordWorkstreamTaskFailure(wsStore, ws, task, provider.Name(), model, err.Error())
 		return
 	}
 
@@ -296,9 +332,10 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	} else {
 		d.addLog("task-done", response)
 	}
+	d.recordWorkstreamTaskCompletion(wsStore, ws, task, provider.Name(), model, response)
 }
 
-func buildTaskPrompt(task Task, autonomy string) string {
+func buildTaskPrompt(task Task, autonomy, workstreamContext string) string {
 	mode := "Be collaborative — show choices before acting."
 	if autonomy == "autonomous" {
 		mode = "Work independently. Only pause for irreversible actions."
@@ -306,10 +343,76 @@ func buildTaskPrompt(task Task, autonomy string) string {
 		mode = "Full autonomy. Complete the task without any user interaction."
 	}
 
-	return "You are KAIROS, a background assistant daemon.\n" +
+	prompt := "You are KAIROS, a background assistant daemon.\n" +
 		"Mode: " + mode + "\n" +
 		"Task: " + task.Description + "\n" +
 		"Execute this task concisely."
+	if contextBlock := strings.TrimSpace(workstreamContext); contextBlock != "" {
+		prompt += "\n\n" + contextBlock
+	}
+	return prompt
+}
+
+func (d *Daemon) recordWorkstreamTaskCompletion(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, response string) {
+	if store == nil || ws == nil {
+		return
+	}
+	verification := workstream.VerificationResult{
+		Status:  "not-run",
+		Source:  "kairos",
+		Summary: truncateDetail(response, 200),
+	}
+	if _, err := store.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+		d.addLog("task-error", "workstream verification: "+err.Error())
+	}
+	if err := store.AppendEvent(ws.ID, workstream.TimelineEvent{
+		Type:    "kairos_task_completed",
+		Message: "KAIROS task completed",
+		Data: map[string]string{
+			"taskId":      task.ID,
+			"description": task.Description,
+			"provider":    provider,
+			"model":       model,
+			"summary":     truncateDetail(response, 200),
+		},
+	}); err != nil {
+		d.addLog("task-error", "workstream completion: "+err.Error())
+	}
+}
+
+func (d *Daemon) recordWorkstreamTaskFailure(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, detail string) {
+	if store == nil || ws == nil {
+		return
+	}
+	verification := workstream.VerificationResult{
+		Status:  "failed",
+		Source:  "kairos",
+		Summary: truncateDetail(detail, 200),
+	}
+	if _, err := store.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+		d.addLog("task-error", "workstream verification: "+err.Error())
+	}
+	if err := store.AppendEvent(ws.ID, workstream.TimelineEvent{
+		Type:    "kairos_task_failed",
+		Message: "KAIROS task failed",
+		Data: map[string]string{
+			"taskId":      task.ID,
+			"description": task.Description,
+			"provider":    provider,
+			"model":       model,
+			"error":       truncateDetail(detail, 200),
+		},
+	}); err != nil {
+		d.addLog("task-error", "workstream failure: "+err.Error())
+	}
+}
+
+func truncateDetail(s string, limit int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "..."
 }
 
 // ── Task Management ──
