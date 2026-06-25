@@ -1,7 +1,10 @@
 package observability
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,16 +27,44 @@ type RequestTrace struct {
 	WorkDir      string    `json:"workDir,omitempty"`
 }
 
+// RunTrace records one agentic loop run and its internal spans.
+type RunTrace struct {
+	ID           string            `json:"id"`
+	Kind         string            `json:"kind"` // agent, chronos, kairos
+	StartedAt    time.Time         `json:"startedAt"`
+	EndedAt      time.Time         `json:"endedAt,omitempty"`
+	DurationMs   int64             `json:"durationMs,omitempty"`
+	Provider     string            `json:"provider"`
+	Model        string            `json:"model"`
+	WorkDir      string            `json:"workDir,omitempty"`
+	WorkstreamID string            `json:"workstreamId,omitempty"`
+	Status       string            `json:"status"` // running, ok, failed
+	Error        string            `json:"error,omitempty"`
+	Spans        []RunSpan         `json:"spans,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
+// RunSpan records a bounded phase inside an agentic loop.
+type RunSpan struct {
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	StartedAt  time.Time         `json:"startedAt"`
+	EndedAt    time.Time         `json:"endedAt,omitempty"`
+	DurationMs int64             `json:"durationMs,omitempty"`
+	Status     string            `json:"status"` // running, ok, failed, skipped
+	Data       map[string]string `json:"data,omitempty"`
+}
+
 // Metrics is a computed summary over a time window.
 type Metrics struct {
-	TotalRequests   int     `json:"totalRequests"`
-	TotalTokens     int     `json:"totalTokens"`
-	TotalCost       float64 `json:"totalCost"`
-	AvgLatencyMs    int64   `json:"avgLatencyMs"`
-	P95LatencyMs    int64   `json:"p95LatencyMs"`
-	ErrorRate       float64 `json:"errorRate"`
-	RequestsPerMin  float64 `json:"requestsPerMin"`
-	ByProvider      map[string]*ProviderMetrics `json:"byProvider"`
+	TotalRequests  int                         `json:"totalRequests"`
+	TotalTokens    int                         `json:"totalTokens"`
+	TotalCost      float64                     `json:"totalCost"`
+	AvgLatencyMs   int64                       `json:"avgLatencyMs"`
+	P95LatencyMs   int64                       `json:"p95LatencyMs"`
+	ErrorRate      float64                     `json:"errorRate"`
+	RequestsPerMin float64                     `json:"requestsPerMin"`
+	ByProvider     map[string]*ProviderMetrics `json:"byProvider"`
 }
 
 // ProviderMetrics is per-provider breakdown.
@@ -47,19 +78,26 @@ type ProviderMetrics struct {
 
 // Tracker collects and queries request traces.
 type Tracker struct {
-	mu     sync.RWMutex
-	traces []RequestTrace
-	dir    string // persistence directory
+	mu        sync.RWMutex
+	traces    []RequestTrace
+	runTraces []RunTrace
+	dir       string // persistence directory
+	runDir    string
 }
 
 func NewTracker(baseDir string) *Tracker {
 	dir := filepath.Join(baseDir, "traces")
+	runDir := filepath.Join(baseDir, "run-traces")
 	os.MkdirAll(dir, 0755)
+	os.MkdirAll(runDir, 0755)
 	t := &Tracker{
-		traces: make([]RequestTrace, 0, 10000),
-		dir:    dir,
+		traces:    make([]RequestTrace, 0, 10000),
+		runTraces: make([]RunTrace, 0, 1000),
+		dir:       dir,
+		runDir:    runDir,
 	}
 	t.loadToday()
+	t.loadRunToday()
 	return t
 }
 
@@ -78,6 +116,32 @@ func (t *Tracker) Record(trace RequestTrace) {
 	t.appendToFile(trace)
 }
 
+// RecordRun adds a completed run trace.
+func (t *Tracker) RecordRun(trace RunTrace) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if trace.ID == "" {
+		trace.ID = NewTraceID("run")
+	}
+	if trace.StartedAt.IsZero() {
+		trace.StartedAt = time.Now().UTC()
+	}
+	if trace.EndedAt.IsZero() {
+		trace.EndedAt = time.Now().UTC()
+	}
+	if trace.DurationMs == 0 {
+		trace.DurationMs = trace.EndedAt.Sub(trace.StartedAt).Milliseconds()
+	}
+	if trace.Status == "" {
+		trace.Status = "ok"
+	}
+	t.runTraces = append(t.runTraces, trace)
+	if len(t.runTraces) > 1000 {
+		t.runTraces = t.runTraces[len(t.runTraces)-500:]
+	}
+	t.appendRunToFile(trace)
+}
+
 // Recent returns the last N traces.
 func (t *Tracker) Recent(limit int) []RequestTrace {
 	t.mu.RLock()
@@ -88,6 +152,19 @@ func (t *Tracker) Recent(limit int) []RequestTrace {
 	start := len(t.traces) - limit
 	result := make([]RequestTrace, limit)
 	copy(result, t.traces[start:])
+	return result
+}
+
+// RecentRuns returns the last N agentic run traces.
+func (t *Tracker) RecentRuns(limit int) []RunTrace {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if limit <= 0 || limit > len(t.runTraces) {
+		limit = len(t.runTraces)
+	}
+	start := len(t.runTraces) - limit
+	result := make([]RunTrace, limit)
+	copy(result, t.runTraces[start:])
 	return result
 }
 
@@ -168,8 +245,23 @@ func (t *Tracker) todayFile() string {
 	return filepath.Join(t.dir, time.Now().Format("2006-01-02")+".jsonl")
 }
 
+func (t *Tracker) runTodayFile() string {
+	return filepath.Join(t.runDir, time.Now().Format("2006-01-02")+".jsonl")
+}
+
 func (t *Tracker) appendToFile(trace RequestTrace) {
 	f, err := os.OpenFile(t.todayFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	data, _ := json.Marshal(trace)
+	f.Write(data)
+	f.Write([]byte("\n"))
+}
+
+func (t *Tracker) appendRunToFile(trace RunTrace) {
+	f, err := os.OpenFile(t.runTodayFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
@@ -190,6 +282,30 @@ func (t *Tracker) loadToday() {
 			t.traces = append(t.traces, trace)
 		}
 	}
+}
+
+func (t *Tracker) loadRunToday() {
+	data, err := os.ReadFile(t.runTodayFile())
+	if err != nil {
+		return
+	}
+	for _, line := range splitLines(data) {
+		var trace RunTrace
+		if json.Unmarshal(line, &trace) == nil {
+			t.runTraces = append(t.runTraces, trace)
+		}
+	}
+}
+
+func NewTraceID(prefix string) string {
+	if prefix == "" {
+		prefix = "trace"
+	}
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	}
+	return prefix + "_" + time.Now().UTC().Format("20060102T150405") + "_" + hex.EncodeToString(b[:])
 }
 
 func splitLines(data []byte) [][]byte {

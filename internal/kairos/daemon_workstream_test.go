@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/types"
 	"github.com/aniclew/aniclew/internal/workstream"
 )
@@ -27,9 +28,11 @@ func TestDaemonExecuteTaskRecordsWorkstream(t *testing.T) {
 	}
 
 	provider := &daemonFakeProvider{text: "daemon task complete"}
+	tracker := observability.NewTracker(t.TempDir())
 	daemon := NewDaemon(DefaultDaemonConfig())
 	daemon.SwitchProject(workDir)
 	daemon.SetProvider(provider, "fake-model")
+	daemon.SetTracker(tracker)
 
 	daemon.executeTask(context.Background(), Task{
 		ID:           "task-1",
@@ -68,6 +71,17 @@ func TestDaemonExecuteTaskRecordsWorkstream(t *testing.T) {
 			t.Fatalf("missing timeline event %q in %+v", want, timeline)
 		}
 	}
+
+	runTraces := tracker.RecentRuns(10)
+	if len(runTraces) != 1 {
+		t.Fatalf("run traces=%d, want 1", len(runTraces))
+	}
+	if runTraces[0].Kind != "kairos" || runTraces[0].WorkstreamID != "ws_kairos" || runTraces[0].Status != "ok" {
+		t.Fatalf("unexpected run trace: %+v", runTraces[0])
+	}
+	if !hasRunSpan(runTraces[0], "kairos.task") {
+		t.Fatalf("kairos run trace missing task span: %+v", runTraces[0].Spans)
+	}
 }
 
 type daemonFakeProvider struct {
@@ -95,4 +109,13 @@ func (p *daemonFakeProvider) StreamMessage(ctx context.Context, req *types.Messa
 		ch <- types.SSEEvent{Type: "message_stop"}
 	}()
 	return ch, nil
+}
+
+func hasRunSpan(trace observability.RunTrace, name string) bool {
+	for _, span := range trace.Spans {
+		if span.Name == name {
+			return true
+		}
+	}
+	return false
 }

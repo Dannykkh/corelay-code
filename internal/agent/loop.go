@@ -485,6 +485,7 @@ func RunLoopWithOptions(
 		if IsSlashCommand(lastText) {
 			processed, err := ProcessSlashCommand(lastText, skills)
 			if err != nil {
+				failRun(opts.Recorder, err.Error())
 				eventCh <- Event{Type: "error", Data: err.Error()}
 				return
 			}
@@ -673,6 +674,14 @@ func RunLoopWithOptions(
 
 		// Call LLM (with retry)
 		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Thinking... (iteration %d/%d, ~%dk tokens)", i+1, maxIterations, tokenEstimate/1000)}
+		finishMakerSpan := startRunSpan(opts.Recorder, fmt.Sprintf("maker_%02d", i+1), "maker.llm_call", map[string]string{
+			"iteration":      fmt.Sprintf("%d", i+1),
+			"provider":       provider.Name(),
+			"model":          model,
+			"tokenEstimate":  fmt.Sprintf("%d", tokenEstimate),
+			"messageCount":   fmt.Sprintf("%d", len(messages)),
+			"toolDefinition": fmt.Sprintf("%d", len(tools)),
+		})
 
 		// Liveness: heartbeat elapsed-time + output size every second. Started
 		// BEFORE StreamMessage on purpose — for a slow/cold local model the
@@ -696,6 +705,8 @@ func RunLoopWithOptions(
 				select {
 				case <-ctx.Done():
 					stopHeartbeat()
+					finishMakerSpan("error", map[string]string{"error": ctx.Err().Error()})
+					failRun(opts.Recorder, ctx.Err().Error())
 					return
 				case <-time.After(2 * time.Second):
 				}
@@ -703,6 +714,8 @@ func RunLoopWithOptions(
 		}
 		if err != nil {
 			stopHeartbeat()
+			finishMakerSpan("error", map[string]string{"error": err.Error()})
+			failRun(opts.Recorder, fmt.Sprintf("Failed after 3 retries: %s", err.Error()))
 			eventCh <- Event{Type: "error", Data: fmt.Sprintf("Failed after 3 retries: %s", err.Error())}
 			return
 		}
@@ -783,6 +796,10 @@ func RunLoopWithOptions(
 				// done with this LLM call
 			}
 		}
+		finishMakerSpan("ok", map[string]string{
+			"textChars": fmt.Sprintf("%d", len(textContent)),
+			"toolCalls": fmt.Sprintf("%d", len(toolUses)),
+		})
 
 		// Generation finished for this iteration — stop the liveness ticker
 		// before tool execution (tools emit their own progress) and before any
@@ -834,22 +851,35 @@ func RunLoopWithOptions(
 			//    cannot loop forever. Skips silently when there is no test runner.
 			if didEdit && autoVerifyEnabled() && verifyAttempts < maxVerifyAttempts {
 				eventCh <- Event{Type: "status", Data: "Auto-verify: running tests after edits…"}
+				finishCheckSpan := startRunSpan(opts.Recorder, fmt.Sprintf("checker_%02d_%02d", i+1, verifyAttempts+1), "checker.auto_verify", map[string]string{
+					"iteration": fmt.Sprintf("%d", i+1),
+					"attempt":   fmt.Sprintf("%d", verifyAttempts+1),
+				})
 				vout, vfailed, vran := runAutoVerify(workDir)
 				if vran && vfailed {
 					testResult = "failed"
+					finishCheckSpan("failed", map[string]string{"outputChars": fmt.Sprintf("%d", len(vout))})
 					verifyAttempts++
 					eventCh <- Event{Type: "status", Data: fmt.Sprintf("Auto-verify: tests failed — asking the model to fix (attempt %d/%d)", verifyAttempts, maxVerifyAttempts)}
+					finishRepairSpan := startRunSpan(opts.Recorder, fmt.Sprintf("repair_%02d_%02d", i+1, verifyAttempts), "repair.feedback", map[string]string{
+						"iteration": fmt.Sprintf("%d", i+1),
+						"attempt":   fmt.Sprintf("%d", verifyAttempts),
+					})
 					if textContent != "" {
 						messages = append(messages, types.Message{Role: "assistant", Content: mustJSON([]map[string]interface{}{{"type": "text", "text": textContent}})})
 					}
 					messages = append(messages, types.Message{Role: "user", Content: mustJSON(
 						"Automated verification ran the tests after your changes and they FAILED:\n\n" + vout +
 							"\n\nIf these failures are caused by your edits, fix them and we'll re-verify. If they are pre-existing and unrelated to your change, briefly say so and stop.")})
+					finishRepairSpan("ok", map[string]string{"next": "model_repair"})
 					continue
 				}
 				if vran {
 					testResult = "passed"
+					finishCheckSpan("ok", map[string]string{"result": "passed", "outputChars": fmt.Sprintf("%d", len(vout))})
 					eventCh <- Event{Type: "status", Data: "Auto-verify: tests passed"}
+				} else {
+					finishCheckSpan("skipped", map[string]string{})
 				}
 			}
 
@@ -1146,10 +1176,12 @@ func RunLoopWithOptions(
 			consecutiveErrorRounds = 0
 		}
 		if consecutiveErrorRounds >= maxErrorRounds {
-			eventCh <- Event{Type: "error", Data: fmt.Sprintf(
+			msg := fmt.Sprintf(
 				"Stopped after %d consecutive failed tool rounds — the model appears "+
 					"stuck repeating a failing action. Try rephrasing the request.",
-				consecutiveErrorRounds)}
+				consecutiveErrorRounds)
+			eventCh <- Event{Type: "error", Data: msg}
+			failRun(opts.Recorder, msg)
 			hookRegistry.Execute(hooks.HookSessionEnd, map[string]string{"WORK_DIR": workDir})
 			return
 		}
@@ -1159,6 +1191,7 @@ func RunLoopWithOptions(
 
 	hookRegistry.Execute(hooks.HookSessionEnd, map[string]string{"WORK_DIR": workDir})
 	eventCh <- Event{Type: "error", Data: "Max iterations reached"}
+	failRun(opts.Recorder, "Max iterations reached")
 }
 
 type toolUseBlock struct {

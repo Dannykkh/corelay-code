@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/types"
 	"github.com/aniclew/aniclew/internal/workstream"
 )
@@ -78,6 +79,7 @@ type Daemon struct {
 	cancel        context.CancelFunc
 	lastGitStatus *GitStatus
 	notifier      *Notifier
+	tracker       *observability.Tracker
 }
 
 func NewDaemon(cfg DaemonConfig) *Daemon {
@@ -147,6 +149,12 @@ func (d *Daemon) SetProvider(p types.Provider, model string) {
 	defer d.mu.Unlock()
 	d.provider = p
 	d.model = model
+}
+
+func (d *Daemon) SetTracker(t *observability.Tracker) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tracker = t
 }
 
 // Start begins the tick loop.
@@ -253,11 +261,41 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	provider := d.provider
 	model := d.model
 	workDir := d.workDir
+	tracker := d.tracker
 	d.mu.RUnlock()
 
 	if provider == nil {
 		d.addLog("task-skip", "No provider configured")
 		return
+	}
+
+	traceID := observability.NewTraceID("run")
+	traceStartedAt := time.Now().UTC()
+	runTrace := observability.RunTrace{
+		ID:           traceID,
+		Kind:         "kairos",
+		StartedAt:    traceStartedAt,
+		Provider:     provider.Name(),
+		Model:        model,
+		WorkDir:      workDir,
+		WorkstreamID: task.WorkstreamID,
+		Status:       "running",
+		Metadata: map[string]string{
+			"taskId":      task.ID,
+			"taskType":    task.Type,
+			"description": task.Description,
+			"autonomy":    autonomy,
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "kairos-task",
+			Name:      "kairos.task",
+			StartedAt: traceStartedAt,
+			Status:    "running",
+			Data: map[string]string{
+				"taskId":      task.ID,
+				"description": task.Description,
+			},
+		}},
 	}
 
 	var wsStore *workstream.Store
@@ -266,12 +304,20 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	if task.WorkstreamID != "" {
 		if workDir == "" {
 			d.addLog("task-error", "No workspace configured for workstream task")
+			finishDaemonRunTrace(&runTrace, "failed", "No workspace configured for workstream task")
+			if tracker != nil {
+				tracker.RecordRun(runTrace)
+			}
 			return
 		}
 		wsStore = workstream.NewStore(workDir)
 		loaded, err := wsStore.Get(task.WorkstreamID)
 		if err != nil {
 			d.addLog("task-error", err.Error())
+			finishDaemonRunTrace(&runTrace, "failed", err.Error())
+			if tracker != nil {
+				tracker.RecordRun(runTrace)
+			}
 			return
 		}
 		ws = loaded
@@ -284,9 +330,14 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 				"description": task.Description,
 				"provider":    provider.Name(),
 				"model":       model,
+				"traceId":     traceID,
 			},
 		}); err != nil {
 			d.addLog("task-error", err.Error())
+			finishDaemonRunTrace(&runTrace, "failed", err.Error())
+			if tracker != nil {
+				tracker.RecordRun(runTrace)
+			}
 			return
 		}
 	}
@@ -305,7 +356,11 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	ch, err := provider.StreamMessage(ctx, req, nil)
 	if err != nil {
 		d.addLog("task-error", err.Error())
-		d.recordWorkstreamTaskFailure(wsStore, ws, task, provider.Name(), model, err.Error())
+		finishDaemonRunTrace(&runTrace, "failed", err.Error())
+		if tracker != nil {
+			tracker.RecordRun(runTrace)
+		}
+		d.recordWorkstreamTaskFailure(wsStore, ws, task, provider.Name(), model, traceID, err.Error())
 		return
 	}
 
@@ -332,7 +387,11 @@ func (d *Daemon) executeTask(ctx context.Context, task Task, autonomy string) {
 	} else {
 		d.addLog("task-done", response)
 	}
-	d.recordWorkstreamTaskCompletion(wsStore, ws, task, provider.Name(), model, response)
+	finishDaemonRunTrace(&runTrace, "ok", "")
+	if tracker != nil {
+		tracker.RecordRun(runTrace)
+	}
+	d.recordWorkstreamTaskCompletion(wsStore, ws, task, provider.Name(), model, traceID, response)
 }
 
 func buildTaskPrompt(task Task, autonomy, workstreamContext string) string {
@@ -353,7 +412,7 @@ func buildTaskPrompt(task Task, autonomy, workstreamContext string) string {
 	return prompt
 }
 
-func (d *Daemon) recordWorkstreamTaskCompletion(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, response string) {
+func (d *Daemon) recordWorkstreamTaskCompletion(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, traceID, response string) {
 	if store == nil || ws == nil {
 		return
 	}
@@ -373,6 +432,7 @@ func (d *Daemon) recordWorkstreamTaskCompletion(store *workstream.Store, ws *wor
 			"description": task.Description,
 			"provider":    provider,
 			"model":       model,
+			"traceId":     traceID,
 			"summary":     truncateDetail(response, 200),
 		},
 	}); err != nil {
@@ -380,7 +440,7 @@ func (d *Daemon) recordWorkstreamTaskCompletion(store *workstream.Store, ws *wor
 	}
 }
 
-func (d *Daemon) recordWorkstreamTaskFailure(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, detail string) {
+func (d *Daemon) recordWorkstreamTaskFailure(store *workstream.Store, ws *workstream.Workstream, task Task, provider, model, traceID, detail string) {
 	if store == nil || ws == nil {
 		return
 	}
@@ -400,6 +460,7 @@ func (d *Daemon) recordWorkstreamTaskFailure(store *workstream.Store, ws *workst
 			"description": task.Description,
 			"provider":    provider,
 			"model":       model,
+			"traceId":     traceID,
 			"error":       truncateDetail(detail, 200),
 		},
 	}); err != nil {
@@ -413,6 +474,33 @@ func truncateDetail(s string, limit int) string {
 		return s
 	}
 	return s[:limit] + "..."
+}
+
+func finishDaemonRunTrace(trace *observability.RunTrace, status string, detail string) {
+	if trace == nil {
+		return
+	}
+	now := time.Now().UTC()
+	trace.EndedAt = now
+	trace.DurationMs = now.Sub(trace.StartedAt).Milliseconds()
+	trace.Status = status
+	if detail != "" {
+		trace.Error = truncateDetail(detail, 500)
+	}
+	for i := range trace.Spans {
+		if trace.Spans[i].Status != "running" {
+			continue
+		}
+		trace.Spans[i].EndedAt = now
+		trace.Spans[i].DurationMs = now.Sub(trace.Spans[i].StartedAt).Milliseconds()
+		trace.Spans[i].Status = status
+		if detail != "" {
+			if trace.Spans[i].Data == nil {
+				trace.Spans[i].Data = map[string]string{}
+			}
+			trace.Spans[i].Data["detail"] = truncateDetail(detail, 500)
+		}
+	}
 }
 
 // ── Task Management ──

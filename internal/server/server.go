@@ -60,6 +60,9 @@ func (s *Server) SetTracker(t *observability.Tracker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tracker = t
+	if s.daemon != nil {
+		s.daemon.SetTracker(t)
+	}
 }
 
 func (s *Server) SetFeedback(f *observability.FeedbackStore) {
@@ -109,6 +112,9 @@ func (s *Server) SetRouter(r *router.Router) {
 func (s *Server) SetDaemon(d *kairos.Daemon) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if d != nil && s.tracker != nil {
+		d.SetTracker(s.tracker)
+	}
 	s.daemon = d
 }
 
@@ -203,6 +209,7 @@ func (s *Server) Start() error {
 
 	// Observability
 	mux.HandleFunc("GET /api/traces", s.handleTraces)
+	mux.HandleFunc("GET /api/run-traces", s.handleRunTraces)
 	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("POST /api/feedback", s.handleAddFeedback)
 	mux.HandleFunc("GET /api/feedback", s.handleFeedbackStats)
@@ -1418,6 +1425,21 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, tracker.Recent(limit))
 }
 
+func (s *Server) handleRunTraces(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	tracker := s.tracker
+	s.mu.RUnlock()
+	if tracker == nil {
+		writeJSON(w, []any{})
+		return
+	}
+	limit := 50
+	if q := r.URL.Query().Get("limit"); q != "" {
+		fmt.Sscanf(q, "%d", &limit)
+	}
+	writeJSON(w, tracker.RecentRuns(limit))
+}
+
 func (s *Server) handleAddFeedback(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	fb := s.feedback
@@ -2002,7 +2024,9 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	if respLang == "" {
 		respLang = "auto"
 	}
+	tracker := s.tracker
 	s.mu.RUnlock()
+	traceID := observability.NewTraceID("run")
 
 	var ws *workstream.Workstream
 	var wsStore *workstream.Store
@@ -2046,7 +2070,7 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	// /api/agent/{sessionId}/cancel or query /api/agent/loops.
 	sessionEvent, _ := json.Marshal(agent.Event{
 		Type: "session",
-		Data: map[string]string{"sessionId": sessionID, "workDir": workDir},
+		Data: map[string]string{"sessionId": sessionID, "workDir": workDir, "traceId": traceID},
 	})
 	fmt.Fprintf(w, "data: %s\n\n", sessionEvent)
 	if f, ok := w.(http.Flusher); ok {
@@ -2061,6 +2085,7 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 				"title":      ws.Title,
 				"status":     ws.Status,
 				"nextAction": ws.NextAction,
+				"traceId":    traceID,
 			},
 		})
 		fmt.Fprintf(w, "data: %s\n\n", workstreamEvent)
@@ -2071,15 +2096,36 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 
 	eventCh := make(chan agent.Event, 64)
 
-	var recorder agent.RunRecorder
+	var recorders []agent.RunRecorder
 	if ws != nil && wsStore != nil {
-		recorder = &workstreamRunRecorder{
+		recorders = append(recorders, &workstreamRunRecorder{
 			store:        wsStore,
 			id:           ws.ID,
 			sessionID:    sessionID,
+			traceID:      traceID,
 			providerName: provider.Name(),
 			model:        model,
-		}
+		})
+	}
+	if tracker != nil {
+		recorders = append(recorders, newObservabilityRunRecorder(tracker, observability.RunTrace{
+			ID:           traceID,
+			Kind:         "agent",
+			Provider:     provider.Name(),
+			Model:        model,
+			WorkDir:      workDir,
+			WorkstreamID: body.WorkstreamID,
+			Metadata: map[string]string{
+				"sessionId": sessionID,
+				"source":    "api.agent",
+			},
+		}))
+	}
+	var recorder agent.RunRecorder
+	if len(recorders) == 1 {
+		recorder = recorders[0]
+	} else if len(recorders) > 1 {
+		recorder = compositeRunRecorder{recorders: recorders}
 	}
 
 	go agent.RunLoopWithOptions(loopCtx, provider, model, body.Messages, workDir, agent.RunOptions{
@@ -2106,6 +2152,7 @@ type workstreamRunRecorder struct {
 	store        *workstream.Store
 	id           string
 	sessionID    string
+	traceID      string
 	providerName string
 	model        string
 }
@@ -2119,6 +2166,7 @@ func (r *workstreamRunRecorder) RunStarted() {
 		Message: "Agent run started",
 		Data: map[string]string{
 			"sessionId": r.sessionID,
+			"traceId":   r.traceID,
 			"provider":  r.providerName,
 			"model":     r.model,
 		},
@@ -2136,6 +2184,7 @@ func (r *workstreamRunRecorder) ReceiptWritten(path string, receipt agent.AgentR
 		Message: "Agent receipt written",
 		Data: map[string]string{
 			"path":         path,
+			"traceId":      r.traceID,
 			"provider":     receipt.Provider,
 			"model":        receipt.Model,
 			"projectType":  receipt.ProjectType,
@@ -2163,6 +2212,7 @@ func (r *workstreamRunRecorder) RunCompleted(summary agent.RunSummary) {
 		Message: "Agent run completed",
 		Data: map[string]string{
 			"sessionId":    r.sessionID,
+			"traceId":      r.traceID,
 			"iterations":   fmt.Sprintf("%d", summary.Iterations),
 			"provider":     summary.Provider,
 			"model":        summary.Model,
@@ -2174,6 +2224,33 @@ func (r *workstreamRunRecorder) RunCompleted(summary agent.RunSummary) {
 		},
 	}); err != nil {
 		log.Printf("[workstream] record completion failed: %v", err)
+	}
+}
+
+func (r *workstreamRunRecorder) RunFailed(message string) {
+	if r == nil || r.store == nil {
+		return
+	}
+	verification := workstream.VerificationResult{
+		Status:  "failed",
+		Source:  "agent",
+		Summary: message,
+	}
+	if _, err := r.store.Patch(r.id, workstream.Patch{LastVerification: &verification}); err != nil {
+		log.Printf("[workstream] record failure verification failed: %v", err)
+	}
+	if err := r.store.AppendEvent(r.id, workstream.TimelineEvent{
+		Type:    "agent_run_failed",
+		Message: "Agent run failed",
+		Data: map[string]string{
+			"sessionId": r.sessionID,
+			"traceId":   r.traceID,
+			"provider":  r.providerName,
+			"model":     r.model,
+			"error":     message,
+		},
+	}); err != nil {
+		log.Printf("[workstream] record failure failed: %v", err)
 	}
 }
 
@@ -2473,6 +2550,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 	provider := s.activeProvider
 	model := s.activeModel
 	workDir := s.workDir
+	tracker := s.tracker
 	s.mu.RUnlock()
 
 	if provider == nil {
@@ -2498,6 +2576,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
+	traceID := observability.NewTraceID("run")
 
 	cfg := agent.DefaultChronosConfig()
 	if body.VerifyCommand != "" {
@@ -2524,6 +2603,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 			Data: map[string]string{
 				"provider":  provider.Name(),
 				"model":     model,
+				"traceId":   traceID,
 				"task":      body.Task,
 				"maxCycles": fmt.Sprintf("%d", cfg.MaxCycles),
 			},
@@ -2539,6 +2619,38 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 
 	eventCh := make(chan agent.Event, 64)
+	traceStartedAt := time.Now().UTC()
+	chronosTrace := observability.RunTrace{
+		ID:           traceID,
+		Kind:         "chronos",
+		StartedAt:    traceStartedAt,
+		Provider:     provider.Name(),
+		Model:        model,
+		WorkDir:      workDir,
+		WorkstreamID: body.WorkstreamID,
+		Status:       "running",
+		Metadata: map[string]string{
+			"task":          body.Task,
+			"maxCycles":     fmt.Sprintf("%d", cfg.MaxCycles),
+			"verifyCommand": cfg.VerifyCommand,
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "chronos",
+			Name:      "chronos.run",
+			StartedAt: traceStartedAt,
+			Status:    "running",
+			Data:      map[string]string{"task": body.Task},
+		}},
+	}
+
+	traceEvent, _ := json.Marshal(agent.Event{
+		Type: "trace",
+		Data: map[string]string{"traceId": traceID},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", traceEvent)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 
 	if ws != nil {
 		workstreamEvent, _ := json.Marshal(agent.Event{
@@ -2548,6 +2660,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 				"title":      ws.Title,
 				"status":     ws.Status,
 				"nextAction": ws.NextAction,
+				"traceId":    traceID,
 			},
 		})
 		fmt.Fprintf(w, "data: %s\n\n", workstreamEvent)
@@ -2560,50 +2673,64 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 
 	recordedChronosEnd := false
 	for event := range eventCh {
-		if wsStore != nil && ws != nil && !recordedChronosEnd {
+		if !recordedChronosEnd {
 			switch event.Type {
 			case "done":
 				recordedChronosEnd = true
-				verification := workstream.VerificationResult{
-					Status:  "not-run",
-					Source:  "chronos",
-					Summary: "chronos run completed",
+				finishRunTrace(&chronosTrace, "ok", "")
+				if tracker != nil {
+					tracker.RecordRun(chronosTrace)
 				}
-				if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
-					log.Printf("[workstream] record chronos verification failed: %v", err)
-				}
-				if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
-					Type:    "chronos_run_completed",
-					Message: "Chronos run completed",
-					Data: map[string]string{
-						"provider": provider.Name(),
-						"model":    model,
-						"task":     body.Task,
-					},
-				}); err != nil {
-					log.Printf("[workstream] record chronos completion failed: %v", err)
+				if wsStore != nil && ws != nil {
+					verification := workstream.VerificationResult{
+						Status:  "not-run",
+						Source:  "chronos",
+						Summary: "chronos run completed",
+					}
+					if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+						log.Printf("[workstream] record chronos verification failed: %v", err)
+					}
+					if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+						Type:    "chronos_run_completed",
+						Message: "Chronos run completed",
+						Data: map[string]string{
+							"provider": provider.Name(),
+							"model":    model,
+							"traceId":  traceID,
+							"task":     body.Task,
+						},
+					}); err != nil {
+						log.Printf("[workstream] record chronos completion failed: %v", err)
+					}
 				}
 			case "error":
 				recordedChronosEnd = true
-				verification := workstream.VerificationResult{
-					Status:  "failed",
-					Source:  "chronos",
-					Summary: fmt.Sprint(event.Data),
+				finishRunTrace(&chronosTrace, "failed", fmt.Sprint(event.Data))
+				if tracker != nil {
+					tracker.RecordRun(chronosTrace)
 				}
-				if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
-					log.Printf("[workstream] record chronos verification failed: %v", err)
-				}
-				if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
-					Type:    "chronos_run_failed",
-					Message: "Chronos run failed",
-					Data: map[string]string{
-						"provider": provider.Name(),
-						"model":    model,
-						"task":     body.Task,
-						"error":    fmt.Sprint(event.Data),
-					},
-				}); err != nil {
-					log.Printf("[workstream] record chronos failure failed: %v", err)
+				if wsStore != nil && ws != nil {
+					verification := workstream.VerificationResult{
+						Status:  "failed",
+						Source:  "chronos",
+						Summary: fmt.Sprint(event.Data),
+					}
+					if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+						log.Printf("[workstream] record chronos verification failed: %v", err)
+					}
+					if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+						Type:    "chronos_run_failed",
+						Message: "Chronos run failed",
+						Data: map[string]string{
+							"provider": provider.Name(),
+							"model":    model,
+							"traceId":  traceID,
+							"task":     body.Task,
+							"error":    fmt.Sprint(event.Data),
+						},
+					}); err != nil {
+						log.Printf("[workstream] record chronos failure failed: %v", err)
+					}
 				}
 			}
 		}

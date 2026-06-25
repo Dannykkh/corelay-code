@@ -9,7 +9,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/types"
 	"github.com/aniclew/aniclew/internal/workstream"
 )
@@ -82,6 +84,44 @@ func TestWorkstreamAPI_CreateListGetHandoff(t *testing.T) {
 	}
 }
 
+func TestRunTracesAPI(t *testing.T) {
+	tracker := observability.NewTracker(t.TempDir())
+	started := time.Now().UTC().Add(-time.Second)
+	tracker.RecordRun(observability.RunTrace{
+		ID:        "run_api",
+		Kind:      "agent",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		Status:    "ok",
+		Spans: []observability.RunSpan{{
+			ID:        "maker_01",
+			Name:      "maker.llm_call",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "ok",
+		}},
+	})
+
+	s := New(nil, "", 0)
+	s.SetTracker(tracker)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/run-traces?limit=1", nil)
+	rec := httptest.NewRecorder()
+	s.handleRunTraces(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run traces status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var runs []observability.RunTrace
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("run traces json: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != "run_api" || !hasRunSpan(runs[0], "maker.llm_call") {
+		t.Fatalf("unexpected run traces: %+v", runs)
+	}
+}
+
 func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	t.Setenv("ANICLEW_MEMORY", "off")
 	t.Setenv("ANICLEW_AUTOSKILL", "off")
@@ -90,6 +130,8 @@ func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	provider := &agentLoopFakeProvider{text: "agent ok"}
 	s := New(provider, "fake-model", 0)
 	s.SetWorkDir(workDir)
+	tracker := observability.NewTracker(t.TempDir())
+	s.SetTracker(tracker)
 
 	store := workstream.NewStore(workDir)
 	if _, err := store.Create(workstream.CreateRequest{
@@ -117,6 +159,9 @@ func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+	if !strings.Contains(rec.Body.String(), `"traceId"`) {
+		t.Fatalf("SSE response missing traceId:\n%s", rec.Body.String())
 	}
 
 	events := agentSSEEventTypes(t, rec.Body.String())
@@ -152,6 +197,17 @@ func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 			t.Fatalf("missing timeline event %q in %+v", want, timeline)
 		}
 	}
+
+	runTraces := tracker.RecentRuns(10)
+	if len(runTraces) != 1 {
+		t.Fatalf("run traces=%d, want 1", len(runTraces))
+	}
+	if runTraces[0].Kind != "agent" || runTraces[0].WorkstreamID != "ws_agent" || runTraces[0].Status != "ok" {
+		t.Fatalf("unexpected run trace: %+v", runTraces[0])
+	}
+	if !hasRunSpan(runTraces[0], "maker.llm_call") {
+		t.Fatalf("agent run trace missing maker span: %+v", runTraces[0].Spans)
+	}
 }
 
 func TestChronosRecordsWorkstreamRun(t *testing.T) {
@@ -162,6 +218,8 @@ func TestChronosRecordsWorkstreamRun(t *testing.T) {
 	provider := &agentLoopFakeProvider{text: "[COMPLETE]"}
 	s := New(provider, "fake-model", 0)
 	s.SetWorkDir(workDir)
+	tracker := observability.NewTracker(t.TempDir())
+	s.SetTracker(tracker)
 
 	store := workstream.NewStore(workDir)
 	if _, err := store.Create(workstream.CreateRequest{
@@ -190,6 +248,9 @@ func TestChronosRecordsWorkstreamRun(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+	if !strings.Contains(rec.Body.String(), `"traceId"`) {
+		t.Fatalf("SSE response missing traceId:\n%s", rec.Body.String())
 	}
 
 	events := agentSSEEventTypes(t, rec.Body.String())
@@ -224,6 +285,17 @@ func TestChronosRecordsWorkstreamRun(t *testing.T) {
 		if !have[want] {
 			t.Fatalf("missing timeline event %q in %+v", want, timeline)
 		}
+	}
+
+	runTraces := tracker.RecentRuns(10)
+	if len(runTraces) != 1 {
+		t.Fatalf("run traces=%d, want 1", len(runTraces))
+	}
+	if runTraces[0].Kind != "chronos" || runTraces[0].WorkstreamID != "ws_chronos" || runTraces[0].Status != "ok" {
+		t.Fatalf("unexpected run trace: %+v", runTraces[0])
+	}
+	if !hasRunSpan(runTraces[0], "chronos.run") {
+		t.Fatalf("chronos run trace missing run span: %+v", runTraces[0].Spans)
 	}
 }
 
@@ -275,4 +347,13 @@ func agentSSEEventTypes(t *testing.T, body string) map[string]int {
 		events[event.Type]++
 	}
 	return events
+}
+
+func hasRunSpan(trace observability.RunTrace, name string) bool {
+	for _, span := range trace.Spans {
+		if span.Name == name {
+			return true
+		}
+	}
+	return false
 }
