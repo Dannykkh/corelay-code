@@ -33,6 +33,14 @@ AniClew sits between your coding CLI tools and LLM providers, giving you multi-p
 - **Context auto-compaction**: LLM-based summarization with snip fallback + circuit breaker
 
 ### Multi-Agent Teams
+- **TeamPlan contract**: Provider-neutral Daedalus-style plan with AgentTask, AgentSpec, stages, dependencies, and evidence criteria
+- **Capacity scheduling**: Local-model defaults keep Ollama/SGLang to one model worker while allowing bounded tool/web fan-out
+- **Resource-aware waves**: Team waves are internally batched by model/tool/web/test slots and file-scope locks
+- **Task routing**: TeamPlan tasks can override provider/model for role-specific execution
+- **Team dashboard**: The web Team page submits objectives, verification commands, capacity, per-task kind/role/provider/model, read-only mode, dependencies, file scopes, and resource reservations
+- **Plan CLI**: `aniclew team plan --objective "..." --out team-plan.json`, `aniclew team validate --plan team-plan.json`
+- **CLI worker/team**: `aniclew worker run --provider ollama --model qwen3:8b --task task.json` or `aniclew team run --plan team-plan.json`
+- **Team receipts**: Team and worker runs write `team-*.json` receipts with task status, provider/model, verification state, and output file pointers
 - **Wave execution**: Topological sort (Kahn's algorithm) for dependency-based parallelism
 - **File ownership**: Hard enforcement at ExecuteTool level
 - **6 agent types**: Explorer, Researcher, Planner, Coder, Reviewer, Tester
@@ -57,6 +65,8 @@ AniClew sits between your coding CLI tools and LLM providers, giving you multi-p
 
 ### Observability
 - **Request tracing**: Per-request provider, model, latency, tokens, cost (JSONL persistence)
+- **Agentic run traces**: Chronos and Team runs record durable run traces with spans, receipts, and workstream metadata
+- **Regression replay**: Failed Chronos/Team traces can be promoted into regression cases and replayed from captured task inputs or Team receipts
 - **Metrics**: Average/P95 latency, error rate, requests/min, per-provider breakdown
 - **Stream watchdog**: 90s idle timeout with context abort
 - **Response quality**: Thumbs up/down feedback with per-model scoring
@@ -195,6 +205,11 @@ Anthropic OpenAI Ollama ...
 | `POST /api/agent` | Coding agent (SSE) |
 | `POST /api/team` | Team execution (SSE) |
 | `POST /api/chronos` | Autonomous loop (SSE) |
+| `GET /api/run-traces` | Agentic run traces |
+| `POST /api/run-traces/{id}/regression` | Promote failed run trace to regression case |
+| `GET /api/regressions` | Regression cases |
+| `POST /api/regressions/{id}/run` | Replay regression case |
+| `GET /api/regression-runs` | Regression replay attempts |
 | `GET/POST /api/kairos/*` | Daemon control |
 | `GET /api/traces` | Request traces |
 | `GET /api/metrics` | Computed metrics |

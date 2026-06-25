@@ -15,12 +15,31 @@ Keep the user-facing model compact:
 | Plan | Explore and design before implementation | `internal/agent/planmode.go` |
 | Execute | Use tools to change files with permissions | `internal/agent/loop.go`, `tools.go` |
 | Verify | Run the project test command after edits | `internal/agent/verify.go` |
-| Team | Run parallel workers with ownership rules | `internal/agent/team.go` |
+| Team | Run TeamPlan tasks with ownership and capacity rules | `internal/agent/team_plan.go`, `internal/agent/team.go` |
 | Memory | Preserve durable context after sessions | `internal/agent/memory_hook.go` |
 | Skill | Extract repeatable workflows | `internal/agent/skill_hook.go`, `internal/skills` |
 
 The rest of the features should stay discoverable as internals or advanced
 configuration, not as the first thing a user has to understand.
+
+The Team surface is intentionally a harness layer, not a smarter single prompt:
+`TeamPlan` defines stages, roles, task dependencies, file scopes, acceptance
+evidence, and capacity limits before a worker loop starts. Local providers such
+as Ollama and SGLang default to one model worker so they can still use bounded
+tool and web parallelism without overloading GPU memory. Individual tasks may
+override provider/model when a plan needs a stronger reviewer or a smaller local
+worker for routine implementation. Plans are validated before execution:
+duplicate task IDs, missing dependencies, dependency cycles, missing write
+scopes, and broken stage references are rejected before any worker starts.
+During execution, each topological wave is split into capacity-aware batches:
+task `resources` reserve model/tool/web/test slots, verify tasks reserve a test
+slot by default, and write-capable tasks with overlapping file scopes are not
+started in the same batch when file-scope locking is enabled.
+
+The web Team page is part of this same contract. It submits the TeamPlan
+objective, verification command, capacity limits, task kind/role, provider/model
+overrides, read-only mode, dependencies, file scopes, and per-task resource
+reservations instead of relying on a reduced legacy task shape.
 
 ## Invariants
 
@@ -88,6 +107,25 @@ Receipt schema:
 
 This receipt is intentionally small. It does not store prompts, tool outputs, or
 secrets.
+
+Team and worker runs use the same workspace namespace and add a `team-` prefix:
+
+```text
+~/.claude-proxy/receipts/<workspace-key>/team-<timestamp>.json
+```
+
+Team receipts record the run status, TeamPlan identity, provider/model,
+capacity limits, verification status, aggregate task counts, and one compact
+entry per task. Each task entry includes status, role, wave, file scope, tool
+count, and the output file path. Full worker output stays under the team output
+directory and is referenced by path instead of embedded in the receipt.
+
+Failed Chronos and Team run traces can be promoted into regression cases.
+Chronos cases replay from captured task inputs; Team cases replay by rebuilding
+the TeamPlan from the recorded team receipt. Replay attempts are recorded as
+regression runs, including unsupported attempts such as missing providers, so
+the checker layer remains observable instead of disappearing into a one-off
+error response.
 
 ### 4. Verification is bounded
 
