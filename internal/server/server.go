@@ -2427,7 +2427,15 @@ func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 // ── Agent Types & Worktrees ──
 
 func (s *Server) handleAgentTypes(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, agent.BuiltinAgentTypes())
+	s.mu.RLock()
+	workDir := s.workDir
+	s.mu.RUnlock()
+
+	types := agent.BuiltinAgentTypes()
+	for name, custom := range agent.LoadCustomAgentTypes(workDir) {
+		types[name] = custom
+	}
+	writeJSON(w, types)
 }
 
 func (s *Server) handleMultiModel(w http.ResponseWriter, r *http.Request) {
