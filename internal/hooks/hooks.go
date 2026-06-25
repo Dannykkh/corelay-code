@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -14,8 +15,8 @@ import (
 type HookType string
 
 const (
-	HookPreToolUse  HookType = "pre_tool_use"
-	HookPostToolUse HookType = "post_tool_use"
+	HookPreToolUse   HookType = "pre_tool_use"
+	HookPostToolUse  HookType = "post_tool_use"
 	HookSessionStart HookType = "session_start"
 	HookSessionEnd   HookType = "session_end"
 	HookPreCompact   HookType = "pre_compact"
@@ -129,7 +130,8 @@ func (r *Registry) run(h Hook, env map[string]string) HookResult {
 
 	start := time.Now()
 
-	cmd := exec.Command("bash", "-c", h.Command)
+	shell, args := hookShell(h.Command)
+	cmd := exec.Command(shell, args...)
 	cmd.Dir = r.workDir
 
 	// Set environment
@@ -172,6 +174,40 @@ func (r *Registry) run(h Hook, env map[string]string) HookResult {
 			Blocked:  false, // timeout doesn't block, just warns
 		}
 	}
+}
+
+func hookShell(command string) (string, []string) {
+	if runtime.GOOS == "windows" {
+		if gitBash := findGitBash(); gitBash != "" {
+			return gitBash, []string{"-c", command}
+		}
+	}
+	return "bash", []string{"-c", command}
+}
+
+func findGitBash() string {
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		candidate := filepath.Join(dir, "bash.exe")
+		if _, err := os.Stat(candidate); err != nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(filepath.Clean(candidate)), `\git\`) {
+			return candidate
+		}
+	}
+	for _, candidate := range []string{
+		filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe"),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Git", "bin", "bash.exe"),
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Git", "bin", "bash.exe"),
+	} {
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func resolveSourceList(skillSource string) []string {
