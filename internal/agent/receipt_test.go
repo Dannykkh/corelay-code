@@ -114,6 +114,9 @@ func TestWriteTeamRunReceiptToDir(t *testing.T) {
 		Name:      "daedalus-plan",
 		Objective: "Add durable state for team runs",
 	}, "completed", ReceiptVerification{Status: "passed", Source: "team-verify"})
+	if receipt.WorkDir != workDir {
+		t.Fatalf("BuildRunReceipt workDir = %q, want %q", receipt.WorkDir, workDir)
+	}
 
 	path, err := writeTeamRunReceiptToDir(baseDir, workDir, receipt, now)
 	if err != nil {

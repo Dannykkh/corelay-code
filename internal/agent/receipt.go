@@ -163,6 +163,7 @@ func (t *Team) BuildRunReceipt(plan TeamPlan, status string, verification Receip
 
 	receipt := TeamRunReceipt{
 		Kind:          "team-run",
+		WorkDir:       t.workDir,
 		Status:        strings.TrimSpace(status),
 		TeamName:      t.config.Name,
 		PlanName:      planName,

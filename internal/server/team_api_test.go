@@ -140,7 +140,7 @@ func TestHandleTeamExecuteRecordsTraceAndWorkstream(t *testing.T) {
 	if len(runTraces) != 1 {
 		t.Fatalf("run traces=%d, want 1", len(runTraces))
 	}
-	if runTraces[0].Kind != "team" || runTraces[0].WorkstreamID != "ws_team" || runTraces[0].Status != "ok" {
+	if runTraces[0].Kind != "team" || runTraces[0].WorkstreamID != "ws_team" || runTraces[0].Status != "ok" || runTraces[0].WorkDir != workDir {
 		t.Fatalf("unexpected run trace: %+v", runTraces[0])
 	}
 	if runTraces[0].Metadata["source"] != "api.team" || runTraces[0].Metadata["receipt"] == "" {
