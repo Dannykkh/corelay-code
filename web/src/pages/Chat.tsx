@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { t } from '../lib/i18n';
 import { Markdown } from '../components/Markdown';
 import { listSessions, getSession, saveSession, deleteSession, type SessionSummary, type SessionMessage } from '../lib/sessions';
+import { createWorkstream, generateHandoff, listWorkstreams, type Workstream } from '../lib/workstreams';
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'tool';
@@ -29,6 +30,9 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [isListening, setIsListening] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [_sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
+  const [selectedWorkstreamId, setSelectedWorkstreamId] = useState('');
+  const [workstreamNotice, setWorkstreamNotice] = useState('');
   // Liveness indicators for slow local models: elapsed seconds tick client-side
   // from the moment we send; genChars is the authoritative output size from the
   // backend heartbeat. Together they prove the model is alive, not hung —
@@ -44,6 +48,23 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   useEffect(() => {
     listSessions().then((s) => setSessions(s || [])).catch(() => setSessions([]));
   }, []);
+
+  const refreshWorkstreams = useCallback(async () => {
+    try {
+      const next = await listWorkstreams();
+      setWorkstreams(next);
+      setSelectedWorkstreamId((current) => {
+        if (!current) return current;
+        return next.some((w) => w.id === current) ? current : '';
+      });
+    } catch (err) {
+      setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshWorkstreams();
+  }, [refreshWorkstreams]);
 
   // Handle session load/new from SidePanel
   useEffect(() => {
@@ -152,7 +173,10 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: apiMessages }),
+        body: JSON.stringify({
+          messages: apiMessages,
+          workstreamId: selectedWorkstreamId || undefined,
+        }),
         signal: controller.signal,
       });
 
@@ -267,6 +291,11 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         if (typeof event.data?.chars === 'number') setGenChars(event.data.chars);
         if (typeof event.data?.elapsedMs === 'number') setElapsed(Math.floor(event.data.elapsedMs / 1000));
         break;
+      case 'workstream':
+        if (typeof event.data?.id === 'string') {
+          setSelectedWorkstreamId(event.data.id);
+        }
+        break;
       case 'status':
         setStatus(event.data);
         break;
@@ -280,6 +309,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           }
           return prev;
         });
+        refreshWorkstreams();
         break;
       case 'error':
         setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${event.data}`, timestamp: new Date() }]);
@@ -292,6 +322,40 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const liveLabel = streaming
     ? `${status || 'Thinking…'} · ${elapsed}s${genChars > 0 ? ` · ${genChars.toLocaleString()} chars` : ''}`
     : '';
+  const selectedWorkstream = workstreams.find((w) => w.id === selectedWorkstreamId);
+
+  async function createCurrentWorkstream() {
+    const seed = input.trim() || messages.find((m) => m.role === 'user')?.content || 'Local agent workstream';
+    const title = seed.split('\n')[0].slice(0, 80) || 'Local agent workstream';
+    try {
+      const created = await createWorkstream({
+        title,
+        summary: seed,
+        nextAction: seed,
+        tags: ['chat'],
+        goal: {
+          objective: seed,
+          acceptanceCriteria: ['Agent runs are linked to this workstream', 'Verification and receipts are recorded'],
+          verificationPolicy: { requiredSignals: ['test'], maxRepairAttempts: 2 },
+        },
+      });
+      setSelectedWorkstreamId(created.id);
+      setWorkstreamNotice(`Created ${created.title}`);
+      await refreshWorkstreams();
+    } catch (err) {
+      setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function exportHandoff() {
+    if (!selectedWorkstreamId) return;
+    try {
+      const result = await generateHandoff(selectedWorkstreamId);
+      setWorkstreamNotice(`Handoff saved: ${result.path}`);
+    } catch (err) {
+      setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   return (
     <div className="flex flex-col flex-1 min-w-0 h-full w-full">
@@ -314,7 +378,53 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
             </span>
           )}
         </div>
+        <div className="flex items-center gap-2 min-w-0">
+          <select
+            value={selectedWorkstreamId}
+            onChange={(e) => setSelectedWorkstreamId(e.target.value)}
+            className="max-w-72 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)]"
+            title="Workstream"
+          >
+            <option value="">No workstream</option>
+            {workstreams.map((ws) => (
+              <option key={ws.id} value={ws.id}>{ws.title}</option>
+            ))}
+          </select>
+          <button
+            onClick={createCurrentWorkstream}
+            className="px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)]"
+          >
+            New
+          </button>
+          <button
+            onClick={exportHandoff}
+            disabled={!selectedWorkstreamId}
+            className="px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text)] disabled:opacity-40 hover:border-[var(--color-accent)]"
+          >
+            Handoff
+          </button>
+        </div>
       </div>
+
+      {(selectedWorkstream || workstreamNotice) && (
+        <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex items-center gap-3 text-xs min-h-10">
+          {selectedWorkstream && (
+            <>
+              <span className="font-medium text-[var(--color-text)] truncate max-w-64">{selectedWorkstream.title}</span>
+              <span className="text-[var(--color-text2)]">{selectedWorkstream.status}</span>
+              {selectedWorkstream.lastVerification?.status && (
+                <span className="text-[var(--color-text2)]">verify: {selectedWorkstream.lastVerification.status}</span>
+              )}
+              {selectedWorkstream.nextAction && (
+                <span className="text-[var(--color-text2)] truncate min-w-0">next: {selectedWorkstream.nextAction}</span>
+              )}
+            </>
+          )}
+          {workstreamNotice && (
+            <span className="ml-auto text-[var(--color-text2)] truncate">{workstreamNotice}</span>
+          )}
+        </div>
+      )}
 
       {/* Messages Area — full width */}
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
