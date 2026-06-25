@@ -1,14 +1,112 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON, type CostEntry } from '../lib/api';
 
+type RunTrace = {
+  id: string;
+  kind: string;
+  startedAt: string;
+  durationMs?: number;
+  provider: string;
+  model: string;
+  workstreamId?: string;
+  status: 'running' | 'ok' | 'failed' | string;
+  error?: string;
+  spans?: { name: string; status: string; durationMs?: number }[];
+  metadata?: Record<string, string>;
+};
+
+type RegressionCase = {
+  id: string;
+  traceId: string;
+  createdAt: string;
+  name: string;
+  kind: string;
+  provider: string;
+  model: string;
+  replayable: boolean;
+  replayHint?: string;
+  inputs?: Record<string, string>;
+  failure: { status: string; error?: string; failedSpans?: string[] };
+};
+
+type RegressionRun = {
+  id: string;
+  caseId: string;
+  traceId: string;
+  runTraceId?: string;
+  startedAt: string;
+  durationMs?: number;
+  kind: string;
+  provider: string;
+  model: string;
+  status: 'running' | 'passed' | 'failed' | 'unsupported' | string;
+  error?: string;
+  checks?: { name: string; target: string; expected: string; observed: string; passed: boolean }[];
+};
+
+type ProviderMetrics = {
+  requests: number;
+  avgLatencyMs: number;
+  cost: number;
+  errors: number;
+};
+
+type Metrics = {
+  totalRequests: number;
+  avgLatencyMs: number;
+  p95LatencyMs: number;
+  errorRate: number;
+  byProvider?: Record<string, ProviderMetrics>;
+};
+
+type RequestTrace = {
+  timestamp: string;
+  status: string;
+  provider: string;
+  model: string;
+  latencyMs: number;
+  outputTokens: number;
+  source: string;
+};
+
+type FeedbackStats = {
+  total: number;
+  thumbsUp: number;
+  thumbsDown: number;
+  score: number;
+  byModel?: Record<string, { up: number; down: number; score: number }>;
+};
+
+type ABResult = {
+  modelA: string;
+  modelB: string;
+  responseA?: string;
+  responseB?: string;
+  latencyA_ms: number;
+  latencyB_ms: number;
+  tokensA: number;
+  tokensB: number;
+  winner?: string;
+};
+
+type SSEEvent = {
+  type?: string;
+  data?: unknown;
+};
+
 export function CostsPage() {
   const [costs, setCosts] = useState<{ total: number; breakdown: CostEntry[] }>({ total: 0, breakdown: [] });
-  const [metrics, setMetrics] = useState<any>(null);
-  const [traces, setTraces] = useState<any[]>([]);
-  const [feedbackStats, setFeedbackStats] = useState<any>(null);
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [traces, setTraces] = useState<RequestTrace[]>([]);
+  const [runTraces, setRunTraces] = useState<RunTrace[]>([]);
+  const [regressionCases, setRegressionCases] = useState<RegressionCase[]>([]);
+  const [regressionRuns, setRegressionRuns] = useState<RegressionRun[]>([]);
+  const [feedbackStats, setFeedbackStats] = useState<FeedbackStats | null>(null);
   const [abPrompt, setAbPrompt] = useState('');
   const [abRunning, setAbRunning] = useState(false);
-  const [abResults, setAbResults] = useState<any[]>([]);
+  const [abResults, setAbResults] = useState<ABResult[]>([]);
+  const [runActionId, setRunActionId] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
 
   useEffect(() => {
     load();
@@ -17,19 +115,72 @@ export function CostsPage() {
   }, []);
 
   async function load() {
-    const [c, m, t, f] = await Promise.all([
-      fetchJSON<any>('/api/costs'),
-      fetchJSON<any>('/api/metrics?window=60').catch(() => null),
-      fetchJSON<any[]>('/api/traces?limit=20').catch(() => []),
-      fetchJSON<any>('/api/feedback').catch(() => null),
+    const [c, m, t, rt, rc, rr, f] = await Promise.all([
+      fetchJSON<{ total: number; breakdown: CostEntry[] }>('/api/costs'),
+      fetchJSON<Metrics>('/api/metrics?window=60').catch(() => null),
+      fetchJSON<RequestTrace[]>('/api/traces?limit=20').catch(() => []),
+      fetchJSON<RunTrace[]>('/api/run-traces?limit=40').catch(() => []),
+      fetchJSON<RegressionCase[]>('/api/regressions?limit=40').catch(() => []),
+      fetchJSON<RegressionRun[]>('/api/regression-runs?limit=40').catch(() => []),
+      fetchJSON<FeedbackStats>('/api/feedback').catch(() => null),
     ]);
     setCosts(c);
     setMetrics(m);
     setTraces(Array.isArray(t) ? t : []);
+    setRunTraces(Array.isArray(rt) ? rt : []);
+    setRegressionCases(Array.isArray(rc) ? rc : []);
+    setRegressionRuns(Array.isArray(rr) ? rr : []);
     setFeedbackStats(f);
   }
 
+  async function createRegression(traceId: string) {
+    setRunActionId(traceId);
+    setActionMessage(null);
+    try {
+      const c = await fetchJSON<RegressionCase>(`/api/run-traces/${encodeURIComponent(traceId)}/regression`, {
+        method: 'POST',
+      });
+      setActionMessage(`Regression case ready: ${c.id}`);
+      await load();
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunActionId(null);
+    }
+  }
+
+  async function replayRegression(caseId: string) {
+    setRunActionId(caseId);
+    setActionMessage('Replay started');
+    try {
+      const res = await fetch(`/api/regressions/${encodeURIComponent(caseId)}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) {
+        const msg = await readError(res);
+        throw new Error(msg);
+      }
+      const result = await readRegressionReplay(res);
+      setActionMessage(result ? `Replay ${result.status}: ${result.id}` : 'Replay completed');
+      await load();
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunActionId(null);
+    }
+  }
+
   const maxCost = Math.max(...costs.breakdown.map((b) => b.cost), 0.001);
+  const failedRuns = runTraces.filter((t) => t.status === 'failed').slice().reverse().slice(0, 6);
+  const recentAgenticRuns = runTraces.slice().reverse().slice(0, 8);
+  const latestRegressionRuns = regressionRuns.slice().reverse().slice(0, 8);
+  const casesByTrace = new Map(regressionCases.map((c) => [c.traceId, c]));
+  const lastRunByCase = new Map<string, RegressionRun>();
+  for (const run of regressionRuns) {
+    lastRunByCase.set(run.caseId, run);
+  }
 
   return (
     <div className="p-6 w-full overflow-y-auto h-full">
@@ -69,7 +220,7 @@ export function CostsPage() {
           <div className="text-xs text-[var(--color-text2)] uppercase mb-3">Provider Breakdown (1h)</div>
           {metrics?.byProvider && Object.keys(metrics.byProvider).length > 0 ? (
             <div className="space-y-2">
-              {Object.entries(metrics.byProvider).map(([name, pm]: [string, any]) => (
+              {Object.entries(metrics.byProvider).map(([name, pm]) => (
                 <div key={name} className="flex items-center justify-between text-sm">
                   <span className="font-medium">{name}</span>
                   <div className="flex gap-4 text-xs text-[var(--color-text2)]">
@@ -98,7 +249,7 @@ export function CostsPage() {
                   <div>{feedbackStats.total} total ratings</div>
                 </div>
               </div>
-              {Object.entries(feedbackStats.byModel || {}).map(([model, ms]: [string, any]) => (
+              {Object.entries(feedbackStats.byModel || {}).map(([model, ms]) => (
                 <div key={model} className="flex items-center justify-between text-xs py-1">
                   <span className="font-mono">{model}</span>
                   <div className="flex items-center gap-2">
@@ -152,13 +303,154 @@ export function CostsPage() {
         </table>
       </div>
 
+      {/* Agentic run loop */}
+      <div className="mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <div className="text-xs text-[var(--color-text2)] uppercase">Agentic Runs</div>
+            <div className="text-sm text-[var(--color-text)]">Trace failures, promote them to regressions, and replay fixed cases.</div>
+          </div>
+          <div className="flex items-center gap-2 text-xs">
+            {actionMessage && <span className="text-[var(--color-text2)] max-w-96 truncate">{actionMessage}</span>}
+            <button
+              onClick={load}
+              className="px-3 py-1.5 rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] active:scale-[0.98]"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-4 gap-3 mb-3">
+          <MetricTile label="Run traces" value={runTraces.length} tone="accent" />
+          <MetricTile label="Failed runs" value={failedRuns.length} tone={failedRuns.length > 0 ? 'red' : 'green'} />
+          <MetricTile label="Regression cases" value={regressionCases.length} tone="accent" />
+          <MetricTile label="Replay passes" value={regressionRuns.filter((r) => r.status === 'passed').length} tone="green" />
+        </div>
+
+        <div className="grid grid-cols-2 gap-4 mb-4">
+          <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl overflow-hidden">
+            <div className="px-4 py-3 bg-[var(--color-surface2)] border-b border-[var(--color-border)] flex items-center justify-between">
+              <div className="text-xs text-[var(--color-text2)] uppercase">Failed Run Traces</div>
+              <div className="text-[10px] text-[var(--color-text2)]">{failedRuns.length} visible</div>
+            </div>
+            <div className="divide-y divide-[var(--color-border)]">
+              {failedRuns.length === 0 ? (
+                <div className="px-4 py-6 text-xs text-[var(--color-text2)]">No failed agentic runs recorded.</div>
+              ) : failedRuns.map((run) => {
+                const c = casesByTrace.get(run.id);
+                return (
+                  <div key={run.id} className="px-4 py-3 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <StatusPill status={run.status} />
+                      <span className="font-mono text-[var(--color-accent)] truncate">{shortID(run.id)}</span>
+                      <span className="text-[var(--color-text2)]">{run.kind}</span>
+                      <span className="text-[var(--color-text2)] ml-auto">{formatTime(run.startedAt)}</span>
+                    </div>
+                    <div className="mt-1 text-[var(--color-text2)] truncate">
+                      {run.error || run.spans?.find((s) => s.status === 'failed')?.name || 'failed without detail'}
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                      {c ? (
+                        <span className="text-[var(--color-green)]">Case {shortID(c.id)}</span>
+                      ) : (
+                        <button
+                          onClick={() => createRegression(run.id)}
+                          disabled={runActionId === run.id}
+                          className="px-2.5 py-1 rounded bg-[var(--color-surface2)] text-[var(--color-text)] border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-40 active:scale-[0.98]"
+                        >
+                          {runActionId === run.id ? 'Creating' : 'Create Case'}
+                        </button>
+                      )}
+                      <span className="text-[var(--color-text2)] truncate">{run.provider}/{run.model}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl overflow-hidden">
+            <div className="px-4 py-3 bg-[var(--color-surface2)] border-b border-[var(--color-border)] flex items-center justify-between">
+              <div className="text-xs text-[var(--color-text2)] uppercase">Regression Cases</div>
+              <div className="text-[10px] text-[var(--color-text2)]">{regressionCases.length} total</div>
+            </div>
+            <div className="divide-y divide-[var(--color-border)] max-h-80 overflow-y-auto">
+              {regressionCases.length === 0 ? (
+                <div className="px-4 py-6 text-xs text-[var(--color-text2)]">Create a case from a failed run trace.</div>
+              ) : regressionCases.slice().reverse().slice(0, 8).map((c) => {
+                const last = lastRunByCase.get(c.id);
+                const canReplay = c.replayable && c.kind === 'chronos';
+                return (
+                  <div key={c.id} className="px-4 py-3 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-mono text-[var(--color-accent)] truncate">{shortID(c.id)}</span>
+                      <span className="text-[var(--color-text2)]">{c.kind}</span>
+                      <span className={c.replayable ? 'text-[var(--color-green)]' : 'text-[var(--color-yellow)]'}>
+                        {c.replayable ? 'replayable' : 'checks only'}
+                      </span>
+                      <span className="text-[var(--color-text2)] ml-auto">{formatTime(c.createdAt)}</span>
+                    </div>
+                    <div className="mt-1 text-[var(--color-text)] truncate">{c.inputs?.task || c.name}</div>
+                    <div className="mt-2 flex items-center gap-2">
+                      <button
+                        onClick={() => replayRegression(c.id)}
+                        disabled={!canReplay || runActionId === c.id}
+                        title={canReplay ? 'Replay Chronos regression' : c.replayHint || 'Replay unsupported'}
+                        className="px-2.5 py-1 rounded bg-[var(--color-accent)] text-white disabled:bg-[var(--color-surface2)] disabled:text-[var(--color-text2)] disabled:opacity-60 active:scale-[0.98]"
+                      >
+                        {runActionId === c.id ? 'Running' : 'Replay'}
+                      </button>
+                      {last ? <StatusPill status={last.status} /> : <span className="text-[var(--color-text2)]">not replayed</span>}
+                      <span className="text-[var(--color-text2)] truncate">{c.failure.error || c.failure.failedSpans?.join(', ')}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-xl p-4 font-mono text-xs max-h-64 overflow-auto">
+          <div className="grid grid-cols-[5rem_5rem_7rem_1fr_6rem_7rem] gap-3 text-[var(--color-text2)] uppercase font-sans text-[10px] mb-2">
+            <span>Time</span><span>Status</span><span>Kind</span><span>ID / Task</span><span>Duration</span><span>Run Trace</span>
+          </div>
+          {latestRegressionRuns.length === 0 && recentAgenticRuns.length === 0 ? (
+            <div className="text-[var(--color-text2)]">No agentic run activity yet</div>
+          ) : (
+            <>
+              {latestRegressionRuns.map((run) => (
+                <div key={run.id} className="grid grid-cols-[5rem_5rem_7rem_1fr_6rem_7rem] gap-3 py-1 items-center border-t border-[var(--color-border)]/60">
+                  <span className="text-[var(--color-text2)]">{formatTime(run.startedAt)}</span>
+                  <StatusPill status={run.status} />
+                  <span>{run.kind}</span>
+                  <span className="truncate text-[var(--color-accent)]">{shortID(run.caseId)}</span>
+                  <span className="text-[var(--color-text2)]">{formatDuration(run.durationMs)}</span>
+                  <span className="text-[var(--color-text2)] truncate">{run.runTraceId ? shortID(run.runTraceId) : '-'}</span>
+                </div>
+              ))}
+              {recentAgenticRuns.map((run) => (
+                <div key={run.id} className="grid grid-cols-[5rem_5rem_7rem_1fr_6rem_7rem] gap-3 py-1 items-center border-t border-[var(--color-border)]/60">
+                  <span className="text-[var(--color-text2)]">{formatTime(run.startedAt)}</span>
+                  <StatusPill status={run.status} />
+                  <span>{run.kind}</span>
+                  <span className="truncate text-[var(--color-accent)]">{shortID(run.id)}</span>
+                  <span className="text-[var(--color-text2)]">{formatDuration(run.durationMs)}</span>
+                  <span className="text-[var(--color-text2)] truncate">{run.metadata?.source || 'live'}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </div>
+
       {/* Request Trace Log */}
       <div className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-xl p-4 font-mono text-xs max-h-60 overflow-y-auto">
         <div className="text-[var(--color-text2)] uppercase mb-2 font-sans text-xs">Recent Requests</div>
         {traces.length === 0 ? (
           <div className="text-[var(--color-text2)]">No traces yet</div>
         ) : (
-          traces.slice().reverse().map((t: any, i: number) => (
+          traces.slice().reverse().map((t, i) => (
             <div key={i} className="flex gap-3 py-0.5 items-center">
               <span className="text-[var(--color-text2)] w-16 shrink-0">
                 {new Date(t.timestamp).toLocaleTimeString()}
@@ -191,13 +483,15 @@ export function CostsPage() {
               if (!abPrompt) return;
               setAbRunning(true);
               try {
-                const result = await fetchJSON<any>('/api/ab-test', {
+                const result = await fetchJSON<ABResult>('/api/ab-test', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ prompt: abPrompt }),
                 });
                 setAbResults(prev => [result, ...prev].slice(0, 10));
-              } catch {}
+              } catch (err) {
+                setActionMessage(err instanceof Error ? err.message : String(err));
+              }
               setAbRunning(false);
             }}
             disabled={abRunning}
@@ -206,7 +500,7 @@ export function CostsPage() {
             {abRunning ? 'Running...' : 'Compare'}
           </button>
         </div>
-        {abResults.map((r: any, i: number) => (
+        {abResults.map((r, i) => (
           <div key={i} className="bg-[var(--color-bg)] rounded-lg p-3 mb-2 text-xs">
             <div className="flex gap-4 mb-2">
               <span className="font-medium">{r.modelA}</span>
@@ -229,4 +523,84 @@ export function CostsPage() {
       </div>
     </div>
   );
+}
+
+function MetricTile({ label, value, tone }: { label: string; value: number; tone: 'accent' | 'green' | 'red' }) {
+  const toneClass = tone === 'green' ? 'text-[var(--color-green)]' : tone === 'red' ? 'text-[var(--color-red)]' : 'text-[var(--color-accent)]';
+  return (
+    <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-3">
+      <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">{label}</div>
+      <div className={`text-lg font-bold tabular-nums ${toneClass}`}>{value}</div>
+    </div>
+  );
+}
+
+function StatusPill({ status }: { status: string }) {
+  const cls = status === 'ok' || status === 'passed'
+    ? 'text-[var(--color-green)] bg-green-500/10'
+    : status === 'failed'
+      ? 'text-[var(--color-red)] bg-red-500/10'
+      : status === 'unsupported'
+        ? 'text-[var(--color-yellow)] bg-yellow-500/10'
+        : 'text-[var(--color-text2)] bg-[var(--color-surface2)]';
+  return <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-sans ${cls}`}>{status}</span>;
+}
+
+function shortID(id: string) {
+  if (id.length <= 18) return id;
+  return `${id.slice(0, 8)}...${id.slice(-6)}`;
+}
+
+function formatTime(value?: string) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleTimeString();
+}
+
+function formatDuration(ms?: number) {
+  if (!ms) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+async function readError(res: Response) {
+  try {
+    const body = await res.json();
+    return body?.error?.message || body?.message || `HTTP ${res.status}`;
+  } catch {
+    return `HTTP ${res.status}`;
+  }
+}
+
+async function readRegressionReplay(res: Response): Promise<RegressionRun | null> {
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream')) {
+    return res.json() as Promise<RegressionRun>;
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return null;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: RegressionRun | null = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(trimmed.slice(6)) as SSEEvent;
+        if (event.type === 'regression_result') {
+          result = event.data as RegressionRun;
+        }
+      } catch {
+        // Ignore malformed stream fragments.
+      }
+    }
+  }
+  return result;
 }
