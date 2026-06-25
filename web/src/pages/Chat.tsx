@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { t } from '../lib/i18n';
 import { Markdown } from '../components/Markdown';
-import { listSessions, getSession, saveSession, deleteSession, type SessionSummary, type SessionMessage } from '../lib/sessions';
+import { listSessions, getSession, saveSession, type SessionSummary, type SessionMessage } from '../lib/sessions';
 import { createWorkstream, generateHandoff, listWorkstreams, type Workstream } from '../lib/workstreams';
 
 interface ChatMessage {
@@ -20,6 +20,50 @@ interface ChatPageProps {
   onSessionLoaded?: () => void;
 }
 
+type AgentEvent = {
+  type: string;
+  data?: unknown;
+};
+
+type AgentEventObject = {
+  name?: string;
+  input?: Record<string, unknown> | string;
+  result?: string;
+  isError?: boolean;
+  diff?: string;
+  chars?: number;
+  elapsedMs?: number;
+  id?: string;
+  planMode?: boolean;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+type SpeechRecognitionEventLike = {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+};
+
+function eventObject(data: unknown): AgentEventObject {
+  return data && typeof data === 'object' ? data as AgentEventObject : {};
+}
+
+function eventText(data: unknown): string {
+  if (typeof data === 'string') return data;
+  if (data == null) return '';
+  return JSON.stringify(data);
+}
+
 export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -29,7 +73,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [attachedImage, setAttachedImage] = useState<string | null>(null); // base64
   const [isListening, setIsListening] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [_sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [, setSessions] = useState<SessionSummary[]>([]);
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState('');
   const [workstreamNotice, setWorkstreamNotice] = useState('');
@@ -75,7 +119,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       loadSession(loadSessionId);
     }
     onSessionLoaded?.();
-  }, [loadSessionId]);
+  }, [loadSessionId, onSessionLoaded]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -117,15 +161,6 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     setMessages([]);
     setSessionId(null);
   }
-
-  // @ts-expect-error reserved for SidePanel session list
-  const _handleDelete = async (id: string) => {
-    await deleteSession(id);
-    setSessions((prev) => prev.filter((s) => s.id !== id));
-    if (sessionId === id) {
-      newChat();
-    }
-  };
 
   async function send(overrideText?: string) {
     const text = (overrideText ?? input).trim();
@@ -194,7 +229,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           const trimmed = line.trim();
           if (!trimmed.startsWith('data: ')) continue;
           try {
-            handleAgentEvent(JSON.parse(trimmed.slice(6)));
+            handleAgentEvent(JSON.parse(trimmed.slice(6)) as AgentEvent);
           } catch { /* skip */ }
         }
       }
@@ -223,7 +258,8 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     }
   }
 
-  function handleAgentEvent(event: { type: string; data: any }) {
+  function handleAgentEvent(event: AgentEvent) {
+    const data = eventObject(event.data);
     switch (event.type) {
       case 'thinking':
         // Append thinking text to assistant message (wrapped in <think> tags for rendering)
@@ -232,7 +268,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           const last = updated[updated.length - 1];
           if (last?.role === 'assistant') {
             const thinkTag = last.content.includes('<think>') ? '' : '<think>';
-            updated[updated.length - 1] = { ...last, content: last.content + thinkTag + event.data };
+            updated[updated.length - 1] = { ...last, content: last.content + thinkTag + eventText(event.data) };
           }
           return updated;
         });
@@ -244,26 +280,26 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           if (last?.role === 'assistant') {
             // Close thinking block if transitioning to text
             const closingTag = last.content.includes('<think>') && !last.content.includes('</think>') ? '</think>\n\n' : '';
-            updated[updated.length - 1] = { ...last, content: last.content + closingTag + event.data };
+            updated[updated.length - 1] = { ...last, content: last.content + closingTag + eventText(event.data) };
           }
           return updated;
         });
         break;
       case 'tool_start':
-        setStatus(`${t('chat.executing')} ${event.data.name}`);
+        setStatus(`${t('chat.executing')} ${data.name || ''}`);
         break;
       case 'tool_input':
         setMessages((prev) => [...prev, {
-          role: 'tool' as const, content: '', toolName: event.data.name,
-          toolInput: event.data.input, timestamp: new Date(),
+          role: 'tool' as const, content: '', toolName: data.name,
+          toolInput: data.input, timestamp: new Date(),
         }]);
         break;
       case 'tool_result':
         setMessages((prev) => {
           const updated = [...prev];
           for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === 'tool' && updated[i].toolName === event.data.name && !updated[i].toolResult) {
-              updated[i] = { ...updated[i], toolResult: event.data.result, isError: event.data.isError };
+            if (updated[i].role === 'tool' && updated[i].toolName === data.name && !updated[i].toolResult) {
+              updated[i] = { ...updated[i], toolResult: data.result, isError: data.isError };
               break;
             }
           }
@@ -279,7 +315,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           for (let i = updated.length - 1; i >= 0; i--) {
             if (updated[i].role === 'tool' && !updated[i].toolDiff &&
                 (updated[i].toolName === 'Edit' || updated[i].toolName === 'Write')) {
-              updated[i] = { ...updated[i], toolDiff: event.data.diff };
+              updated[i] = { ...updated[i], toolDiff: data.diff };
               break;
             }
           }
@@ -288,20 +324,20 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         break;
       case 'heartbeat':
         // Authoritative output size + elapsed from the backend liveness ticker.
-        if (typeof event.data?.chars === 'number') setGenChars(event.data.chars);
-        if (typeof event.data?.elapsedMs === 'number') setElapsed(Math.floor(event.data.elapsedMs / 1000));
+        if (typeof data.chars === 'number') setGenChars(data.chars);
+        if (typeof data.elapsedMs === 'number') setElapsed(Math.floor(data.elapsedMs / 1000));
         break;
       case 'workstream':
-        if (typeof event.data?.id === 'string') {
-          setSelectedWorkstreamId(event.data.id);
+        if (typeof data.id === 'string') {
+          setSelectedWorkstreamId(data.id);
         }
         break;
       case 'status':
-        setStatus(event.data);
+        setStatus(eventText(event.data));
         break;
       case 'done':
       case 'stream_end':
-        if (event.type === 'done' && event.data?.planMode) setPlanReady(true);
+        if (event.type === 'done' && data.planMode) setPlanReady(true);
         setStatus('');
         setMessages((prev) => {
           if (prev[prev.length - 1]?.role === 'assistant' && prev[prev.length - 1]?.content === '') {
@@ -312,7 +348,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         refreshWorkstreams();
         break;
       case 'error':
-        setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${event.data}`, timestamp: new Date() }]);
+        setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${eventText(event.data)}`, timestamp: new Date() }]);
         break;
     }
   }
@@ -611,14 +647,19 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
                     alert('Speech recognition not supported in this browser');
                     return;
                   }
-                  const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+                  const speechWindow = window as Window & {
+                    SpeechRecognition?: SpeechRecognitionConstructor;
+                    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+                  };
+                  const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+                  if (!SpeechRecognition) return;
                   const recognition = new SpeechRecognition();
                   recognition.continuous = false;
                   recognition.interimResults = false;
                   recognition.lang = 'ko-KR';
                   recognition.onstart = () => setIsListening(true);
                   recognition.onend = () => setIsListening(false);
-                  recognition.onresult = (event: any) => {
+                  recognition.onresult = (event) => {
                     const text = event.results[0][0].transcript;
                     setInput((prev) => prev + text);
                   };

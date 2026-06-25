@@ -2,9 +2,15 @@ import { useState, useEffect } from 'react';
 import { fetchJSON, putJSON, type ProviderInfo } from '../lib/api';
 import { t } from '../lib/i18n';
 
+interface AppConfig {
+  provider: string;
+  model: string;
+  responseLang?: string;
+}
+
 export function SettingsPage() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
-  const [config, setConfig] = useState<any>(null);
+  const [config, setConfig] = useState<AppConfig | null>(null);
   const [selProvider, setSelProvider] = useState('');
   const [selModel, setSelModel] = useState('');
   const [apiKey, setApiKey] = useState('');
@@ -17,7 +23,7 @@ export function SettingsPage() {
 
   useEffect(() => {
     fetchJSON<ProviderInfo[]>('/api/providers').then(setProviders);
-    fetchJSON<any>('/api/config').then((c) => {
+    fetchJSON<AppConfig>('/api/config').then((c) => {
       setConfig(c);
       setSelProvider(c.provider);
       setSelModel(c.model);
@@ -40,7 +46,7 @@ export function SettingsPage() {
 
   async function quickStart(provider: string, model: string) {
     await putJSON('/api/config', { provider, model });
-    setConfig((c: any) => c ? { ...c, provider, model } : c);
+    setConfig((c) => c ? { ...c, provider, model } : c);
     setSelProvider(provider);
     setSelModel(model);
     setSaved(true);
@@ -56,7 +62,7 @@ export function SettingsPage() {
       });
     }
     await putJSON('/api/config', { provider: selProvider, model: selModel });
-    setConfig((c: any) => c ? { ...c, provider: selProvider, model: selModel } : c);
+    setConfig((c) => c ? { ...c, provider: selProvider, model: selModel } : c);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }

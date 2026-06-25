@@ -115,7 +115,7 @@ const translations = {
   'team.noUsers': { ko: '사용자 없음', en: 'No users yet' },
 } as const;
 
-type TransKey = keyof typeof translations;
+export type TransKey = keyof typeof translations;
 
 let currentLang: Lang = (typeof localStorage !== 'undefined' && localStorage.getItem('kairos-lang') as Lang) || 'ko';
 

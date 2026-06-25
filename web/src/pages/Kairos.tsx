@@ -2,30 +2,92 @@ import { useState, useEffect, useRef } from 'react';
 import { fetchJSON, postJSON, putJSON } from '../lib/api';
 import { listWorkstreams, type Workstream } from '../lib/workstreams';
 
+interface KairosStatus {
+  enabled?: boolean;
+  state?: string;
+  autonomy?: string;
+  tasks?: number;
+  tickInterval?: string;
+}
+
+interface KairosTask {
+  id: string;
+  type: string;
+  description: string;
+  workstreamId?: string;
+}
+
+interface KairosLog {
+  time: string;
+  action: string;
+  detail: string;
+}
+
+interface GitStatus {
+  error?: string;
+  branch?: string;
+  aheadBy?: number;
+  staged?: string[];
+  modified?: string[];
+  untracked?: string[];
+  lastCommit?: string;
+}
+
+interface KairosNotification {
+  timestamp: string;
+  title: string;
+  message: string;
+}
+
+function parseNotification(data: string): KairosNotification | null {
+  try {
+    const value = JSON.parse(data) as Partial<KairosNotification>;
+    if (typeof value.timestamp === 'string' && typeof value.title === 'string' && typeof value.message === 'string') {
+      return { timestamp: value.timestamp, title: value.title, message: value.message };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function KairosPage() {
-  const [status, setStatus] = useState<any>(null);
-  const [tasks, setTasks] = useState<any[]>([]);
-  const [logs, setLogs] = useState<any[]>([]);
-  const [gitStatus, setGitStatus] = useState<any>(null);
-  const [notifications, setNotifications] = useState<any[]>([]);
+  const [status, setStatus] = useState<KairosStatus | null>(null);
+  const [tasks, setTasks] = useState<KairosTask[]>([]);
+  const [logs, setLogs] = useState<KairosLog[]>([]);
+  const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
+  const [notifications, setNotifications] = useState<KairosNotification[]>([]);
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
   const [newTask, setNewTask] = useState({ id: '', type: 'custom', description: '', workstreamId: '' });
   const sseRef = useRef<EventSource | null>(null);
 
+  async function load() {
+    const [s, t, l, g, w] = await Promise.all([
+      fetchJSON<KairosStatus>('/api/kairos'),
+      fetchJSON<KairosTask[]>('/api/kairos/tasks'),
+      fetchJSON<KairosLog[]>('/api/kairos/logs'),
+      fetchJSON<GitStatus>('/api/kairos/git').catch(() => null),
+      listWorkstreams().catch(() => []),
+    ]);
+    setStatus(s);
+    setTasks(Array.isArray(t) ? t : []);
+    setLogs(Array.isArray(l) ? l : []);
+    setGitStatus(g);
+    setWorkstreams(Array.isArray(w) ? w : []);
+  }
+
   useEffect(() => {
-    load();
-    const interval = setInterval(load, 5000);
+    queueMicrotask(() => { void load(); });
+    const interval = setInterval(() => { void load(); }, 5000);
 
     // SSE for real-time notifications
     const sse = new EventSource('/api/kairos/notifications/stream');
     sseRef.current = sse;
     sse.onmessage = (event) => {
-      try {
-        const notif = JSON.parse(event.data);
-        setNotifications(prev => [...prev.slice(-19), notif]);
-        // Also trigger a data refresh
-        load();
-      } catch { /* skip */ }
+      const notif = parseNotification(event.data);
+      if (!notif) return;
+      setNotifications(prev => [...prev.slice(-19), notif]);
+      void load();
     };
     sse.onerror = () => {
       // Reconnect handled by browser automatically
@@ -36,21 +98,6 @@ export function KairosPage() {
       sse.close();
     };
   }, []);
-
-  async function load() {
-    const [s, t, l, g, w] = await Promise.all([
-      fetchJSON('/api/kairos'),
-      fetchJSON('/api/kairos/tasks'),
-      fetchJSON('/api/kairos/logs'),
-      fetchJSON('/api/kairos/git').catch(() => null),
-      listWorkstreams().catch(() => []),
-    ]);
-    setStatus(s);
-    setTasks(Array.isArray(t) ? t : []);
-    setLogs(Array.isArray(l) ? l : []);
-    setGitStatus(g);
-    setWorkstreams(Array.isArray(w) ? w : []);
-  }
 
   async function start() { await postJSON('/api/kairos/start', {}); load(); }
   async function stop() { await postJSON('/api/kairos/stop', {}); load(); }
@@ -126,26 +173,26 @@ export function KairosPage() {
           <div className="text-xs text-[var(--color-text2)] uppercase mb-3">Git Status</div>
           <div className="flex items-center gap-3 mb-2">
             <span className="text-sm font-mono text-[var(--color-accent)]">{gitStatus.branch}</span>
-            {gitStatus.aheadBy > 0 && (
+            {(gitStatus.aheadBy || 0) > 0 && (
               <span className="text-[10px] bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded">
                 {gitStatus.aheadBy} unpushed
               </span>
             )}
-            {gitStatus.staged?.length === 0 && gitStatus.modified?.length === 0 && gitStatus.untracked?.length === 0 && (
+            {(gitStatus.staged?.length || 0) === 0 && (gitStatus.modified?.length || 0) === 0 && (gitStatus.untracked?.length || 0) === 0 && (
               <span className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded">Clean</span>
             )}
           </div>
           <div className="flex gap-4 text-xs">
-            {gitStatus.staged?.length > 0 && (
-              <div><span className="text-green-400">{gitStatus.staged.length} staged</span></div>
+            {(gitStatus.staged?.length || 0) > 0 && (
+              <div><span className="text-green-400">{gitStatus.staged?.length || 0} staged</span></div>
             )}
-            {gitStatus.modified?.length > 0 && (
-              <div><span className="text-yellow-400">{gitStatus.modified.length} modified</span>
-                <span className="text-[var(--color-text2)] ml-1">({gitStatus.modified.slice(0, 3).join(', ')}{gitStatus.modified.length > 3 ? '...' : ''})</span>
+            {(gitStatus.modified?.length || 0) > 0 && (
+              <div><span className="text-yellow-400">{gitStatus.modified?.length || 0} modified</span>
+                <span className="text-[var(--color-text2)] ml-1">({(gitStatus.modified || []).slice(0, 3).join(', ')}{(gitStatus.modified?.length || 0) > 3 ? '...' : ''})</span>
               </div>
             )}
-            {gitStatus.untracked?.length > 0 && (
-              <div><span className="text-red-400">{gitStatus.untracked.length} untracked</span></div>
+            {(gitStatus.untracked?.length || 0) > 0 && (
+              <div><span className="text-red-400">{gitStatus.untracked?.length || 0} untracked</span></div>
             )}
           </div>
           {gitStatus.lastCommit && (
@@ -179,7 +226,7 @@ export function KairosPage() {
       {tasks.length > 0 && (
         <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-4 mb-4">
           <div className="text-xs text-[var(--color-text2)] uppercase mb-3">Active Tasks</div>
-          {tasks.map((t: any) => (
+          {tasks.map((t) => (
             <div key={t.id} className="flex items-center justify-between py-2 border-b border-[var(--color-border)] last:border-0">
               <div>
                 <span className="text-sm font-mono text-[var(--color-accent)]">{t.id}</span>
@@ -200,7 +247,7 @@ export function KairosPage() {
       {notifications.length > 0 && (
         <div className="bg-[var(--color-surface)] border border-[var(--color-accent)]/30 rounded-xl p-4 mb-4">
           <div className="text-xs text-[var(--color-accent)] uppercase mb-2">Live Notifications</div>
-          {notifications.slice().reverse().slice(0, 5).map((n: any, i: number) => (
+          {notifications.slice().reverse().slice(0, 5).map((n, i) => (
             <div key={i} className="flex items-center gap-2 py-1 text-xs">
               <span className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-pulse shrink-0" />
               <span className="text-[var(--color-text2)]">{new Date(n.timestamp).toLocaleTimeString()}</span>
@@ -217,7 +264,7 @@ export function KairosPage() {
         {logs.length === 0 ? (
           <div className="text-[var(--color-text2)]">No logs yet</div>
         ) : (
-          logs.map((l: any, i: number) => (
+          logs.map((l, i) => (
             <div key={i} className="flex gap-2 py-0.5">
               <span className="text-[var(--color-text2)] w-20 shrink-0">
                 {new Date(l.time).toLocaleTimeString()}

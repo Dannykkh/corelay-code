@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ActivityBar } from './components/ActivityBar';
 import { SidePanel } from './components/SidePanel';
-import { Toast, useToast } from './components/Toast';
+import { Toast } from './components/Toast';
 import { ChatPage } from './pages/Chat';
 import { RoutesPage } from './pages/Routes';
 import { CostsPage } from './pages/Costs';
@@ -10,6 +10,7 @@ import { SettingsPage } from './pages/Settings';
 import { MemoryPage } from './pages/Memory';
 import { TeamPage } from './pages/Team';
 import { fetchJSON, putJSON } from './lib/api';
+import { useToast } from './lib/toast';
 import './lib/i18n';
 
 interface ProjectInfo {
@@ -21,12 +22,23 @@ interface ProjectInfo {
   active: boolean;
 }
 
+interface AppConfig {
+  provider: string;
+  model: string;
+  routerEnabled?: boolean;
+  workDir?: string;
+}
+
+interface FileResponse {
+  content?: string;
+}
+
 function App() {
   const [page, setPage] = useState('chat');
   const [theme, setTheme] = useState<'dark' | 'light'>(() =>
     (localStorage.getItem('aniclew-theme') as 'dark' | 'light') || 'dark'
   );
-  const [status, setStatus] = useState<any>(null);
+  const [status, setStatus] = useState<AppConfig | null>(null);
   const [loadSessionId, setLoadSessionId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [showProjectPicker, setShowProjectPicker] = useState(false);
@@ -48,12 +60,12 @@ function App() {
   useEffect(() => {
     const load = async () => {
       try {
-        const data = await fetchJSON<any>('/api/config');
+        const data = await fetchJSON<AppConfig>('/api/config');
         setStatus(data);
       } catch { setStatus(null); }
     };
     load();
-    loadProjects();
+    queueMicrotask(() => { void loadProjects(); });
     const interval = setInterval(load, 15000);
     return () => clearInterval(interval);
   }, [loadProjects]);
@@ -97,8 +109,8 @@ function App() {
           onProjectSwitch={() => loadProjects()}
           onFileClick={async (path) => {
             try {
-              const data = await fetchJSON<any>(`/api/file?path=${encodeURIComponent(path)}`);
-              setViewingFile({ path, content: data.content || data });
+              const data = await fetchJSON<FileResponse | string>(`/api/file?path=${encodeURIComponent(path)}`);
+              setViewingFile({ path, content: typeof data === 'string' ? data : data.content || '' });
             } catch { setViewingFile({ path, content: 'Failed to load file' }); }
           }}
         />
@@ -202,7 +214,7 @@ function App() {
                       key={m}
                       onClick={async () => {
                         await putJSON('/api/config', { provider: group.provider, model: m });
-                        const cfg = await fetchJSON<any>('/api/config');
+                        const cfg = await fetchJSON<AppConfig>('/api/config');
                         setStatus(cfg);
                         setShowModelPicker(false);
                       }}

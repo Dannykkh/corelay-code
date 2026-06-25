@@ -16,6 +16,18 @@ interface ProjectInfo {
   fileCount: number;
 }
 
+interface WorkspaceResponse {
+  path: string;
+  project: ProjectInfo | null;
+  ok?: boolean;
+}
+
+interface BrowseResponse {
+  current: string;
+  parent: string;
+  entries?: BrowseEntry[];
+}
+
 export function WorkspacePage() {
   const [currentPath, setCurrentPath] = useState('');
   const [parentPath, setParentPath] = useState('');
@@ -27,18 +39,9 @@ export function WorkspacePage() {
 
   const ko = getLang() === 'ko';
 
-  useEffect(() => {
-    // Load current workspace
-    fetchJSON<any>('/api/workspace').then((data) => {
-      setWorkspace(data.path);
-      setProject(data.project);
-      browse(data.path);
-    });
-  }, []);
-
   async function browse(path: string) {
     try {
-      const data = await fetchJSON<any>(`/api/browse?path=${encodeURIComponent(path)}`);
+      const data = await fetchJSON<BrowseResponse>(`/api/browse?path=${encodeURIComponent(path)}`);
       setCurrentPath(data.current);
       setParentPath(data.parent);
       setEntries(data.entries || []);
@@ -50,7 +53,7 @@ export function WorkspacePage() {
 
   async function selectWorkspace(path: string) {
     try {
-      const data = await fetchJSON<any>('/api/workspace', {
+      const data = await fetchJSON<WorkspaceResponse>('/api/workspace', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
@@ -65,6 +68,14 @@ export function WorkspacePage() {
       setStatus(`Error: ${e}`);
     }
   }
+
+  useEffect(() => {
+    fetchJSON<WorkspaceResponse>('/api/workspace').then((data) => {
+      setWorkspace(data.path);
+      setProject(data.project);
+      void browse(data.path);
+    });
+  }, []);
 
   function goTo(name: string) {
     const newPath = currentPath.replace(/\\/g, '/') + '/' + name;

@@ -1,5 +1,18 @@
 const BASE = '';
 
+type ErrorBody = {
+  error?: { message?: unknown };
+  message?: unknown;
+};
+
+function errorMessageFromBody(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const parsed = body as ErrorBody;
+  if (typeof parsed.error?.message === 'string') return parsed.error.message;
+  if (typeof parsed.message === 'string') return parsed.message;
+  return undefined;
+}
+
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, init);
   if (!res.ok) {
@@ -9,8 +22,8 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
     // plain `{ message }` and bare text.
     let msg = `HTTP ${res.status}`;
     try {
-      const body: any = await res.json();
-      msg = body?.error?.message || body?.message || msg;
+      const body: unknown = await res.json();
+      msg = errorMessageFromBody(body) || msg;
     } catch {
       try {
         const text = await res.text();

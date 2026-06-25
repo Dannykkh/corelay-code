@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useEffect } from 'react';
+import type { ToastType } from '../lib/toast';
 
 interface ToastProps {
   message: string;
-  type: 'error' | 'success' | 'info';
+  type: ToastType;
   onDismiss: () => void;
 }
 
@@ -24,22 +25,4 @@ export function Toast({ message, type, onDismiss }: ToastProps) {
       <button onClick={onDismiss} className="text-white/70 hover:text-white text-lg leading-none">&times;</button>
     </div>
   );
-}
-
-// Global toast state
-let _showToast: (msg: string, type: 'error' | 'success' | 'info') => void = () => {};
-
-export function useToast() {
-  const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' | 'info' } | null>(null);
-
-  _showToast = (msg, type) => setToast({ message: msg, type });
-
-  return {
-    toast,
-    dismissToast: () => setToast(null),
-  };
-}
-
-export function showToast(message: string, type: 'error' | 'success' | 'info' = 'info') {
-  _showToast(message, type);
 }

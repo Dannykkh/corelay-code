@@ -1,24 +1,44 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON } from '../lib/api';
 
+interface ConfigResponse {
+  workDir?: string;
+}
+
+interface ProjectInfo {
+  name: string;
+  type: string;
+  framework?: string;
+  fileCount: number;
+  fileTree?: string;
+}
+
+type AgentEvent = {
+  type?: string;
+  data?: unknown;
+};
+
+type ToolResultData = {
+  result?: string;
+};
+
+function toolResultData(data: unknown): ToolResultData {
+  return data && typeof data === 'object' ? data as ToolResultData : {};
+}
+
 export function ExplorerPage() {
   const [workDir, setWorkDir] = useState('');
   const [fileContent, setFileContent] = useState('');
   const [selectedFile, setSelectedFile] = useState('');
-  const [project, setProject] = useState<any>(null);
+  const [project, setProject] = useState<ProjectInfo | null>(null);
 
   useEffect(() => {
-    fetchJSON<any>('/api/config').then((c) => {
+    fetchJSON<ConfigResponse>('/api/config').then((c) => {
       const dir = c.workDir || '.';
       setWorkDir(dir);
-      loadDir(dir);
-      fetchJSON<any>(`/api/project?workDir=${encodeURIComponent(dir)}`).then(setProject);
+      fetchJSON<ProjectInfo>(`/api/project?workDir=${encodeURIComponent(dir)}`).then(setProject);
     });
   }, []);
-
-  async function loadDir(_dir: string) {
-    // Project info loaded via /api/project
-  }
 
   async function readFile(path: string) {
     setSelectedFile(path);
@@ -42,9 +62,9 @@ export function ExplorerPage() {
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             try {
-              const event = JSON.parse(line.slice(6));
-              if (event.type === 'text') content += event.data;
-              if (event.type === 'tool_result') content = event.data?.result || '';
+              const event = JSON.parse(line.slice(6)) as AgentEvent;
+              if (event.type === 'text') content += typeof event.data === 'string' ? event.data : '';
+              if (event.type === 'tool_result') content = toolResultData(event.data).result || '';
             } catch { /* skip */ }
           }
         }

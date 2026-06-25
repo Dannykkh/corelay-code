@@ -1,8 +1,8 @@
-import { t, getLang, setLang, type Lang } from '../lib/i18n';
+import { t, getLang, setLang, type Lang, type TransKey } from '../lib/i18n';
 
 interface NavItem {
   id: string;
-  labelKey: string;
+  labelKey: TransKey;
   icon: string;
 }
 
@@ -64,7 +64,7 @@ export function Sidebar({ active, onNavigate, onLangChange, onThemeToggle, theme
             }`}
           >
             <span className="text-base">{item.icon}</span>
-            {t(item.labelKey as any)}
+            {t(item.labelKey)}
           </button>
         ))}
       </nav>

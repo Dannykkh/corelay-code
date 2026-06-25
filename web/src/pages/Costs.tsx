@@ -94,6 +94,23 @@ type SSEEvent = {
   data?: unknown;
 };
 
+const replayableRegressionKinds = new Set(['chronos', 'team']);
+
+function canReplayRegression(c: RegressionCase): boolean {
+  return c.replayable && replayableRegressionKinds.has(c.kind);
+}
+
+function regressionCaseLabel(c: RegressionCase): string {
+  return c.inputs?.task || c.inputs?.objective || c.inputs?.teamName || c.name;
+}
+
+function regressionReplayTitle(c: RegressionCase): string {
+  if (canReplayRegression(c)) {
+    return `Replay ${c.kind} regression`;
+  }
+  return c.replayHint || 'Replay unsupported';
+}
+
 export function CostsPage() {
   const [costs, setCosts] = useState<{ total: number; breakdown: CostEntry[] }>({ total: 0, breakdown: [] });
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -116,7 +133,7 @@ export function CostsPage() {
 
   async function load() {
     const [c, m, t, rt, rc, rr, f] = await Promise.all([
-      fetchJSON<{ total: number; breakdown: CostEntry[] }>('/api/costs'),
+      fetchJSON<{ total: number; breakdown: CostEntry[] }>('/api/costs').catch(() => ({ total: 0, breakdown: [] })),
       fetchJSON<Metrics>('/api/metrics?window=60').catch(() => null),
       fetchJSON<RequestTrace[]>('/api/traces?limit=20').catch(() => []),
       fetchJSON<RunTrace[]>('/api/run-traces?limit=40').catch(() => []),
@@ -380,7 +397,7 @@ export function CostsPage() {
                 <div className="px-4 py-6 text-xs text-[var(--color-text2)]">Create a case from a failed run trace.</div>
               ) : regressionCases.slice().reverse().slice(0, 8).map((c) => {
                 const last = lastRunByCase.get(c.id);
-                const canReplay = c.replayable && c.kind === 'chronos';
+                const canReplay = canReplayRegression(c);
                 return (
                   <div key={c.id} className="px-4 py-3 text-xs">
                     <div className="flex items-center gap-2 min-w-0">
@@ -391,12 +408,12 @@ export function CostsPage() {
                       </span>
                       <span className="text-[var(--color-text2)] ml-auto">{formatTime(c.createdAt)}</span>
                     </div>
-                    <div className="mt-1 text-[var(--color-text)] truncate">{c.inputs?.task || c.name}</div>
+                    <div className="mt-1 text-[var(--color-text)] truncate">{regressionCaseLabel(c)}</div>
                     <div className="mt-2 flex items-center gap-2">
                       <button
                         onClick={() => replayRegression(c.id)}
                         disabled={!canReplay || runActionId === c.id}
-                        title={canReplay ? 'Replay Chronos regression' : c.replayHint || 'Replay unsupported'}
+                        title={regressionReplayTitle(c)}
                         className="px-2.5 py-1 rounded bg-[var(--color-accent)] text-white disabled:bg-[var(--color-surface2)] disabled:text-[var(--color-text2)] disabled:opacity-60 active:scale-[0.98]"
                       >
                         {runActionId === c.id ? 'Running' : 'Replay'}

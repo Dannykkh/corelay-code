@@ -1,21 +1,32 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON, postJSON } from '../lib/api';
 
+interface MemoryEntry {
+  key: string;
+  value: string;
+  category: string;
+  source?: string;
+}
+
+interface MemoryState {
+  entries?: MemoryEntry[];
+  totalSize?: number;
+  sessionCount?: number;
+}
+
 export function MemoryPage() {
-  const [state, setState] = useState<any>(null);
+  const [state, setState] = useState<MemoryState | null>(null);
   const [searchQ, setSearchQ] = useState('');
-  const [results, setResults] = useState<any[]>([]);
+  const [results, setResults] = useState<MemoryEntry[]>([]);
   const [newEntry, setNewEntry] = useState({ key: '', value: '', category: 'project' });
 
-  useEffect(() => { load(); }, []);
-
   async function load() {
-    const s = await fetchJSON('/api/memory');
+    const s = await fetchJSON<MemoryState>('/api/memory');
     setState(s);
   }
 
   async function search() {
-    const r = await fetchJSON<any[]>(`/api/memory/search?q=${encodeURIComponent(searchQ)}`);
+    const r = await fetchJSON<MemoryEntry[]>(`/api/memory/search?q=${encodeURIComponent(searchQ)}`);
     setResults(r || []);
   }
 
@@ -30,6 +41,8 @@ export function MemoryPage() {
     await postJSON('/api/memory/dream', {});
     load();
   }
+
+  useEffect(() => { queueMicrotask(() => { void load(); }); }, []);
 
   return (
     <div className="p-6 w-full">
@@ -69,7 +82,7 @@ export function MemoryPage() {
         </div>
         {results.length > 0 && (
           <div className="mt-3 space-y-2">
-            {results.map((r: any, i: number) => (
+            {results.map((r, i) => (
               <div key={i} className="bg-[var(--color-bg)] rounded-lg p-3">
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-xs font-mono text-[var(--color-accent)]">{r.key}</span>
@@ -104,7 +117,7 @@ export function MemoryPage() {
       </div>
 
       {/* Entries */}
-      {state?.entries?.length > 0 && (
+      {(state?.entries?.length || 0) > 0 && (
         <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl overflow-hidden">
           <table className="w-full">
             <thead>
@@ -116,7 +129,7 @@ export function MemoryPage() {
               </tr>
             </thead>
             <tbody>
-              {state.entries.map((e: any, i: number) => (
+              {(state?.entries || []).map((e, i) => (
                 <tr key={i} className="border-t border-[var(--color-border)]">
                   <td className="px-4 py-2 text-sm font-mono text-[var(--color-accent)]">{e.key}</td>
                   <td className="px-4 py-2 text-sm max-w-md truncate">{e.value}</td>

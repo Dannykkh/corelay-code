@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { fetchJSON, postJSON } from '../lib/api';
 import { getLang } from '../lib/i18n';
 import { listSessions, type SessionSummary } from '../lib/sessions';
-import { showToast } from './Toast';
+import { showToast } from '../lib/toast';
 
 // parentPath returns the parent of a filesystem path, handling Windows drive
 // roots correctly: `D:/git` -> `D:/`, NOT `D:` (which Windows treats as the
@@ -89,28 +89,40 @@ interface TreeNode {
   children?: TreeNode[];
 }
 
+interface WorkspaceResponse {
+  path?: string;
+}
+
+interface BrowseEntry {
+  name: string;
+  isDir: boolean;
+  isProject?: boolean;
+}
+
+interface BrowseResponse {
+  entries?: BrowseEntry[];
+  current?: string;
+}
+
+function errorMessage(err: unknown): string | undefined {
+  return err instanceof Error ? err.message : undefined;
+}
+
 export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewChat, onProjectSwitch }: Props) {
   const [sessionSearch, setSessionSearch] = useState('');
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [showProjectList, setShowProjectList] = useState(false);
   const [showAddProject, setShowAddProject] = useState(false);
-  const [browseEntries, setBrowseEntries] = useState<any[]>([]);
+  const [browseEntries, setBrowseEntries] = useState<BrowseEntry[]>([]);
   const [browsePath, setBrowsePath] = useState('');
   const [fileTree, setFileTree] = useState<TreeNode[]>([]);
   const ko = getLang() === 'ko';
 
   const activeProject = projects.find(p => p.active);
 
-  // Load projects + file tree
-  useEffect(() => {
-    loadProjects();
-    loadSessions();
-    loadFileTree();
-  }, []);
-
   async function loadSessions() {
-    const ws = (await fetchJSON<any>('/api/workspace').catch(() => null))?.path;
+    const ws = (await fetchJSON<WorkspaceResponse>('/api/workspace').catch(() => null))?.path;
     // Backend returns `null` (not `[]`) for a workspace with no sessions;
     // unwrapped that bypasses the [] default and makes render crash on
     // `sessions.length`. Coerce here defensively in addition to the backend fix.
@@ -143,8 +155,8 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
       loadFileTree();
       setShowProjectList(false);
       onProjectSwitch?.(path);
-    } catch (e: any) {
-      showToast(e?.message || (ko ? '프로젝트 전환 실패' : 'Failed to switch project'), 'error');
+    } catch (e: unknown) {
+      showToast(errorMessage(e) || (ko ? '프로젝트 전환 실패' : 'Failed to switch project'), 'error');
     }
   }
 
@@ -158,10 +170,10 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
       setShowProjectList(false);
       onProjectSwitch?.(path);
       showToast(ko ? `프로젝트 추가됨: ${path}` : `Project added: ${path}`, 'success');
-    } catch (e: any) {
+    } catch (e: unknown) {
       // Most common: 409 "Project already exists" → tell the user instead of
       // closing the menu silently like before.
-      showToast(e?.message || (ko ? '프로젝트 추가 실패' : 'Failed to add project'), 'error');
+      showToast(errorMessage(e) || (ko ? '프로젝트 추가 실패' : 'Failed to add project'), 'error');
     }
   }
 
@@ -173,10 +185,13 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
 
   async function loadBrowse(path: string) {
     try {
-      const data = await fetchJSON<any>(`/api/browse?path=${encodeURIComponent(path)}`);
+      const data = await fetchJSON<BrowseResponse>(`/api/browse?path=${encodeURIComponent(path)}`);
       setBrowseEntries(data.entries || []);
-      setBrowsePath(data.current);
-    } catch {}
+      setBrowsePath(data.current || path);
+    } catch {
+      setBrowseEntries([]);
+      setBrowsePath(path);
+    }
   }
 
   function openFolderBrowser() {
@@ -185,6 +200,15 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
     const startPath = browsePath || 'D:/git';
     loadBrowse(startPath);
   }
+
+  // Load projects + file tree
+  useEffect(() => {
+    queueMicrotask(() => {
+      void loadProjects();
+      void loadSessions();
+      void loadFileTree();
+    });
+  }, []);
 
   if (!visible) return null;
 
@@ -277,7 +301,7 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
               </button>
             </div>
             <div className="py-1">
-              {browseEntries.filter((e: any) => e.isDir).map((entry: any) => {
+              {browseEntries.filter((e) => e.isDir).map((entry) => {
                 const childPath = browsePath.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + entry.name;
                 return (
                   <div

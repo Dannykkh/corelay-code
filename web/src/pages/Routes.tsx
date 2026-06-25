@@ -37,11 +37,6 @@ export function RoutesPage() {
   const [editProvider, setEditProvider] = useState('');
   const [editModel, setEditModel] = useState('');
 
-  useEffect(() => {
-    load();
-    fetchJSON<ProviderInfo[]>('/api/providers').then(setProviders);
-  }, []);
-
   async function load() {
     const data = await fetchJSON<{ rules: RouteRule[] }>('/api/routes');
     setRules(data.rules || []);
@@ -52,6 +47,11 @@ export function RoutesPage() {
     setEditing(null);
     load();
   }
+
+  useEffect(() => {
+    queueMicrotask(() => { void load(); });
+    fetchJSON<ProviderInfo[]>('/api/providers').then(setProviders);
+  }, []);
 
   return (
     <div className="p-6 w-full">
