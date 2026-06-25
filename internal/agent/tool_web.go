@@ -29,9 +29,14 @@ const (
 )
 
 type webSearchArgs struct {
-	Query      string `json:"query"`
-	MaxResults int    `json:"max_results,omitempty"`
-	Provider   string `json:"provider,omitempty"` // auto, ollama, duckduckgo
+	Query      string   `json:"query"`
+	MaxResults int      `json:"max_results,omitempty"`
+	Provider   string   `json:"provider,omitempty"`  // auto, multi, ollama, duckduckgo, google, naver, bing, yahoo
+	Providers  []string `json:"providers,omitempty"` // explicit provider list
+	Sort       string   `json:"sort,omitempty"`      // relevance, latest
+	Recency    string   `json:"recency,omitempty"`   // day, week, month, year
+	DateFrom   string   `json:"date_from,omitempty"` // YYYY-MM-DD
+	DateTo     string   `json:"date_to,omitempty"`   // YYYY-MM-DD
 }
 
 type webFetchArgs struct {
@@ -42,19 +47,32 @@ type webFetchArgs struct {
 }
 
 type webResearchArgs struct {
-	Query      string `json:"query"`
-	MaxResults int    `json:"max_results,omitempty"`
-	FetchTop   int    `json:"fetch_top,omitempty"`
-	MaxChars   int    `json:"max_chars,omitempty"`
-	Provider   string `json:"provider,omitempty"` // auto, ollama, duckduckgo
+	Query      string   `json:"query"`
+	MaxResults int      `json:"max_results,omitempty"`
+	FetchTop   int      `json:"fetch_top,omitempty"`
+	MaxChars   int      `json:"max_chars,omitempty"`
+	Provider   string   `json:"provider,omitempty"`  // auto, multi, ollama, duckduckgo, google, naver, bing, yahoo
+	Providers  []string `json:"providers,omitempty"` // explicit provider list
+	Sort       string   `json:"sort,omitempty"`      // relevance, latest
+	Recency    string   `json:"recency,omitempty"`   // day, week, month, year
+	DateFrom   string   `json:"date_from,omitempty"` // YYYY-MM-DD
+	DateTo     string   `json:"date_to,omitempty"`   // YYYY-MM-DD
 }
 
 type webSearchResult struct {
-	Rank    int    `json:"rank"`
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	Snippet string `json:"snippet"`
-	Source  string `json:"source"`
+	Rank           int      `json:"rank"`
+	Title          string   `json:"title"`
+	URL            string   `json:"url"`
+	Snippet        string   `json:"snippet"`
+	Source         string   `json:"source"`
+	Providers      []string `json:"providers,omitempty"`
+	SearchedAt     string   `json:"searched_at,omitempty"`
+	PublishedAt    string   `json:"published_at,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+	RelevanceScore float64  `json:"relevance_score,omitempty"`
+	FreshnessScore float64  `json:"freshness_score,omitempty"`
+	AuthorityScore float64  `json:"authority_score,omitempty"`
+	Score          float64  `json:"score,omitempty"`
 }
 
 type webFetchResult struct {
@@ -128,6 +146,11 @@ func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
 		Query:      args.Query,
 		MaxResults: args.MaxResults,
 		Provider:   args.Provider,
+		Providers:  args.Providers,
+		Sort:       args.Sort,
+		Recency:    args.Recency,
+		DateFrom:   args.DateFrom,
+		DateTo:     args.DateTo,
 	})
 	if err != nil {
 		return err.Error(), true
@@ -141,6 +164,13 @@ func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
 	b.WriteString("\nSources:\n")
 	for _, r := range results {
 		fmt.Fprintf(&b, "[%d] %s\n    %s\n    %s\n", r.Rank, r.Title, r.URL, r.Snippet)
+		if r.PublishedAt != "" || r.UpdatedAt != "" || len(r.Providers) > 0 {
+			fmt.Fprintf(&b, "    published=%s updated=%s providers=%s score=%.2f\n",
+				coalesceString(r.PublishedAt, "unknown"),
+				coalesceString(r.UpdatedAt, "unknown"),
+				strings.Join(r.Providers, ","),
+				r.Score)
+		}
 	}
 
 	if len(results) == 0 {
@@ -161,7 +191,7 @@ func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
 			URL:      r.URL,
 			Prompt:   args.Query,
 			MaxChars: args.MaxChars / maxInt(1, args.FetchTop),
-			Provider: args.Provider,
+			Provider: researchFetchProvider(args),
 		})
 		if ferr != nil {
 			fmt.Fprintf(&b, "\n[%d] fetch failed: %v\n", r.Rank, ferr)
@@ -176,32 +206,15 @@ func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
 	return b.String(), false
 }
 
-func searchWeb(ctx context.Context, args webSearchArgs) ([]webSearchResult, string, string, error) {
-	provider := strings.ToLower(strings.TrimSpace(args.Provider))
-	if provider == "" || provider == "auto" {
-		provider = webSearchDefaultProvider()
+func researchFetchProvider(args webResearchArgs) string {
+	if len(args.Providers) == 0 && strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
+		return "ollama"
 	}
+	return "direct"
+}
 
-	switch provider {
-	case "ollama":
-		results, err := ollamaWebSearch(ctx, args.Query, args.MaxResults)
-		if err == nil {
-			return results, "ollama", "", nil
-		}
-		if strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
-			return nil, "ollama", "", err
-		}
-		results, derr := duckDuckGoSearch(ctx, args.Query, args.MaxResults)
-		if derr != nil {
-			return nil, "duckduckgo", "", fmt.Errorf("ollama search failed: %v; fallback failed: %w", err, derr)
-		}
-		return results, "duckduckgo", "Ollama web_search failed; used DuckDuckGo fallback.", nil
-	case "duckduckgo", "ddg":
-		results, err := duckDuckGoSearch(ctx, args.Query, args.MaxResults)
-		return results, "duckduckgo", "", err
-	default:
-		return nil, provider, "", fmt.Errorf("unsupported web search provider %q", args.Provider)
-	}
+func searchWeb(ctx context.Context, args webSearchArgs) ([]webSearchResult, string, string, error) {
+	return searchWebWithProviders(ctx, args)
 }
 
 func fetchWeb(ctx context.Context, args webFetchArgs) (webFetchResult, error) {
@@ -334,9 +347,12 @@ func ollamaWebFetch(ctx context.Context, targetURL string) (webFetchResult, erro
 	}, nil
 }
 
-func duckDuckGoSearch(ctx context.Context, query string, maxResults int) ([]webSearchResult, error) {
-	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
-	log.Printf("[WebSearch] DuckDuckGo: %s", query)
+func duckDuckGoSearch(ctx context.Context, opts webSearchOptions) ([]webSearchResult, error) {
+	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(opts.Query)
+	if df := duckDuckGoDateFilter(opts.Recency); df != "" {
+		searchURL += "&df=" + url.QueryEscape(df)
+	}
+	log.Printf("[WebSearch] DuckDuckGo: %s", opts.Query)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
 	if err != nil {
@@ -359,7 +375,7 @@ func duckDuckGoSearch(ctx context.Context, query string, maxResults int) ([]webS
 	if err != nil {
 		return nil, fmt.Errorf("read DuckDuckGo results: %w", err)
 	}
-	results := extractDuckDuckGoResults(string(body), maxResults)
+	results := extractDuckDuckGoResults(string(body), opts.MaxResults)
 	if len(results) == 0 {
 		text := htmlToText(string(body))
 		if text != "" {
@@ -671,6 +687,22 @@ func formatSearchResults(query, provider, note string, results []webSearchResult
 	for _, r := range results {
 		fmt.Fprintf(&b, "\n[%d] %s\nURL: %s\nSnippet: %s\nSource: %s\n",
 			r.Rank, coalesceString(r.Title, "(untitled)"), r.URL, r.Snippet, r.Source)
+		if r.SearchedAt != "" {
+			fmt.Fprintf(&b, "Searched-At: %s\n", r.SearchedAt)
+		}
+		if r.PublishedAt != "" {
+			fmt.Fprintf(&b, "Published-At: %s\n", r.PublishedAt)
+		}
+		if r.UpdatedAt != "" {
+			fmt.Fprintf(&b, "Updated-At: %s\n", r.UpdatedAt)
+		}
+		if len(r.Providers) > 0 {
+			fmt.Fprintf(&b, "Providers: %s\n", strings.Join(r.Providers, ", "))
+		}
+		if r.Score > 0 {
+			fmt.Fprintf(&b, "Scores: total=%.2f relevance=%.2f freshness=%.2f authority=%.2f\n",
+				r.Score, r.RelevanceScore, r.FreshnessScore, r.AuthorityScore)
+		}
 	}
 	if len(results) == 0 {
 		b.WriteString("\nNo results returned.")

@@ -23,7 +23,12 @@ func ExtendedToolDefs() []types.ToolDef {
 				"properties": {
 					"query": {"type": "string", "description": "Search query"},
 					"max_results": {"type": "integer", "description": "Maximum results to return (default 5, max 10)"},
-					"provider": {"type": "string", "description": "Search provider: auto, ollama, duckduckgo"}
+					"provider": {"type": "string", "description": "Search provider: auto, multi, duckduckgo, google, naver, naver-web, naver-blog, bing, yahoo, ollama"},
+					"providers": {"type": "array", "items": {"type": "string"}, "description": "Explicit provider list for multi-search"},
+					"sort": {"type": "string", "description": "Ranking mode: relevance or latest"},
+					"recency": {"type": "string", "description": "Freshness filter hint: day, week, month, year"},
+					"date_from": {"type": "string", "description": "Earliest desired result date, YYYY-MM-DD"},
+					"date_to": {"type": "string", "description": "Latest desired result date, YYYY-MM-DD"}
 				},
 				"required": ["query"]
 			}`),
@@ -52,7 +57,12 @@ func ExtendedToolDefs() []types.ToolDef {
 					"max_results": {"type": "integer", "description": "Maximum search results (default 5, max 10)"},
 					"fetch_top": {"type": "integer", "description": "How many top results to fetch (default 3)"},
 					"max_chars": {"type": "integer", "description": "Maximum fetched content characters to return (default 12000, max 30000)"},
-					"provider": {"type": "string", "description": "Provider preference: auto, ollama, duckduckgo"}
+					"provider": {"type": "string", "description": "Provider preference: auto, multi, duckduckgo, google, naver, naver-web, naver-blog, bing, yahoo, ollama"},
+					"providers": {"type": "array", "items": {"type": "string"}, "description": "Explicit provider list for multi-search"},
+					"sort": {"type": "string", "description": "Ranking mode: relevance or latest"},
+					"recency": {"type": "string", "description": "Freshness filter hint: day, week, month, year"},
+					"date_from": {"type": "string", "description": "Earliest desired result date, YYYY-MM-DD"},
+					"date_to": {"type": "string", "description": "Latest desired result date, YYYY-MM-DD"}
 				},
 				"required": ["query"]
 			}`),

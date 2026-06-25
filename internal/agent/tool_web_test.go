@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractDuckDuckGoResults(t *testing.T) {
@@ -137,6 +138,113 @@ func TestNaverMobilePostURL(t *testing.T) {
 		if got != want {
 			t.Fatalf("naverMobilePostURL(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+func TestFuseSearchResultsDeduplicatesProviders(t *testing.T) {
+	opts := webSearchOptions{
+		Query:      "official docs",
+		MaxResults: 5,
+		Sort:       "relevance",
+		SearchedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
+	}
+	results := fuseSearchResults(opts, map[string][]webSearchResult{
+		"duckduckgo": {
+			{Rank: 1, Title: "Official Docs", URL: "https://example.com/docs?utm_source=x", Snippet: "official docs reference"},
+		},
+		"google": {
+			{Rank: 2, Title: "Official Docs", URL: "https://example.com/docs", Snippet: "official docs reference with longer snippet"},
+		},
+	})
+
+	if len(results) != 1 {
+		t.Fatalf("expected deduped single result, got %d", len(results))
+	}
+	if got := strings.Join(results[0].Providers, ","); got != "duckduckgo,google" {
+		t.Fatalf("unexpected providers: %q", got)
+	}
+	if !strings.Contains(results[0].Snippet, "longer snippet") {
+		t.Fatalf("expected longer snippet to win, got %q", results[0].Snippet)
+	}
+	if results[0].SearchedAt == "" || results[0].Score <= 0 {
+		t.Fatalf("expected searched_at and score, got %+v", results[0])
+	}
+}
+
+func TestFuseSearchResultsSortsLatestFirst(t *testing.T) {
+	opts := webSearchOptions{
+		Query:      "release notes",
+		MaxResults: 5,
+		Sort:       "latest",
+		SearchedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
+	}
+	results := fuseSearchResults(opts, map[string][]webSearchResult{
+		"duckduckgo": {
+			{Rank: 1, Title: "Old Release Notes", URL: "https://example.com/old", Snippet: "release notes", PublishedAt: "2024-01-01"},
+			{Rank: 2, Title: "New Release Notes", URL: "https://example.com/new", Snippet: "release notes", PublishedAt: "2026-06-24"},
+		},
+	})
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].URL != "https://example.com/new" {
+		t.Fatalf("expected newest result first, got %+v", results)
+	}
+}
+
+func TestSelectSearchProvidersExplicitList(t *testing.T) {
+	providers, label, notes, err := selectSearchProviders(webSearchArgs{
+		Providers: []string{"duckduckgo", "yahoo"},
+	})
+	if err != nil {
+		t.Fatalf("selectSearchProviders returned error: %v notes=%v", err, notes)
+	}
+	if label != "multi" {
+		t.Fatalf("expected multi label, got %q", label)
+	}
+	var names []string
+	for _, provider := range providers {
+		names = append(names, provider.Name())
+	}
+	if got := strings.Join(names, ","); got != "duckduckgo,yahoo" {
+		t.Fatalf("unexpected provider order: %q", got)
+	}
+}
+
+func TestSelectSearchProvidersAllSkipsUnconfiguredAPIs(t *testing.T) {
+	t.Setenv("GOOGLE_SEARCH_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("GOOGLE_SEARCH_ENGINE_ID", "")
+	t.Setenv("GOOGLE_CSE_ID", "")
+	t.Setenv("NAVER_CLIENT_ID", "")
+	t.Setenv("NAVER_CLIENT_SECRET", "")
+	t.Setenv("BING_SEARCH_API_KEY", "")
+	providers, _, notes, err := selectSearchProviders(webSearchArgs{Provider: "all"})
+	if err != nil {
+		t.Fatalf("selectSearchProviders(all) returned error: %v notes=%v", err, notes)
+	}
+	var names []string
+	for _, provider := range providers {
+		names = append(names, provider.Name())
+	}
+	if got := strings.Join(names, ","); got != "duckduckgo,yahoo" {
+		t.Fatalf("unexpected provider order for all: %q", got)
+	}
+}
+
+func TestResearchFetchProviderSeparatesSearchAndFetch(t *testing.T) {
+	if got := researchFetchProvider(webResearchArgs{Provider: "google"}); got != "direct" {
+		t.Fatalf("google search should fetch direct, got %q", got)
+	}
+	if got := researchFetchProvider(webResearchArgs{Provider: "multi"}); got != "direct" {
+		t.Fatalf("multi search should fetch direct, got %q", got)
+	}
+	if got := researchFetchProvider(webResearchArgs{Provider: "ollama"}); got != "ollama" {
+		t.Fatalf("explicit ollama should fetch with ollama, got %q", got)
+	}
+	if got := researchFetchProvider(webResearchArgs{Providers: []string{"ollama", "duckduckgo"}}); got != "direct" {
+		t.Fatalf("mixed search providers should fetch direct, got %q", got)
 	}
 }
 
