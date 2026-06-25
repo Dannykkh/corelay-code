@@ -284,7 +284,24 @@ func RunLoop(
 	responseLang string,
 	eventCh chan<- Event,
 ) {
+	RunLoopWithOptions(ctx, provider, model, userMessages, workDir, RunOptions{ResponseLang: responseLang}, eventCh)
+}
+
+func RunLoopWithOptions(
+	ctx context.Context,
+	provider types.Provider,
+	model string,
+	userMessages []types.Message,
+	workDir string,
+	opts RunOptions,
+	eventCh chan<- Event,
+) {
 	defer close(eventCh)
+
+	responseLang := opts.ResponseLang
+	if responseLang == "" {
+		responseLang = "auto"
+	}
 
 	messages := make([]types.Message, len(userMessages))
 	copy(messages, userMessages)
@@ -452,6 +469,13 @@ func RunLoop(
 	// on the first user message, so recomputing per-iteration would just
 	// defeat the prompt cache.
 	memoryContext := BuildMemoryContext(workDir, messages)
+	workstreamContext := ""
+	if strings.TrimSpace(opts.WorkstreamContext) != "" {
+		workstreamContext = "\n\n" + strings.TrimSpace(opts.WorkstreamContext)
+	}
+	if opts.Recorder != nil {
+		opts.Recorder.RunStarted()
+	}
 
 	// ── Process slash commands ──
 	if len(messages) > 0 {
@@ -634,7 +658,7 @@ func RunLoop(
 		}
 
 		// Build request with full context
-		sysPrompt := buildSystemPrompt(responseLang) + projectPrompt + projectCtx + skillText + ragContext + memoryContext
+		sysPrompt := buildSystemPrompt(responseLang) + projectPrompt + projectCtx + skillText + ragContext + memoryContext + workstreamContext
 		if planMode {
 			sysPrompt += "\n\n## PLAN MODE\nYou are in plan mode. Explore the codebase with the read-only tools and produce a concrete, step-by-step implementation plan (which files to change and what to do in each). You have NO edit tools — do not attempt to make changes. End with the plan; the user will review it and ask you to proceed."
 		}
@@ -860,6 +884,9 @@ func RunLoop(
 				} else {
 					receiptPath = path
 					eventCh <- Event{Type: "status", Data: "Receipt saved: " + path}
+					if opts.Recorder != nil {
+						opts.Recorder.ReceiptWritten(path, receipt)
+					}
 				}
 			}
 
@@ -887,6 +914,18 @@ func RunLoop(
 				"planMode":      planMode,
 				"receipt":       receiptPath,
 			}}
+			if opts.Recorder != nil {
+				opts.Recorder.RunCompleted(RunSummary{
+					Provider:     provider.Name(),
+					Model:        model,
+					ProjectType:  project.Type,
+					PlanMode:     planMode,
+					Iterations:   i + 1,
+					EditedFiles:  uniqueStrings(editedFiles),
+					Verification: receiptVerification(testResult),
+					ReceiptPath:  receiptPath,
+				})
+			}
 			return
 		}
 

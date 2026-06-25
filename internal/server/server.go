@@ -29,6 +29,7 @@ import (
 	"github.com/aniclew/aniclew/internal/router"
 	"github.com/aniclew/aniclew/internal/stream"
 	"github.com/aniclew/aniclew/internal/types"
+	"github.com/aniclew/aniclew/internal/workstream"
 )
 
 //go:embed dashboard.html
@@ -282,6 +283,11 @@ func (s *Server) Start() error {
 
 	// Workspaces & Sessions
 	mux.HandleFunc("GET /api/workspaces", s.handleWorkspaceList)
+	mux.HandleFunc("GET /api/workstreams", s.handleWorkstreamList)
+	mux.HandleFunc("POST /api/workstreams", s.handleWorkstreamCreate)
+	mux.HandleFunc("GET /api/workstreams/{id}", s.handleWorkstreamGet)
+	mux.HandleFunc("PATCH /api/workstreams/{id}", s.handleWorkstreamPatch)
+	mux.HandleFunc("POST /api/workstreams/{id}/handoff", s.handleWorkstreamHandoff)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionSave)
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleSessionGet)
@@ -1711,6 +1717,155 @@ func (s *Server) handleWorkspaceList(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, store.ListWorkspaces())
 }
 
+func (s *Server) requestWorkDir(r *http.Request, explicit string) string {
+	workDir := strings.TrimSpace(explicit)
+	if workDir == "" {
+		workDir = strings.TrimSpace(r.URL.Query().Get("workDir"))
+	}
+	if workDir == "" {
+		s.mu.RLock()
+		workDir = s.workDir
+		s.mu.RUnlock()
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+	return workDir
+}
+
+func (s *Server) handleWorkstreamList(w http.ResponseWriter, r *http.Request) {
+	workDir := s.requestWorkDir(r, "")
+	status := workstream.Status(strings.TrimSpace(r.URL.Query().Get("status")))
+	if status != "" && !status.Valid() {
+		writeError(w, 400, "invalid status")
+		return
+	}
+	store := workstream.NewStore(workDir)
+	workstreams, err := store.List(status)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"workDir": workDir, "workstreams": workstreams})
+}
+
+func (s *Server) handleWorkstreamCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		WorkDir    string          `json:"workDir"`
+		ID         string          `json:"id"`
+		Title      string          `json:"title"`
+		Summary    string          `json:"summary"`
+		NextAction string          `json:"nextAction"`
+		Tags       []string        `json:"tags"`
+		Goal       workstream.Goal `json:"goal"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "Invalid JSON")
+		return
+	}
+	workDir := s.requestWorkDir(r, body.WorkDir)
+	store := workstream.NewStore(workDir)
+	ws, err := store.Create(workstream.CreateRequest{
+		ID:         body.ID,
+		Title:      body.Title,
+		Summary:    body.Summary,
+		NextAction: body.NextAction,
+		Tags:       body.Tags,
+		Goal:       body.Goal,
+	})
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":         true,
+		"workstream": ws,
+		"path":       workstream.StatePath(workDir, ws.ID),
+	})
+}
+
+func (s *Server) handleWorkstreamGet(w http.ResponseWriter, r *http.Request) {
+	workDir := s.requestWorkDir(r, "")
+	id := r.PathValue("id")
+	store := workstream.NewStore(workDir)
+	ws, err := store.Get(id)
+	if err != nil {
+		writeError(w, 404, err.Error())
+		return
+	}
+	timeline, err := store.Timeline(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"workstream": ws, "timeline": timeline})
+}
+
+func (s *Server) handleWorkstreamPatch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		WorkDir          string                         `json:"workDir"`
+		Status           *workstream.Status             `json:"status"`
+		Summary          *string                        `json:"summary"`
+		NextAction       *string                        `json:"nextAction"`
+		OpenQuestions    []string                       `json:"openQuestions"`
+		Tags             []string                       `json:"tags"`
+		Goal             *workstream.Goal               `json:"goal"`
+		LastVerification *workstream.VerificationResult `json:"lastVerification"`
+		HasOpenQuestions bool                           `json:"hasOpenQuestions"`
+		HasTags          bool                           `json:"hasTags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "Invalid JSON")
+		return
+	}
+	workDir := s.requestWorkDir(r, body.WorkDir)
+	store := workstream.NewStore(workDir)
+	patch := workstream.Patch{
+		Status:           body.Status,
+		Summary:          body.Summary,
+		NextAction:       body.NextAction,
+		Goal:             body.Goal,
+		LastVerification: body.LastVerification,
+	}
+	// JSON cannot distinguish omitted slices from null with this simple
+	// decoder shape, so accept explicit booleans for clients that need to
+	// clear lists. Non-empty lists are always applied.
+	if len(body.OpenQuestions) > 0 || body.HasOpenQuestions {
+		patch.OpenQuestions = body.OpenQuestions
+	}
+	if len(body.Tags) > 0 || body.HasTags {
+		patch.Tags = body.Tags
+	}
+	ws, err := store.Patch(r.PathValue("id"), patch)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "workstream": ws})
+}
+
+func (s *Server) handleWorkstreamHandoff(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		WorkDir            string `json:"workDir"`
+		IncludeReceipts    bool   `json:"includeReceipts"`
+		IncludeMemoryIndex bool   `json:"includeMemoryIndex"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	workDir := s.requestWorkDir(r, body.WorkDir)
+	store := workstream.NewStore(workDir)
+	snap, err := store.GenerateHandoff(r.PathValue("id"), workstream.HandoffOptions{
+		IncludeReceipts:    body.IncludeReceipts,
+		IncludeMemoryIndex: body.IncludeMemoryIndex,
+	})
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "path": snap.Path, "markdown": snap.Markdown})
+}
+
 func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	store := s.sessions
@@ -1822,6 +1977,7 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		Messages     []types.Message `json:"messages"`
 		WorkDir      string          `json:"workDir"`
 		ResponseLang string          `json:"responseLang"`
+		WorkstreamID string          `json:"workstreamId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
@@ -1847,6 +2003,20 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		respLang = "auto"
 	}
 	s.mu.RUnlock()
+
+	var ws *workstream.Workstream
+	var wsStore *workstream.Store
+	workstreamContext := ""
+	if body.WorkstreamID != "" {
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(body.WorkstreamID)
+		if err != nil {
+			writeError(w, 404, err.Error())
+			return
+		}
+		ws = loaded
+		workstreamContext = workstream.RenderContext(*ws, 2000)
+	}
 
 	// Register with the loop registry before we touch the response writer
 	// — if the cap is already hit we reject with 429 instead of opening
@@ -1883,9 +2053,40 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
+	if ws != nil {
+		workstreamEvent, _ := json.Marshal(agent.Event{
+			Type: "workstream",
+			Data: map[string]any{
+				"id":         ws.ID,
+				"title":      ws.Title,
+				"status":     ws.Status,
+				"nextAction": ws.NextAction,
+			},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", workstreamEvent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
 	eventCh := make(chan agent.Event, 64)
 
-	go agent.RunLoop(loopCtx, provider, model, body.Messages, workDir, respLang, eventCh)
+	var recorder agent.RunRecorder
+	if ws != nil && wsStore != nil {
+		recorder = &workstreamRunRecorder{
+			store:        wsStore,
+			id:           ws.ID,
+			sessionID:    sessionID,
+			providerName: provider.Name(),
+			model:        model,
+		}
+	}
+
+	go agent.RunLoopWithOptions(loopCtx, provider, model, body.Messages, workDir, agent.RunOptions{
+		ResponseLang:      respLang,
+		WorkstreamContext: workstreamContext,
+		Recorder:          recorder,
+	}, eventCh)
 
 	for event := range eventCh {
 		data, _ := json.Marshal(event)
@@ -1898,6 +2099,81 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+type workstreamRunRecorder struct {
+	store        *workstream.Store
+	id           string
+	sessionID    string
+	providerName string
+	model        string
+}
+
+func (r *workstreamRunRecorder) RunStarted() {
+	if r == nil || r.store == nil {
+		return
+	}
+	if err := r.store.AppendEvent(r.id, workstream.TimelineEvent{
+		Type:    "agent_run_started",
+		Message: "Agent run started",
+		Data: map[string]string{
+			"sessionId": r.sessionID,
+			"provider":  r.providerName,
+			"model":     r.model,
+		},
+	}); err != nil {
+		log.Printf("[workstream] record start failed: %v", err)
+	}
+}
+
+func (r *workstreamRunRecorder) ReceiptWritten(path string, receipt agent.AgentReceipt) {
+	if r == nil || r.store == nil {
+		return
+	}
+	if err := r.store.AppendEvent(r.id, workstream.TimelineEvent{
+		Type:    "receipt_written",
+		Message: "Agent receipt written",
+		Data: map[string]string{
+			"path":         path,
+			"provider":     receipt.Provider,
+			"model":        receipt.Model,
+			"projectType":  receipt.ProjectType,
+			"verification": receipt.Verification.Status,
+		},
+	}); err != nil {
+		log.Printf("[workstream] record receipt failed: %v", err)
+	}
+}
+
+func (r *workstreamRunRecorder) RunCompleted(summary agent.RunSummary) {
+	if r == nil || r.store == nil {
+		return
+	}
+	verification := workstream.VerificationResult{
+		Status:  summary.Verification.Status,
+		Source:  summary.Verification.Source,
+		Summary: "agent run completed",
+	}
+	if _, err := r.store.Patch(r.id, workstream.Patch{LastVerification: &verification}); err != nil {
+		log.Printf("[workstream] record verification failed: %v", err)
+	}
+	if err := r.store.AppendEvent(r.id, workstream.TimelineEvent{
+		Type:    "agent_run_completed",
+		Message: "Agent run completed",
+		Data: map[string]string{
+			"sessionId":    r.sessionID,
+			"iterations":   fmt.Sprintf("%d", summary.Iterations),
+			"provider":     summary.Provider,
+			"model":        summary.Model,
+			"projectType":  summary.ProjectType,
+			"planMode":     fmt.Sprintf("%v", summary.PlanMode),
+			"editedFiles":  strings.Join(summary.EditedFiles, ","),
+			"verification": summary.Verification.Status,
+			"receipt":      summary.ReceiptPath,
+		},
+	}); err != nil {
+		log.Printf("[workstream] record completion failed: %v", err)
 	}
 }
 
