@@ -17,7 +17,7 @@ func ExtendedToolDefs() []types.ToolDef {
 		// ── Web Tools ──
 		{
 			Name:        "WebSearch",
-			Description: "Search the web and return structured top results with title, URL, snippet, and source. Uses Ollama web_search when OLLAMA_API_KEY is set, otherwise DuckDuckGo fallback.",
+			Description: "Search the web and return structured top results with title, URL, snippet, and source. Uses the built-in DuckDuckGo provider by default; provider=ollama uses Ollama web_search when OLLAMA_API_KEY is set.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
@@ -30,7 +30,7 @@ func ExtendedToolDefs() []types.ToolDef {
 		},
 		{
 			Name:        "WebFetch",
-			Description: "Fetch a webpage URL and return cleaned readable text, title, links, and metadata. Uses Ollama web_fetch when OLLAMA_API_KEY is set, otherwise direct HTTP fetch.",
+			Description: "Fetch a webpage URL and return cleaned readable text, title, links, and metadata. Uses direct HTTP fetch by default; provider=ollama uses Ollama web_fetch when OLLAMA_API_KEY is set.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {

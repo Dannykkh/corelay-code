@@ -74,6 +74,17 @@ func TestExecuteWebFetchDirectHTML(t *testing.T) {
 	}
 }
 
+func TestDefaultWebProvidersIgnoreOllamaAPIKey(t *testing.T) {
+	t.Setenv("OLLAMA_API_KEY", "test-key")
+
+	if got := webSearchDefaultProvider(); got != "duckduckgo" {
+		t.Fatalf("webSearchDefaultProvider() = %q, want duckduckgo", got)
+	}
+	if got := webFetchDefaultProvider(); got != "direct" {
+		t.Fatalf("webFetchDefaultProvider() = %q, want direct", got)
+	}
+}
+
 func TestOllamaWebSearchUsesConfiguredBase(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/web_search" {

@@ -85,8 +85,8 @@ func executeWebFetch(input json.RawMessage, _ string) (string, bool) {
 	return formatFetchResult(result, args.Prompt, args.MaxChars), false
 }
 
-// WebSearch searches the web with a provider chain: Ollama API when configured,
-// then DuckDuckGo HTML fallback.
+// WebSearch searches the web with the built-in DuckDuckGo provider by default.
+// Ollama's hosted web_search is only used when provider:"ollama" is explicit.
 func executeWebSearch(input json.RawMessage, _ string) (string, bool) {
 	var args webSearchArgs
 	json.Unmarshal(input, &args)
@@ -230,16 +230,10 @@ func fetchWeb(ctx context.Context, args webFetchArgs) (webFetchResult, error) {
 }
 
 func webSearchDefaultProvider() string {
-	if strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")) != "" {
-		return "ollama"
-	}
 	return "duckduckgo"
 }
 
 func webFetchDefaultProvider() string {
-	if strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")) != "" {
-		return "ollama"
-	}
 	return "direct"
 }
 
