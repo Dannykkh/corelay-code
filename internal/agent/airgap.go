@@ -13,11 +13,12 @@ import (
 //
 // Note: Bash can also reach the network (e.g. `curl`), but gating it wholesale
 // would break legitimate local use — an air-gapped deployment relies on the
-// host having no route off the network for that case. These three tools are
-// the ones whose entire purpose is outbound internet access.
+// host having no route off the network for that case. These tools are the ones
+// whose entire purpose is outbound internet access.
 var egressTools = map[string]bool{
 	"WebSearch":   true,
 	"WebFetch":    true,
+	"WebResearch": true,
 	"HTTPRequest": true,
 }
 

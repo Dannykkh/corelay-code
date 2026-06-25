@@ -185,6 +185,8 @@ func ExecuteTool(name string, input json.RawMessage, workDir string) (string, bo
 		return executeWebFetch(input, workDir)
 	case "WebSearch":
 		return executeWebSearch(input, workDir)
+	case "WebResearch":
+		return executeWebResearch(input, workDir)
 	default:
 		return fmt.Sprintf("Unknown tool: %s", name), true
 	}
@@ -193,7 +195,9 @@ func ExecuteTool(name string, input json.RawMessage, workDir string) (string, bo
 // ── Tool implementations ──
 
 func executeBash(input json.RawMessage, workDir string) (string, bool) {
-	var args struct{ Command string `json:"command"` }
+	var args struct {
+		Command string `json:"command"`
+	}
 	json.Unmarshal(input, &args)
 
 	ctx := exec.Command("bash", "-c", args.Command)
@@ -233,8 +237,12 @@ func executeRead(input json.RawMessage, workDir string) (string, bool) {
 	lines := strings.Split(string(data), "\n")
 
 	start := args.Offset
-	if start < 0 { start = 0 }
-	if start > len(lines) { start = len(lines) }
+	if start < 0 {
+		start = 0
+	}
+	if start > len(lines) {
+		start = len(lines)
+	}
 
 	end := len(lines)
 	if args.Limit > 0 && start+args.Limit < end {

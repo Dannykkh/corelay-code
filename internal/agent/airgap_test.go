@@ -31,7 +31,8 @@ func TestOfflineMode(t *testing.T) {
 func TestFilterEgressTools(t *testing.T) {
 	defs := []types.ToolDef{
 		{Name: "Read"}, {Name: "Write"}, {Name: "WebSearch"},
-		{Name: "WebFetch"}, {Name: "HTTPRequest"}, {Name: "Bash"},
+		{Name: "WebFetch"}, {Name: "WebResearch"}, {Name: "HTTPRequest"},
+		{Name: "Bash"},
 	}
 
 	// Online: untouched.
@@ -47,7 +48,7 @@ func TestFilterEgressTools(t *testing.T) {
 	for _, d := range got {
 		names[d.Name] = true
 	}
-	for _, banned := range []string{"WebSearch", "WebFetch", "HTTPRequest"} {
+	for _, banned := range []string{"WebSearch", "WebFetch", "WebResearch", "HTTPRequest"} {
 		if names[banned] {
 			t.Errorf("offline: %s should be filtered out", banned)
 		}
@@ -58,14 +59,14 @@ func TestFilterEgressTools(t *testing.T) {
 		}
 	}
 	// Caller's slice must not be mutated.
-	if len(defs) != 6 {
+	if len(defs) != 7 {
 		t.Errorf("input slice was mutated: len=%d", len(defs))
 	}
 }
 
 func TestExecuteToolBlocksEgressOffline(t *testing.T) {
 	t.Setenv("ANICLEW_OFFLINE", "1")
-	for _, name := range []string{"WebSearch", "WebFetch", "HTTPRequest"} {
+	for _, name := range []string{"WebSearch", "WebFetch", "WebResearch", "HTTPRequest"} {
 		input := json.RawMessage(`{"url":"https://example.com","query":"x"}`)
 		out, isErr := ExecuteTool(name, input, t.TempDir())
 		if !isErr {

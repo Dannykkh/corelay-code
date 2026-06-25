@@ -50,7 +50,9 @@ var moderateBashPatterns = []string{
 func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string) {
 	switch toolName {
 	case "Bash":
-		var args struct{ Command string `json:"command"` }
+		var args struct {
+			Command string `json:"command"`
+		}
 		json.Unmarshal(input, &args)
 		cmd := strings.ToLower(args.Command)
 
@@ -88,7 +90,7 @@ func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string
 	case "Edit":
 		return DangerSafe, ""
 
-	case "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
+	case "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch", "WebResearch",
 		"TaskCreate", "TaskUpdate", "TaskList",
 		"NotebookRead":
 		return DangerSafe, ""
@@ -163,7 +165,9 @@ func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg
 
 	// Check blocked commands for Bash
 	if toolName == "Bash" {
-		var args struct{ Command string `json:"command"` }
+		var args struct {
+			Command string `json:"command"`
+		}
 		json.Unmarshal(input, &args)
 		for _, blocked := range cfg.BlockedCommands {
 			if strings.Contains(strings.ToLower(args.Command), strings.ToLower(blocked)) {
@@ -174,7 +178,9 @@ func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg
 
 	// Check file paths
 	if toolName == "Read" || toolName == "Write" || toolName == "Edit" {
-		var args struct{ FilePath string `json:"file_path"` }
+		var args struct {
+			FilePath string `json:"file_path"`
+		}
 		json.Unmarshal(input, &args)
 		if args.FilePath != "" {
 			if ok, msg := CheckPath(args.FilePath, workDir, cfg); !ok {

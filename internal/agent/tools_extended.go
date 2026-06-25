@@ -17,25 +17,44 @@ func ExtendedToolDefs() []types.ToolDef {
 		// ── Web Tools ──
 		{
 			Name:        "WebSearch",
-			Description: "Search the web and return top results. Use for finding documentation, APIs, solutions.",
+			Description: "Search the web and return structured top results with title, URL, snippet, and source. Uses Ollama web_search when OLLAMA_API_KEY is set, otherwise DuckDuckGo fallback.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"query": {"type": "string", "description": "Search query"}
+					"query": {"type": "string", "description": "Search query"},
+					"max_results": {"type": "integer", "description": "Maximum results to return (default 5, max 10)"},
+					"provider": {"type": "string", "description": "Search provider: auto, ollama, duckduckgo"}
 				},
 				"required": ["query"]
 			}`),
 		},
 		{
 			Name:        "WebFetch",
-			Description: "Fetch a webpage URL and return its text content.",
+			Description: "Fetch a webpage URL and return cleaned readable text, title, links, and metadata. Uses Ollama web_fetch when OLLAMA_API_KEY is set, otherwise direct HTTP fetch.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"url": {"type": "string", "description": "URL to fetch"},
-					"prompt": {"type": "string", "description": "What to extract from the page"}
+					"prompt": {"type": "string", "description": "What to extract from the page"},
+					"max_chars": {"type": "integer", "description": "Maximum content characters to return (default 12000, max 30000)"},
+					"provider": {"type": "string", "description": "Fetch provider: auto, ollama, direct"}
 				},
 				"required": ["url"]
+			}`),
+		},
+		{
+			Name:        "WebResearch",
+			Description: "Search the web, fetch the top pages, and return compact cited context. Use when current information or multi-source web evidence is needed.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"query": {"type": "string", "description": "Research query"},
+					"max_results": {"type": "integer", "description": "Maximum search results (default 5, max 10)"},
+					"fetch_top": {"type": "integer", "description": "How many top results to fetch (default 3)"},
+					"max_chars": {"type": "integer", "description": "Maximum fetched content characters to return (default 12000, max 30000)"},
+					"provider": {"type": "string", "description": "Provider preference: auto, ollama, duckduckgo"}
+				},
+				"required": ["query"]
 			}`),
 		},
 		// ── Git Tools ──
@@ -133,6 +152,9 @@ func ExecuteExtendedTool(name string, input json.RawMessage, workDir string) (st
 	case "WebFetch":
 		r, e := executeWebFetch(input, workDir)
 		return r, e, true
+	case "WebResearch":
+		r, e := executeWebResearch(input, workDir)
+		return r, e, true
 	case "Git":
 		r, e := executeGit(input, workDir)
 		return r, e, true
@@ -159,7 +181,7 @@ func ExecuteExtendedTool(name string, input json.RawMessage, workDir string) (st
 	}
 }
 
-// WebSearch and WebFetch are implemented in tool_web.go
+// WebSearch, WebFetch, and WebResearch are implemented in tool_web.go
 
 // ── Git ──
 
@@ -207,7 +229,9 @@ func executeGit(input json.RawMessage, workDir string) (string, bool) {
 // ── LS ──
 
 func executeLS(input json.RawMessage, workDir string) (string, bool) {
-	var args struct{ Path string `json:"path"` }
+	var args struct {
+		Path string `json:"path"`
+	}
 	json.Unmarshal(input, &args)
 
 	dir := workDir
@@ -310,7 +334,9 @@ type notebookCell struct {
 }
 
 func executeNotebookRead(input json.RawMessage, workDir string) (string, bool) {
-	var args struct{ FilePath string `json:"file_path"` }
+	var args struct {
+		FilePath string `json:"file_path"`
+	}
 	json.Unmarshal(input, &args)
 
 	path := resolvePath(args.FilePath, workDir)

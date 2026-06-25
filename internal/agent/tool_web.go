@@ -1,142 +1,737 @@
 package agent
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
+const (
+	defaultSearchResults = 5
+	maxSearchResults     = 10
+	defaultFetchTop      = 3
+	defaultFetchChars    = 12000
+	maxFetchChars        = 30000
+)
+
+type webSearchArgs struct {
+	Query      string `json:"query"`
+	MaxResults int    `json:"max_results,omitempty"`
+	Provider   string `json:"provider,omitempty"` // auto, ollama, duckduckgo
+}
+
+type webFetchArgs struct {
+	URL      string `json:"url"`
+	Prompt   string `json:"prompt,omitempty"`
+	MaxChars int    `json:"max_chars,omitempty"`
+	Provider string `json:"provider,omitempty"` // auto, ollama, direct
+}
+
+type webResearchArgs struct {
+	Query      string `json:"query"`
+	MaxResults int    `json:"max_results,omitempty"`
+	FetchTop   int    `json:"fetch_top,omitempty"`
+	MaxChars   int    `json:"max_chars,omitempty"`
+	Provider   string `json:"provider,omitempty"` // auto, ollama, duckduckgo
+}
+
+type webSearchResult struct {
+	Rank    int    `json:"rank"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet"`
+	Source  string `json:"source"`
+}
+
+type webFetchResult struct {
+	URL         string   `json:"url"`
+	FinalURL    string   `json:"final_url,omitempty"`
+	Title       string   `json:"title,omitempty"`
+	Status      int      `json:"status,omitempty"`
+	ContentType string   `json:"content_type,omitempty"`
+	Content     string   `json:"content"`
+	Links       []string `json:"links,omitempty"`
+	Source      string   `json:"source"`
+}
+
 // WebFetch fetches a URL and returns cleaned text content.
 func executeWebFetch(input json.RawMessage, _ string) (string, bool) {
-	var args struct {
-		URL    string `json:"url"`
-		Prompt string `json:"prompt,omitempty"` // optional instruction
-	}
+	var args webFetchArgs
 	json.Unmarshal(input, &args)
-
+	args.URL = strings.TrimSpace(args.URL)
 	if args.URL == "" {
 		return "URL is required", true
 	}
+	args.MaxChars = normalizePositiveLimit(args.MaxChars, defaultFetchChars, maxFetchChars)
 
-	log.Printf("[WebFetch] Fetching: %s", args.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", args.URL, nil)
+	result, err := fetchWeb(ctx, args)
 	if err != nil {
-		return fmt.Sprintf("Invalid URL: %v", err), true
+		return err.Error(), true
 	}
-	req.Header.Set("User-Agent", "AniClew/1.0 (Web Fetch Tool)")
-	req.Header.Set("Accept", "text/html, application/json, text/plain")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Sprintf("Fetch error: %v", err), true
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status), true
-	}
-
-	// Read body (limit 500KB)
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 500*1024))
-	if err != nil {
-		return fmt.Sprintf("Read error: %v", err), true
-	}
-
-	content := string(body)
-	contentType := resp.Header.Get("Content-Type")
-
-	// JSON response — return as-is
-	if strings.Contains(contentType, "json") {
-		if len(content) > 10000 {
-			content = content[:10000] + "\n... (truncated)"
-		}
-		return content, false
-	}
-
-	// HTML — strip tags
-	if strings.Contains(contentType, "html") {
-		content = htmlToText(content)
-	}
-
-	// Truncate
-	if len(content) > 15000 {
-		content = content[:15000] + "\n\n... (truncated, full page was larger)"
-	}
-
-	result := fmt.Sprintf("URL: %s\nStatus: %d\nContent-Type: %s\n\n%s",
-		args.URL, resp.StatusCode, contentType, content)
-
-	return result, false
+	return formatFetchResult(result, args.Prompt, args.MaxChars), false
 }
 
-// WebSearch performs a simple search (using DuckDuckGo HTML).
+// WebSearch searches the web with a provider chain: Ollama API when configured,
+// then DuckDuckGo HTML fallback.
 func executeWebSearch(input json.RawMessage, _ string) (string, bool) {
-	var args struct {
-		Query string `json:"query"`
-	}
+	var args webSearchArgs
 	json.Unmarshal(input, &args)
-
+	args.Query = strings.TrimSpace(args.Query)
 	if args.Query == "" {
 		return "Query is required", true
 	}
+	args.MaxResults = normalizePositiveLimit(args.MaxResults, defaultSearchResults, maxSearchResults)
 
-	url := "https://html.duckduckgo.com/html/?q=" + strings.ReplaceAll(args.Query, " ", "+")
-	log.Printf("[WebSearch] Searching: %s", args.Query)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "AniClew/1.0")
+	results, provider, fallbackNote, err := searchWeb(ctx, args)
+	if err != nil {
+		return err.Error(), true
+	}
+	return formatSearchResults(args.Query, provider, fallbackNote, results), false
+}
+
+// WebResearch searches, fetches the top pages, and returns compact cited context.
+func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
+	var args webResearchArgs
+	json.Unmarshal(input, &args)
+	args.Query = strings.TrimSpace(args.Query)
+	if args.Query == "" {
+		return "Query is required", true
+	}
+	args.MaxResults = normalizePositiveLimit(args.MaxResults, defaultSearchResults, maxSearchResults)
+	args.FetchTop = normalizePositiveLimit(args.FetchTop, defaultFetchTop, args.MaxResults)
+	args.MaxChars = normalizePositiveLimit(args.MaxChars, defaultFetchChars, maxFetchChars)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	results, provider, fallbackNote, err := searchWeb(ctx, webSearchArgs{
+		Query:      args.Query,
+		MaxResults: args.MaxResults,
+		Provider:   args.Provider,
+	})
+	if err != nil {
+		return err.Error(), true
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "WebResearch query=%q search_provider=%s\n", args.Query, provider)
+	if fallbackNote != "" {
+		fmt.Fprintf(&b, "Note: %s\n", fallbackNote)
+	}
+	b.WriteString("\nSources:\n")
+	for _, r := range results {
+		fmt.Fprintf(&b, "[%d] %s\n    %s\n    %s\n", r.Rank, r.Title, r.URL, r.Snippet)
+	}
+
+	if len(results) == 0 {
+		return b.String(), false
+	}
+
+	b.WriteString("\nFetched context:\n")
+	fetched := 0
+	for _, r := range results {
+		if fetched >= args.FetchTop {
+			break
+		}
+		if strings.TrimSpace(r.URL) == "" {
+			fmt.Fprintf(&b, "\n[%d] fetch skipped: result has no URL\n", r.Rank)
+			continue
+		}
+		fetchResult, ferr := fetchWeb(ctx, webFetchArgs{
+			URL:      r.URL,
+			Prompt:   args.Query,
+			MaxChars: args.MaxChars / maxInt(1, args.FetchTop),
+			Provider: args.Provider,
+		})
+		if ferr != nil {
+			fmt.Fprintf(&b, "\n[%d] fetch failed: %v\n", r.Rank, ferr)
+			continue
+		}
+		fetched++
+		content := extractRelevantText(fetchResult.Content, args.Query, args.MaxChars/maxInt(1, args.FetchTop))
+		fmt.Fprintf(&b, "\n[%d] %s\nURL: %s\nProvider: %s\n%s\n",
+			r.Rank, coalesceString(fetchResult.Title, r.Title), fetchResult.URL, fetchResult.Source, content)
+	}
+
+	return b.String(), false
+}
+
+func searchWeb(ctx context.Context, args webSearchArgs) ([]webSearchResult, string, string, error) {
+	provider := strings.ToLower(strings.TrimSpace(args.Provider))
+	if provider == "" || provider == "auto" {
+		provider = webSearchDefaultProvider()
+	}
+
+	switch provider {
+	case "ollama":
+		results, err := ollamaWebSearch(ctx, args.Query, args.MaxResults)
+		if err == nil {
+			return results, "ollama", "", nil
+		}
+		if strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
+			return nil, "ollama", "", err
+		}
+		results, derr := duckDuckGoSearch(ctx, args.Query, args.MaxResults)
+		if derr != nil {
+			return nil, "duckduckgo", "", fmt.Errorf("ollama search failed: %v; fallback failed: %w", err, derr)
+		}
+		return results, "duckduckgo", "Ollama web_search failed; used DuckDuckGo fallback.", nil
+	case "duckduckgo", "ddg":
+		results, err := duckDuckGoSearch(ctx, args.Query, args.MaxResults)
+		return results, "duckduckgo", "", err
+	default:
+		return nil, provider, "", fmt.Errorf("unsupported web search provider %q", args.Provider)
+	}
+}
+
+func fetchWeb(ctx context.Context, args webFetchArgs) (webFetchResult, error) {
+	provider := strings.ToLower(strings.TrimSpace(args.Provider))
+	if provider == "" || provider == "auto" {
+		provider = webFetchDefaultProvider()
+	}
+
+	switch provider {
+	case "ollama":
+		result, err := ollamaWebFetch(ctx, args.URL)
+		if err == nil {
+			result.Content = truncateString(result.Content, args.MaxChars)
+			return result, nil
+		}
+		if strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
+			return webFetchResult{}, err
+		}
+		result, derr := directWebFetch(ctx, args.URL, args.MaxChars)
+		if derr != nil {
+			return webFetchResult{}, fmt.Errorf("ollama web_fetch failed: %v; direct fetch failed: %w", err, derr)
+		}
+		return result, nil
+	case "direct", "duckduckgo", "ddg":
+		return directWebFetch(ctx, args.URL, args.MaxChars)
+	default:
+		return webFetchResult{}, fmt.Errorf("unsupported web fetch provider %q", args.Provider)
+	}
+}
+
+func webSearchDefaultProvider() string {
+	if strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")) != "" {
+		return "ollama"
+	}
+	return "duckduckgo"
+}
+
+func webFetchDefaultProvider() string {
+	if strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")) != "" {
+		return "ollama"
+	}
+	return "direct"
+}
+
+func ollamaWebSearch(ctx context.Context, query string, maxResults int) ([]webSearchResult, error) {
+	key := strings.TrimSpace(os.Getenv("OLLAMA_API_KEY"))
+	if key == "" {
+		return nil, fmt.Errorf("OLLAMA_API_KEY is not set")
+	}
+	base := strings.TrimRight(coalesceString(os.Getenv("ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
+	body, _ := json.Marshal(map[string]any{
+		"query":       query,
+		"max_results": maxResults,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/web_search", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "AniClew/1.0 (Ollama WebSearch)")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama web_search request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return nil, fmt.Errorf("ollama web_search HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var decoded struct {
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("parse ollama web_search: %w", err)
+	}
+	results := make([]webSearchResult, 0, len(decoded.Results))
+	for i, r := range decoded.Results {
+		if strings.TrimSpace(r.URL) == "" {
+			continue
+		}
+		results = append(results, webSearchResult{
+			Rank:    i + 1,
+			Title:   strings.TrimSpace(r.Title),
+			URL:     strings.TrimSpace(r.URL),
+			Snippet: strings.TrimSpace(r.Content),
+			Source:  "ollama",
+		})
+	}
+	return results, nil
+}
+
+func ollamaWebFetch(ctx context.Context, targetURL string) (webFetchResult, error) {
+	key := strings.TrimSpace(os.Getenv("OLLAMA_API_KEY"))
+	if key == "" {
+		return webFetchResult{}, fmt.Errorf("OLLAMA_API_KEY is not set")
+	}
+	base := strings.TrimRight(coalesceString(os.Getenv("ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
+	body, _ := json.Marshal(map[string]any{"url": targetURL})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/web_fetch", bytes.NewReader(body))
+	if err != nil {
+		return webFetchResult{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "AniClew/1.0 (Ollama WebFetch)")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return webFetchResult{}, fmt.Errorf("ollama web_fetch request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return webFetchResult{}, fmt.Errorf("ollama web_fetch HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var decoded struct {
+		Title   string   `json:"title"`
+		Content string   `json:"content"`
+		Links   []string `json:"links"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&decoded); err != nil {
+		return webFetchResult{}, fmt.Errorf("parse ollama web_fetch: %w", err)
+	}
+	return webFetchResult{
+		URL:     targetURL,
+		Title:   strings.TrimSpace(decoded.Title),
+		Content: strings.TrimSpace(decoded.Content),
+		Links:   decoded.Links,
+		Source:  "ollama",
+	}, nil
+}
+
+func duckDuckGoSearch(ctx context.Context, query string, maxResults int) ([]webSearchResult, error) {
+	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	log.Printf("[WebSearch] DuckDuckGo: %s", query)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DuckDuckGo search error: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("DuckDuckGo HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read DuckDuckGo results: %w", err)
+	}
+	results := extractDuckDuckGoResults(string(body), maxResults)
+	if len(results) == 0 {
+		text := htmlToText(string(body))
+		if text != "" {
+			results = append(results, webSearchResult{
+				Rank:    1,
+				Title:   "DuckDuckGo raw result text",
+				Snippet: truncateString(text, 2000),
+				Source:  "duckduckgo",
+			})
+		}
+	}
+	return results, nil
+}
+
+func directWebFetch(ctx context.Context, targetURL string, maxChars int) (webFetchResult, error) {
+	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return webFetchResult{}, fmt.Errorf("invalid URL: %s", targetURL)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return webFetchResult{}, fmt.Errorf("unsupported URL scheme: %s", parsed.Scheme)
+	}
+
+	log.Printf("[WebFetch] Direct: %s", targetURL)
+	client := &http.Client{Timeout: 35 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return webFetchResult{}, fmt.Errorf("invalid URL: %w", err)
+	}
+	req.Header.Set("User-Agent", browserUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json,text/plain")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Sprintf("Search error: %v", err), true
+		return webFetchResult{}, fmt.Errorf("fetch error: %w", err)
 	}
 	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 200*1024))
-	text := htmlToText(string(body))
-
-	// Extract search results
-	if len(text) > 5000 {
-		text = text[:5000]
+	if resp.StatusCode >= 400 {
+		return webFetchResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	return fmt.Sprintf("Search: %s\n\n%s", args.Query, text), false
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return webFetchResult{}, fmt.Errorf("read error: %w", err)
+	}
+	content := string(body)
+	contentType := resp.Header.Get("Content-Type")
+	title := ""
+	links := []string{}
+	if strings.Contains(strings.ToLower(contentType), "html") || looksLikeHTML(content) {
+		title = extractHTMLTitle(content)
+		links = extractLinks(content, resp.Request.URL)
+		content = htmlToText(content)
+	}
+	if maxChars <= 0 {
+		maxChars = defaultFetchChars
+	}
+	content = truncateString(content, maxChars)
+	return webFetchResult{
+		URL:         targetURL,
+		FinalURL:    resp.Request.URL.String(),
+		Title:       title,
+		Status:      resp.StatusCode,
+		ContentType: contentType,
+		Content:     content,
+		Links:       links,
+		Source:      "direct",
+	}, nil
+}
+
+func extractDuckDuckGoResults(page string, maxResults int) []webSearchResult {
+	anchors := regexp.MustCompile(`(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`).FindAllStringSubmatch(page, -1)
+	snippets := regexp.MustCompile(`(?is)<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>`).FindAllStringSubmatch(page, -1)
+	results := make([]webSearchResult, 0, minInt(maxResults, len(anchors)))
+	seen := map[string]bool{}
+	for i, match := range anchors {
+		if len(results) >= maxResults {
+			break
+		}
+		target := normalizeDuckDuckGoURL(html.UnescapeString(match[1]))
+		if target == "" || seen[target] {
+			continue
+		}
+		seen[target] = true
+		snippet := ""
+		if i < len(snippets) {
+			for _, part := range snippets[i][1:] {
+				if part != "" {
+					snippet = cleanHTMLFragment(part)
+					break
+				}
+			}
+		}
+		results = append(results, webSearchResult{
+			Rank:    len(results) + 1,
+			Title:   cleanHTMLFragment(match[2]),
+			URL:     target,
+			Snippet: snippet,
+			Source:  "duckduckgo",
+		})
+	}
+	return results
+}
+
+func normalizeDuckDuckGoURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "//") {
+		raw = "https:" + raw
+	}
+	if strings.HasPrefix(raw, "/") {
+		raw = "https://duckduckgo.com" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if uddg := parsed.Query().Get("uddg"); uddg != "" {
+		if decoded, err := url.QueryUnescape(uddg); err == nil {
+			return decoded
+		}
+		return uddg
+	}
+	return raw
+}
+
+func formatSearchResults(query, provider, note string, results []webSearchResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "WebSearch query=%q provider=%s results=%d\n", query, provider, len(results))
+	if note != "" {
+		fmt.Fprintf(&b, "Note: %s\n", note)
+	}
+	for _, r := range results {
+		fmt.Fprintf(&b, "\n[%d] %s\nURL: %s\nSnippet: %s\nSource: %s\n",
+			r.Rank, coalesceString(r.Title, "(untitled)"), r.URL, r.Snippet, r.Source)
+	}
+	if len(results) == 0 {
+		b.WriteString("\nNo results returned.")
+	}
+	return b.String()
+}
+
+func formatFetchResult(result webFetchResult, prompt string, maxChars int) string {
+	content := result.Content
+	if strings.TrimSpace(prompt) != "" {
+		content = extractRelevantText(content, prompt, maxChars)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "WebFetch provider=%s\nURL: %s\n", result.Source, result.URL)
+	if result.FinalURL != "" && result.FinalURL != result.URL {
+		fmt.Fprintf(&b, "Final-URL: %s\n", result.FinalURL)
+	}
+	if result.Status != 0 {
+		fmt.Fprintf(&b, "Status: %d\n", result.Status)
+	}
+	if result.ContentType != "" {
+		fmt.Fprintf(&b, "Content-Type: %s\n", result.ContentType)
+	}
+	if result.Title != "" {
+		fmt.Fprintf(&b, "Title: %s\n", result.Title)
+	}
+	if len(result.Links) > 0 {
+		fmt.Fprintf(&b, "Links: %s\n", strings.Join(limitStrings(result.Links, 10), ", "))
+	}
+	fmt.Fprintf(&b, "\n%s", content)
+	return b.String()
+}
+
+func extractRelevantText(content, prompt string, maxChars int) string {
+	content = strings.TrimSpace(content)
+	if content == "" || strings.TrimSpace(prompt) == "" {
+		return truncateString(content, maxChars)
+	}
+	keywords := keywordSet(prompt)
+	if len(keywords) == 0 {
+		return truncateString(content, maxChars)
+	}
+	paragraphs := splitParagraphs(content)
+	type scored struct {
+		text  string
+		score int
+		idx   int
+	}
+	var ranked []scored
+	for i, p := range paragraphs {
+		lower := strings.ToLower(p)
+		score := 0
+		for kw := range keywords {
+			if strings.Contains(lower, kw) {
+				score++
+			}
+		}
+		if score > 0 {
+			ranked = append(ranked, scored{text: p, score: score, idx: i})
+		}
+	}
+	if len(ranked) == 0 {
+		return truncateString(content, maxChars)
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score == ranked[j].score {
+			return ranked[i].idx < ranked[j].idx
+		}
+		return ranked[i].score > ranked[j].score
+	})
+	var selected []scored
+	total := 0
+	for _, p := range ranked {
+		if total+len(p.text) > maxChars && len(selected) > 0 {
+			break
+		}
+		selected = append(selected, p)
+		total += len(p.text) + 2
+	}
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].idx < selected[j].idx })
+	var parts []string
+	for _, p := range selected {
+		parts = append(parts, p.text)
+	}
+	return truncateString(strings.Join(parts, "\n\n"), maxChars)
 }
 
 // htmlToText strips HTML tags and returns readable text.
-func htmlToText(html string) string {
-	// Remove script and style blocks
-	html = regexp.MustCompile(`(?s)<script[^>]*>.*?</script>`).ReplaceAllString(html, "")
-	html = regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`).ReplaceAllString(html, "")
-	html = regexp.MustCompile(`(?s)<nav[^>]*>.*?</nav>`).ReplaceAllString(html, "")
-	html = regexp.MustCompile(`(?s)<footer[^>]*>.*?</footer>`).ReplaceAllString(html, "")
+func htmlToText(input string) string {
+	input = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(input, "")
+	input = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(input, "")
+	input = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`).ReplaceAllString(input, "")
+	input = regexp.MustCompile(`(?is)<nav[^>]*>.*?</nav>`).ReplaceAllString(input, "")
+	input = regexp.MustCompile(`(?is)<footer[^>]*>.*?</footer>`).ReplaceAllString(input, "")
+	input = regexp.MustCompile(`(?i)<br\s*/?\s*>`).ReplaceAllString(input, "\n")
+	input = regexp.MustCompile(`(?i)</?(p|div|h[1-6]|li|tr|section|article|main|blockquote|pre|table)[^>]*>`).ReplaceAllString(input, "\n")
+	input = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(input, "")
+	input = html.UnescapeString(input)
+	input = regexp.MustCompile(`[ \t]+`).ReplaceAllString(input, " ")
+	input = regexp.MustCompile(`\n[ \t]+`).ReplaceAllString(input, "\n")
+	input = regexp.MustCompile(`\n{3,}`).ReplaceAllString(input, "\n\n")
+	return strings.TrimSpace(input)
+}
 
-	// Replace block elements with newlines
-	html = regexp.MustCompile(`<br\s*/?\s*>`).ReplaceAllString(html, "\n")
-	html = regexp.MustCompile(`</?(p|div|h[1-6]|li|tr|section|article)[^>]*>`).ReplaceAllString(html, "\n")
+func cleanHTMLFragment(s string) string {
+	return htmlToText(s)
+}
 
-	// Strip remaining tags
-	html = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(html, "")
+func extractHTMLTitle(page string) string {
+	m := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`).FindStringSubmatch(page)
+	if len(m) < 2 {
+		return ""
+	}
+	return truncateString(cleanHTMLFragment(m[1]), 200)
+}
 
-	// Decode common entities
-	html = strings.ReplaceAll(html, "&amp;", "&")
-	html = strings.ReplaceAll(html, "&lt;", "<")
-	html = strings.ReplaceAll(html, "&gt;", ">")
-	html = strings.ReplaceAll(html, "&quot;", "\"")
-	html = strings.ReplaceAll(html, "&#39;", "'")
-	html = strings.ReplaceAll(html, "&nbsp;", " ")
+func extractLinks(page string, base *url.URL) []string {
+	matches := regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["']`).FindAllStringSubmatch(page, -1)
+	out := make([]string, 0, minInt(20, len(matches)))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		href := strings.TrimSpace(html.UnescapeString(m[1]))
+		if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(strings.ToLower(href), "javascript:") {
+			continue
+		}
+		u, err := url.Parse(href)
+		if err != nil {
+			continue
+		}
+		if base != nil {
+			u = base.ResolveReference(u)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			continue
+		}
+		value := u.String()
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+		if len(out) >= 20 {
+			break
+		}
+	}
+	return out
+}
 
-	// Collapse whitespace
-	html = regexp.MustCompile(`[ \t]+`).ReplaceAllString(html, " ")
-	html = regexp.MustCompile(`\n{3,}`).ReplaceAllString(html, "\n\n")
+func looksLikeHTML(s string) bool {
+	lower := strings.ToLower(s[:minInt(len(s), 512)])
+	return strings.Contains(lower, "<html") || strings.Contains(lower, "<body") || strings.Contains(lower, "<!doctype html")
+}
 
-	return strings.TrimSpace(html)
+func splitParagraphs(s string) []string {
+	raw := regexp.MustCompile(`\n{2,}`).Split(s, -1)
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func keywordSet(s string) map[string]bool {
+	words := regexp.MustCompile(`[A-Za-z0-9가-힣_./-]+`).FindAllString(strings.ToLower(s), -1)
+	out := map[string]bool{}
+	for _, w := range words {
+		w = strings.Trim(w, ".,/\\-_")
+		if len([]rune(w)) < 3 {
+			continue
+		}
+		out[w] = true
+	}
+	return out
+}
+
+func normalizePositiveLimit(value, fallback, maxValue int) int {
+	if value <= 0 {
+		value = fallback
+	}
+	if maxValue > 0 && value > maxValue {
+		value = maxValue
+	}
+	return value
+}
+
+func truncateString(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + "\n... (truncated)"
+}
+
+func limitStrings(in []string, limit int) []string {
+	if limit <= 0 || len(in) <= limit {
+		return in
+	}
+	return in[:limit]
+}
+
+func browserUserAgent() string {
+	return "Mozilla/5.0 (compatible; AniClew/1.0; +https://github.com/aniclew/aniclew)"
+}
+
+func coalesceString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
