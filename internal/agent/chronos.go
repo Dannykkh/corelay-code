@@ -13,13 +13,14 @@ import (
 
 // ChronosConfig controls the autonomous loop.
 type ChronosConfig struct {
-	MaxIterations   int           // overall iteration cap (default 50)
-	MaxCycles       int           // FIND→FIX→VERIFY cycle cap (default 10)
-	CycleTimeout    time.Duration // max time per cycle (default 5 min)
-	TotalTimeout    time.Duration // max total time (default 30 min)
-	VerifyCommand   string        // command to verify (e.g., "npm test", "go test ./...")
-	CompletionCheck string        // how to determine completion
-	AutoFix         bool          // automatically attempt fixes on verify failure
+	MaxIterations     int           // overall iteration cap (default 50)
+	MaxCycles         int           // FIND→FIX→VERIFY cycle cap (default 10)
+	CycleTimeout      time.Duration // max time per cycle (default 5 min)
+	TotalTimeout      time.Duration // max total time (default 30 min)
+	VerifyCommand     string        // command to verify (e.g., "npm test", "go test ./...")
+	CompletionCheck   string        // how to determine completion
+	AutoFix           bool          // automatically attempt fixes on verify failure
+	WorkstreamContext string        // durable workstream context rendered by the server
 }
 
 // DefaultChronosConfig returns standard settings.
@@ -216,10 +217,10 @@ func runAgentIteration(
 	tools := AllToolDefs(workDir)
 
 	req := &types.MessagesRequest{
-		Model:    model,
-		System:   mustJSON([]map[string]string{{"type": "text", "text": sysPrompt}}),
-		Messages: messages,
-		Tools:    tools,
+		Model:     model,
+		System:    mustJSON([]map[string]string{{"type": "text", "text": sysPrompt}}),
+		Messages:  messages,
+		Tools:     tools,
 		MaxTokens: 8192,
 	}
 
@@ -324,7 +325,7 @@ func buildChronosSystemPrompt(task string, cfg ChronosConfig) string {
 		verify = fmt.Sprintf("Use this command to verify: %s", cfg.VerifyCommand)
 	}
 
-	return fmt.Sprintf(`You are AniClew Chronos — an autonomous coding agent that works in cycles until the task is complete.
+	prompt := fmt.Sprintf(`You are AniClew Chronos — an autonomous coding agent that works in cycles until the task is complete.
 
 ## Mode: FIND → FIX → VERIFY
 
@@ -347,6 +348,10 @@ Each cycle:
 ## Constraints
 - Max %d cycles, %v total timeout
 - Focus on the task, don't over-engineer`, verify, task, cfg.MaxCycles, cfg.TotalTimeout)
+	if contextBlock := strings.TrimSpace(cfg.WorkstreamContext); contextBlock != "" {
+		prompt += "\n\n" + contextBlock
+	}
+	return prompt
 }
 
 // compressChronosMessages keeps the first 2 and last 6 messages, summarizing the middle.

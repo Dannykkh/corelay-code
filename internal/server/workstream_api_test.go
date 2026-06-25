@@ -154,6 +154,79 @@ func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 	}
 }
 
+func TestChronosRecordsWorkstreamRun(t *testing.T) {
+	t.Setenv("ANICLEW_MEMORY", "off")
+	t.Setenv("ANICLEW_AUTOSKILL", "off")
+
+	workDir := t.TempDir()
+	provider := &agentLoopFakeProvider{text: "[COMPLETE]"}
+	s := New(provider, "fake-model", 0)
+	s.SetWorkDir(workDir)
+
+	store := workstream.NewStore(workDir)
+	if _, err := store.Create(workstream.CreateRequest{
+		ID:         "ws_chronos",
+		Title:      "Chronos Workstream",
+		Summary:    "chronos background summary",
+		NextAction: "run chronos",
+		Goal: workstream.Goal{
+			Objective:          "prove chronos workstream recording",
+			AcceptanceCriteria: []string{"chronos event", "timeline event"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{
+		"task":"finish scoped work",
+		"workstreamId":"ws_chronos",
+		"maxCycles":1
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/chronos", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleChronos(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("chronos status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+
+	events := agentSSEEventTypes(t, rec.Body.String())
+	for _, want := range []string{"workstream", "status", "text", "done", "stream_end"} {
+		if events[want] == 0 {
+			t.Fatalf("missing SSE event %q in %v\nbody=%s", want, events, rec.Body.String())
+		}
+	}
+	if !strings.Contains(provider.systemPrompt, "## Workstream Context") ||
+		!strings.Contains(provider.systemPrompt, "Chronos Workstream") ||
+		!strings.Contains(provider.systemPrompt, "prove chronos workstream recording") {
+		t.Fatalf("provider did not receive compact workstream context:\n%s", provider.systemPrompt)
+	}
+
+	updated, err := store.Get("ws_chronos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastVerification.Status != "not-run" || updated.LastVerification.Source != "chronos" {
+		t.Fatalf("unexpected verification: %+v", updated.LastVerification)
+	}
+
+	timeline, err := store.Timeline("ws_chronos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, event := range timeline {
+		have[event.Type] = true
+	}
+	for _, want := range []string{"chronos_run_started", "verification_updated", "chronos_run_completed"} {
+		if !have[want] {
+			t.Fatalf("missing timeline event %q in %+v", want, timeline)
+		}
+	}
+}
+
 type agentLoopFakeProvider struct {
 	text         string
 	calls        int

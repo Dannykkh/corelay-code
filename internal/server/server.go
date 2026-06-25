@@ -2484,6 +2484,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		Task          string `json:"task"`
 		VerifyCommand string `json:"verifyCommand"`
 		MaxCycles     int    `json:"maxCycles"`
+		WorkstreamID  string `json:"workstreamId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
@@ -2506,6 +2507,32 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		cfg.MaxCycles = body.MaxCycles
 	}
 
+	var ws *workstream.Workstream
+	var wsStore *workstream.Store
+	if body.WorkstreamID != "" {
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(body.WorkstreamID)
+		if err != nil {
+			writeError(w, 404, err.Error())
+			return
+		}
+		ws = loaded
+		cfg.WorkstreamContext = workstream.RenderContext(*ws, 2000)
+		if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+			Type:    "chronos_run_started",
+			Message: "Chronos run started",
+			Data: map[string]string{
+				"provider":  provider.Name(),
+				"model":     model,
+				"task":      body.Task,
+				"maxCycles": fmt.Sprintf("%d", cfg.MaxCycles),
+			},
+		}); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -2513,9 +2540,73 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 
 	eventCh := make(chan agent.Event, 64)
 
+	if ws != nil {
+		workstreamEvent, _ := json.Marshal(agent.Event{
+			Type: "workstream",
+			Data: map[string]any{
+				"id":         ws.ID,
+				"title":      ws.Title,
+				"status":     ws.Status,
+				"nextAction": ws.NextAction,
+			},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", workstreamEvent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
 	go agent.RunChronos(r.Context(), provider, model, body.Task, workDir, cfg, eventCh)
 
+	recordedChronosEnd := false
 	for event := range eventCh {
+		if wsStore != nil && ws != nil && !recordedChronosEnd {
+			switch event.Type {
+			case "done":
+				recordedChronosEnd = true
+				verification := workstream.VerificationResult{
+					Status:  "not-run",
+					Source:  "chronos",
+					Summary: "chronos run completed",
+				}
+				if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+					log.Printf("[workstream] record chronos verification failed: %v", err)
+				}
+				if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+					Type:    "chronos_run_completed",
+					Message: "Chronos run completed",
+					Data: map[string]string{
+						"provider": provider.Name(),
+						"model":    model,
+						"task":     body.Task,
+					},
+				}); err != nil {
+					log.Printf("[workstream] record chronos completion failed: %v", err)
+				}
+			case "error":
+				recordedChronosEnd = true
+				verification := workstream.VerificationResult{
+					Status:  "failed",
+					Source:  "chronos",
+					Summary: fmt.Sprint(event.Data),
+				}
+				if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
+					log.Printf("[workstream] record chronos verification failed: %v", err)
+				}
+				if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
+					Type:    "chronos_run_failed",
+					Message: "Chronos run failed",
+					Data: map[string]string{
+						"provider": provider.Name(),
+						"model":    model,
+						"task":     body.Task,
+						"error":    fmt.Sprint(event.Data),
+					},
+				}); err != nil {
+					log.Printf("[workstream] record chronos failure failed: %v", err)
+				}
+			}
+		}
 		data, _ := json.Marshal(event)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		if f, ok := w.(http.Flusher); ok {
