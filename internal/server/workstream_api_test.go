@@ -2,11 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/aniclew/aniclew/internal/types"
+	"github.com/aniclew/aniclew/internal/workstream"
 )
 
 func TestWorkstreamAPI_CreateListGetHandoff(t *testing.T) {
@@ -75,4 +80,126 @@ func TestWorkstreamAPI_CreateListGetHandoff(t *testing.T) {
 	if _, err := os.Stat(handoff.Path); err != nil {
 		t.Fatalf("handoff file missing: %v", err)
 	}
+}
+
+func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
+	t.Setenv("ANICLEW_MEMORY", "off")
+	t.Setenv("ANICLEW_AUTOSKILL", "off")
+
+	workDir := t.TempDir()
+	provider := &agentLoopFakeProvider{text: "agent ok"}
+	s := New(provider, "fake-model", 0)
+	s.SetWorkDir(workDir)
+
+	store := workstream.NewStore(workDir)
+	if _, err := store.Create(workstream.CreateRequest{
+		ID:         "ws_agent",
+		Title:      "Agent Workstream",
+		Summary:    "background summary",
+		NextAction: "run agent",
+		Goal: workstream.Goal{
+			Objective:          "prove agent workstream recording",
+			AcceptanceCriteria: []string{"sse event", "timeline event"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{
+		"workstreamId":"ws_agent",
+		"messages":[{"role":"user","content":"reply briefly"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleAgentLoop(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+
+	events := agentSSEEventTypes(t, rec.Body.String())
+	for _, want := range []string{"session", "workstream", "text", "done", "stream_end"} {
+		if events[want] == 0 {
+			t.Fatalf("missing SSE event %q in %v\nbody=%s", want, events, rec.Body.String())
+		}
+	}
+	if !strings.Contains(provider.systemPrompt, "## Workstream Context") ||
+		!strings.Contains(provider.systemPrompt, "Agent Workstream") ||
+		!strings.Contains(provider.systemPrompt, "prove agent workstream recording") {
+		t.Fatalf("provider did not receive compact workstream context:\n%s", provider.systemPrompt)
+	}
+
+	updated, err := store.Get("ws_agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LastVerification.Status != "not-run" || updated.LastVerification.Source != "none" {
+		t.Fatalf("unexpected verification: %+v", updated.LastVerification)
+	}
+
+	timeline, err := store.Timeline("ws_agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, event := range timeline {
+		have[event.Type] = true
+	}
+	for _, want := range []string{"agent_run_started", "verification_updated", "agent_run_completed"} {
+		if !have[want] {
+			t.Fatalf("missing timeline event %q in %+v", want, timeline)
+		}
+	}
+}
+
+type agentLoopFakeProvider struct {
+	text         string
+	calls        int
+	systemPrompt string
+}
+
+func (p *agentLoopFakeProvider) Name() string              { return "fake" }
+func (p *agentLoopFakeProvider) DisplayName() string       { return "Fake" }
+func (p *agentLoopFakeProvider) Models() []types.ModelInfo { return nil }
+func (p *agentLoopFakeProvider) Validate() error           { return nil }
+
+func (p *agentLoopFakeProvider) StreamMessage(ctx context.Context, req *types.MessagesRequest, opts *types.StreamOptions) (<-chan types.SSEEvent, error) {
+	p.calls++
+	p.systemPrompt = string(req.System)
+
+	ch := make(chan types.SSEEvent, 5)
+	go func() {
+		defer close(ch)
+		block, _ := json.Marshal(map[string]string{"type": "text"})
+		delta, _ := json.Marshal(map[string]string{"type": "text_delta", "text": p.text})
+		stop, _ := json.Marshal(map[string]string{"stop_reason": "end_turn"})
+		ch <- types.SSEEvent{Type: "content_block_start", ContentBlock: block}
+		ch <- types.SSEEvent{Type: "content_block_delta", Delta: delta}
+		ch <- types.SSEEvent{Type: "content_block_stop"}
+		ch <- types.SSEEvent{Type: "message_delta", Delta: stop}
+		ch <- types.SSEEvent{Type: "message_stop"}
+	}()
+	return ch, nil
+}
+
+func agentSSEEventTypes(t *testing.T, body string) map[string]int {
+	t.Helper()
+
+	events := map[string]int{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatalf("decode SSE line %q: %v", line, err)
+		}
+		events[event.Type]++
+	}
+	return events
 }
