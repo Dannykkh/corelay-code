@@ -179,6 +179,24 @@ Fix: Documented Chronos/Team run traces, regression case promotion, regression r
 Verify: git diff --check -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS
 -----------------------------------------------------------
 
+-- Cycle 28 -----------------------------------------------
+Issue: Qwen/Ollama smoke testing proved the Team API run path, but the in-memory TeamRunReceipt did not preserve `workDir` until disk write time, so API Team run traces could lose the workspace that produced the receipt.
+Fix: Populated TeamRunReceipt.WorkDir when building the receipt and extended receipt/server Team API tests to assert the workspace is preserved in run traces.
+Verify: qwen3-coder:30b CLI worker write+verify -> PASS; qwen3-coder:30b API Team write+verify -> PASS; qwen3.6:27b CLI worker write+verify -> PASS; API smoke `TRACE_WORKDIR` matched the temp workspace -> PASS; go test ./internal/agent ./internal/server -run "TestWriteTeamRunReceiptToDir|TestHandleTeamExecuteRecordsTraceAndWorkstream" -count=1 -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS; git diff --check -> PASS; commit 2de422d `fix(observability): preserve team trace workdir`.
+-----------------------------------------------------------
+
+-- Cycle 29 -----------------------------------------------
+Issue: `/api/agent-types` exposed only builtin roles even though `LoadCustomAgentTypes` promised project `.claude/agents/*.md` support, so local/team orchestration could not discover project-specific agent roles.
+Fix: Implemented a conservative markdown frontmatter parser for project custom agents, using the markdown body as the system prompt, and merged custom agents into the server `/api/agent-types` response.
+Verify: go test ./internal/agent -run TestLoadCustomAgentTypes -count=1 -> PASS; go test ./internal/server -run TestHandleAgentTypesIncludesCustomAgents -count=1 -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS; git diff --check -> PASS
+-----------------------------------------------------------
+
+-- Cycle 30 -----------------------------------------------
+Issue: `HoistToolResults` was a no-op even though the normalization pipeline documented that assistant-role `tool_result` blocks should be moved to user-role messages before API calls.
+Fix: Wired `HoistToolResults` into `NormalizeMessages` and split assistant content arrays so misplaced `tool_result` blocks become proper user messages while non-tool assistant blocks stay assistant-owned.
+Verify: go test ./internal/agent -run "TestHoistToolResults|TestNormalizeMessages" -count=1 -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS; git diff --check -> PASS
+-----------------------------------------------------------
+
 Current Completion Gate:
 - go test ./... -count=1 -> PASS
 - go vet ./... -> PASS
