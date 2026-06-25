@@ -2,6 +2,7 @@ package observability
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +62,47 @@ func TestTrackerCreateRegressionCaseFromFailedRun(t *testing.T) {
 	cases := reloaded.RegressionCases(10)
 	if len(cases) != 1 || cases[0].ID != c.ID || cases[0].Inputs["task"] != "fix failing test" {
 		t.Fatalf("regression cases did not persist: %+v", cases)
+	}
+}
+
+func TestTrackerCreateRegressionCaseFromFailedTeamRun(t *testing.T) {
+	dir := t.TempDir()
+	tracker := NewTracker(dir)
+	started := time.Now().UTC().Add(-2 * time.Second)
+	tracker.RecordRun(RunTrace{
+		ID:        "run_team_failed",
+		Kind:      "team",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		WorkDir:   dir,
+		Status:    "failed",
+		Error:     "team verify failed",
+		Metadata: map[string]string{
+			"receipt":       "/tmp/team-receipt.json",
+			"teamName":      "api-team",
+			"objective":     "replay team",
+			"verifyCommand": "go test ./...",
+		},
+		Spans: []RunSpan{{
+			ID:        "team-run",
+			Name:      "team.run",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "failed",
+		}},
+	})
+
+	c, err := tracker.CreateRegressionCase("run_team_failed")
+	if err != nil {
+		t.Fatalf("CreateRegressionCase() error = %v", err)
+	}
+	if c.Kind != "team" || !c.Replayable || c.Inputs["receipt"] == "" {
+		t.Fatalf("unexpected team regression case: %+v", c)
+	}
+	if !strings.Contains(c.ReplayHint, "Team receipt") {
+		t.Fatalf("unexpected replay hint: %q", c.ReplayHint)
 	}
 }
 

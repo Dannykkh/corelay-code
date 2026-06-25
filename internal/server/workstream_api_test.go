@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aniclew/aniclew/internal/agent"
 	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/types"
 	"github.com/aniclew/aniclew/internal/workstream"
@@ -248,6 +249,163 @@ func TestRunRegressionChronosAPI(t *testing.T) {
 	replayTrace := runTraces[len(runTraces)-1]
 	if replayTrace.ID != regressionRuns[0].RunTraceID || replayTrace.Status != "ok" || replayTrace.Metadata["source"] != "regression" {
 		t.Fatalf("unexpected replay trace: %+v", replayTrace)
+	}
+}
+
+func TestRunRegressionRecordsUnsupportedWithoutProvider(t *testing.T) {
+	workDir := t.TempDir()
+	tracker := observability.NewTracker(t.TempDir())
+	started := time.Now().UTC().Add(-time.Second)
+	tracker.RecordRun(observability.RunTrace{
+		ID:        "run_failed_no_provider",
+		Kind:      "chronos",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		WorkDir:   workDir,
+		Status:    "failed",
+		Error:     "verify failed",
+		Metadata: map[string]string{
+			"task":      "repair replay regression",
+			"maxCycles": "1",
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "chronos",
+			Name:      "chronos.run",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "failed",
+		}},
+	})
+	c, err := tracker.CreateRegressionCase("run_failed_no_provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(nil, "", 0)
+	s.SetWorkDir(workDir)
+	s.SetTracker(tracker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/regressions/"+c.ID+"/run", nil)
+	req.SetPathValue("id", c.ID)
+	rec := httptest.NewRecorder()
+	s.handleRunRegressionCase(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run regression status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var run observability.RegressionRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatalf("run regression json: %v", err)
+	}
+	if run.Status != "unsupported" || !strings.Contains(run.Error, "No provider configured") {
+		t.Fatalf("unexpected unsupported run response: %+v", run)
+	}
+	regressionRuns := tracker.RegressionRuns(10)
+	if len(regressionRuns) != 1 || regressionRuns[0].ID != run.ID || regressionRuns[0].Status != "unsupported" {
+		t.Fatalf("unsupported run was not recorded: %+v", regressionRuns)
+	}
+}
+
+func TestRunRegressionTeamAPI(t *testing.T) {
+	t.Setenv("ANICLEW_MEMORY", "off")
+	t.Setenv("ANICLEW_AUTOSKILL", "off")
+
+	workDir := t.TempDir()
+	tracker := observability.NewTracker(t.TempDir())
+	receiptPath, err := agent.WriteTeamRunReceipt(t.TempDir(), workDir, agent.TeamRunReceipt{
+		Kind:          "team-run",
+		Status:        "failed",
+		TeamName:      "api-team",
+		PlanName:      "api-team",
+		PlanVersion:   1,
+		Objective:     "replay failed team",
+		Provider:      "fake",
+		Model:         "fake-model",
+		Capacity:      agent.CapacityConfig{ModelSlots: 1, MaxParallelTasks: 1, FileScopeLock: true},
+		VerifyCommand: "",
+		TaskCount:     1,
+		Failed:        1,
+		Verification:  agent.ReceiptVerification{Status: "failed", Source: "team-verify"},
+		Tasks: []agent.TeamTaskReceipt{{
+			ID:          "task-1",
+			Name:        "Replay one",
+			Description: "return team ok",
+			Kind:        agent.TaskKindImplement,
+			Role:        "implementer",
+			Status:      "failed",
+			Files:       []string{"**"},
+			Resources:   agent.AgentTaskResources{ModelSlots: 1},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC().Add(-time.Second)
+	tracker.RecordRun(observability.RunTrace{
+		ID:        "run_team_failed_replay",
+		Kind:      "team",
+		StartedAt: started,
+		EndedAt:   time.Now().UTC(),
+		Provider:  "fake",
+		Model:     "fake-model",
+		WorkDir:   workDir,
+		Status:    "failed",
+		Error:     "team failed",
+		Metadata: map[string]string{
+			"receipt":       receiptPath,
+			"teamName":      "api-team",
+			"objective":     "replay failed team",
+			"verifyCommand": "",
+		},
+		Spans: []observability.RunSpan{{
+			ID:        "team-run",
+			Name:      "team.run",
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+			Status:    "failed",
+		}},
+	})
+	c, err := tracker.CreateRegressionCase("run_team_failed_replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Replayable || c.Kind != "team" {
+		t.Fatalf("unexpected regression case: %+v", c)
+	}
+
+	provider := &agentLoopFakeProvider{text: "team ok"}
+	s := New(provider, "fake-model", 0)
+	s.SetWorkDir(workDir)
+	s.SetTracker(tracker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/regressions/"+c.ID+"/run", bytes.NewReader([]byte(`{}`)))
+	req.SetPathValue("id", c.ID)
+	rec := httptest.NewRecorder()
+	s.handleRunRegressionCase(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run team regression status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"\"type\":\"regression\"", "\"type\":\"done\"", "\"type\":\"regression_result\"", "\"type\":\"stream_end\""} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("team regression SSE missing %s:\n%s", want, rec.Body.String())
+		}
+	}
+
+	regressionRuns := tracker.RegressionRuns(10)
+	if len(regressionRuns) != 1 || regressionRuns[0].Status != "passed" || regressionRuns[0].Kind != "team" {
+		t.Fatalf("unexpected regression runs: %+v", regressionRuns)
+	}
+	runTraces := tracker.RecentRuns(10)
+	if len(runTraces) != 2 {
+		t.Fatalf("run traces=%d, want original failure + replay", len(runTraces))
+	}
+	replayTrace := runTraces[len(runTraces)-1]
+	if replayTrace.ID != regressionRuns[0].RunTraceID || replayTrace.Kind != "team" || replayTrace.Status != "ok" || replayTrace.Metadata["source"] != "regression" {
+		t.Fatalf("unexpected replay trace: %+v", replayTrace)
+	}
+	if !hasRunSpan(replayTrace, "team.run") {
+		t.Fatalf("team replay trace missing run span: %+v", replayTrace.Spans)
 	}
 }
 

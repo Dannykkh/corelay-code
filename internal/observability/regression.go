@@ -331,6 +331,11 @@ func regressionReplay(trace RunTrace, inputs map[string]string) (bool, string) {
 			return true, "Replay with POST /api/agent using inputs.prompt."
 		}
 		return false, "Agent prompt bodies are not captured in run traces; this case preserves failure checks only."
+	case "team":
+		if strings.TrimSpace(inputs["receipt"]) != "" {
+			return true, "Replay with POST /api/regressions/{id}/run using the recorded Team receipt."
+		}
+		return false, "Team replay needs the recorded receipt path to reconstruct the task graph."
 	}
 	return false, "No replay input is available for this run kind."
 }
