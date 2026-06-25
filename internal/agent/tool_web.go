@@ -79,6 +79,8 @@ type webFetchResult struct {
 	URL         string   `json:"url"`
 	FinalURL    string   `json:"final_url,omitempty"`
 	Title       string   `json:"title,omitempty"`
+	PublishedAt string   `json:"published_at,omitempty"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
 	Status      int      `json:"status,omitempty"`
 	ContentType string   `json:"content_type,omitempty"`
 	Content     string   `json:"content"`
@@ -199,8 +201,14 @@ func executeWebResearch(input json.RawMessage, _ string) (string, bool) {
 		}
 		fetched++
 		content := extractRelevantText(fetchResult.Content, args.Query, args.MaxChars/maxInt(1, args.FetchTop))
-		fmt.Fprintf(&b, "\n[%d] %s\nURL: %s\nProvider: %s\n%s\n",
-			r.Rank, coalesceString(fetchResult.Title, r.Title), fetchResult.URL, fetchResult.Source, content)
+		fmt.Fprintf(&b, "\n[%d] %s\nURL: %s\nProvider: %s\n",
+			r.Rank, coalesceString(fetchResult.Title, r.Title), fetchResult.URL, fetchResult.Source)
+		if fetchResult.PublishedAt != "" || fetchResult.UpdatedAt != "" {
+			fmt.Fprintf(&b, "Published: %s\nUpdated: %s\n",
+				coalesceString(fetchResult.PublishedAt, "unknown"),
+				coalesceString(fetchResult.UpdatedAt, "unknown"))
+		}
+		fmt.Fprintf(&b, "%s\n", content)
 	}
 
 	return b.String(), false
@@ -436,10 +444,13 @@ func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL
 	content := string(body)
 	contentType := resp.Header.Get("Content-Type")
 	title := ""
+	publishedAt := ""
+	updatedAt := ""
 	links := []string{}
 	if strings.Contains(strings.ToLower(contentType), "html") || looksLikeHTML(content) {
 		rawHTML := content
 		title = extractHTMLTitle(rawHTML)
+		publishedAt, updatedAt = extractHTMLDates(rawHTML)
 		links = extractLinks(rawHTML, resp.Request.URL)
 		content = htmlToText(rawHTML)
 
@@ -452,6 +463,12 @@ func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL
 				}
 				if title == "" {
 					title = frameResult.Title
+				}
+				if publishedAt == "" {
+					publishedAt = frameResult.PublishedAt
+				}
+				if updatedAt == "" {
+					updatedAt = frameResult.UpdatedAt
 				}
 				links = appendUniqueStrings(links, frameResult.Links...)
 				content = strings.TrimSpace(content + "\n\n--- Frame: " + frameResult.URL + " ---\n" + frameResult.Content)
@@ -466,6 +483,8 @@ func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL
 		URL:         originalURL,
 		FinalURL:    resp.Request.URL.String(),
 		Title:       title,
+		PublishedAt: publishedAt,
+		UpdatedAt:   updatedAt,
 		Status:      resp.StatusCode,
 		ContentType: contentType,
 		Content:     content,
@@ -729,6 +748,12 @@ func formatFetchResult(result webFetchResult, prompt string, maxChars int) strin
 	if result.Title != "" {
 		fmt.Fprintf(&b, "Title: %s\n", result.Title)
 	}
+	if result.PublishedAt != "" {
+		fmt.Fprintf(&b, "Published-At: %s\n", result.PublishedAt)
+	}
+	if result.UpdatedAt != "" {
+		fmt.Fprintf(&b, "Updated-At: %s\n", result.UpdatedAt)
+	}
 	if len(result.Links) > 0 {
 		fmt.Fprintf(&b, "Links: %s\n", strings.Join(limitStrings(result.Links, 10), ", "))
 	}
@@ -817,6 +842,117 @@ func extractHTMLTitle(page string) string {
 		return ""
 	}
 	return truncateString(cleanHTMLFragment(m[1]), 200)
+}
+
+func extractHTMLDates(page string) (string, string) {
+	published := ""
+	updated := ""
+	for _, attrs := range extractMetaAttrs(page) {
+		key := strings.ToLower(coalesceString(
+			htmlAttrValue(attrs, "property"),
+			htmlAttrValue(attrs, "name"),
+			htmlAttrValue(attrs, "itemprop"),
+		))
+		content := htmlAttrValue(attrs, "content")
+		if key == "" || content == "" {
+			continue
+		}
+		normalizedKey := strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", "")
+		switch normalizedKey {
+		case "article:publishedtime", "datepublished", "publishdate", "pubdate", "dc.date", "dc.date.issued", "date":
+			if published == "" {
+				published = normalizeDateString(content)
+			}
+		case "article:modifiedtime", "datemodified", "modifieddate", "lastmod", "og:updatedtime":
+			if updated == "" {
+				updated = normalizeDateString(content)
+			}
+		}
+	}
+	jsonPublished, jsonUpdated := extractJSONLDDates(page)
+	published = coalesceString(published, jsonPublished)
+	updated = coalesceString(updated, jsonUpdated)
+	published = coalesceString(published, extractTimeElementDate(page))
+	return published, updated
+}
+
+func extractMetaAttrs(page string) []string {
+	matches := regexp.MustCompile(`(?is)<meta\b([^>]*)>`).FindAllStringSubmatch(page, -1)
+	out := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			out = append(out, match[1])
+		}
+	}
+	return out
+}
+
+func extractJSONLDDates(page string) (string, string) {
+	matches := regexp.MustCompile(`(?is)<script[^>]+type=["']application/ld\+json["'][^>]*>(.*?)</script>`).FindAllStringSubmatch(page, -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		published, updated := datesFromJSONLD(html.UnescapeString(match[1]))
+		if published != "" || updated != "" {
+			return published, updated
+		}
+	}
+	return "", ""
+}
+
+func datesFromJSONLD(raw string) (string, string) {
+	var decoded any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &decoded); err != nil {
+		return "", ""
+	}
+	return findDatesInJSONValue(decoded)
+}
+
+func findDatesInJSONValue(value any) (string, string) {
+	switch v := value.(type) {
+	case map[string]any:
+		published := ""
+		updated := ""
+		for key, raw := range v {
+			normalizedKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
+			if s, ok := raw.(string); ok {
+				switch normalizedKey {
+				case "datepublished", "publishdate", "pubdate":
+					published = coalesceString(published, normalizeDateString(s))
+				case "datemodified", "modifieddate", "dateupdated":
+					updated = coalesceString(updated, normalizeDateString(s))
+				}
+			}
+			childPublished, childUpdated := findDatesInJSONValue(raw)
+			published = coalesceString(published, childPublished)
+			updated = coalesceString(updated, childUpdated)
+		}
+		return published, updated
+	case []any:
+		for _, item := range v {
+			published, updated := findDatesInJSONValue(item)
+			if published != "" || updated != "" {
+				return published, updated
+			}
+		}
+	}
+	return "", ""
+}
+
+func extractTimeElementDate(page string) string {
+	matches := regexp.MustCompile(`(?is)<time\b([^>]*)>(.*?)</time>`).FindAllStringSubmatch(page, -1)
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		for _, candidate := range []string{htmlAttrValue(match[1], "datetime"), cleanHTMLFragment(match[2])} {
+			if date := normalizeDateString(candidate); date != "" {
+				return date
+			}
+		}
+	}
+	return ""
 }
 
 func extractLinks(page string, base *url.URL) []string {

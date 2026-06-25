@@ -39,6 +39,8 @@ func TestExecuteWebFetchDirectHTML(t *testing.T) {
 		_, _ = w.Write([]byte(`
 			<html>
 				<head><title>Local Doc</title></head>
+				<meta property="article:published_time" content="2026-06-20T10:00:00+09:00">
+				<meta property="article:modified_time" content="2026-06-21T11:00:00+09:00">
 				<body>
 					<nav>ignored navigation</nav>
 					<main>
@@ -63,6 +65,8 @@ func TestExecuteWebFetchDirectHTML(t *testing.T) {
 	for _, want := range []string{
 		"WebFetch provider=direct",
 		"Title: Local Doc",
+		"Published-At: 2026-06-20",
+		"Updated-At: 2026-06-21",
 		"Alpha release notes explain the searchable local model harness.",
 		server.URL + "/next",
 	} {
@@ -72,6 +76,40 @@ func TestExecuteWebFetchDirectHTML(t *testing.T) {
 	}
 	if strings.Contains(out, "ignored navigation") {
 		t.Fatalf("expected nav content to be stripped, got:\n%s", out)
+	}
+}
+
+func TestExtractHTMLDatesFromJSONLDAndTime(t *testing.T) {
+	page := `
+		<html>
+			<head>
+				<script type="application/ld+json">
+				{
+					"@type": "NewsArticle",
+					"datePublished": "2026-06-22T09:30:00+09:00",
+					"dateModified": "2026-06-23T12:00:00+09:00"
+				}
+				</script>
+			</head>
+			<body><time datetime="2026-06-24">fallback</time></body>
+		</html>`
+
+	published, updated := extractHTMLDates(page)
+	if published != "2026-06-22" {
+		t.Fatalf("published = %q, want 2026-06-22", published)
+	}
+	if updated != "2026-06-23" {
+		t.Fatalf("updated = %q, want 2026-06-23", updated)
+	}
+}
+
+func TestExtractHTMLDatesFallsBackToTimeElement(t *testing.T) {
+	published, updated := extractHTMLDates(`<html><body><time datetime="2026-06-24">June 24, 2026</time></body></html>`)
+	if published != "2026-06-24" {
+		t.Fatalf("published = %q, want 2026-06-24", published)
+	}
+	if updated != "" {
+		t.Fatalf("updated = %q, want empty", updated)
 	}
 }
 
@@ -190,6 +228,33 @@ func TestFuseSearchResultsSortsLatestFirst(t *testing.T) {
 	}
 	if results[0].URL != "https://example.com/new" {
 		t.Fatalf("expected newest result first, got %+v", results)
+	}
+}
+
+func TestFuseSearchResultsRecomputesScoresAfterMerge(t *testing.T) {
+	opts := webSearchOptions{
+		Query:      "release notes",
+		MaxResults: 5,
+		Sort:       "latest",
+		SearchedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
+	}
+	results := fuseSearchResults(opts, map[string][]webSearchResult{
+		"duckduckgo": {
+			{Rank: 1, Title: "Release Notes", URL: "https://example.com/release", Snippet: "release notes"},
+		},
+		"google": {
+			{Rank: 1, Title: "Release Notes", URL: "https://example.com/release?utm_source=g", Snippet: "release notes with detailed current changelog", PublishedAt: "2026-06-24"},
+		},
+	})
+
+	if len(results) != 1 {
+		t.Fatalf("expected one merged result, got %d", len(results))
+	}
+	if results[0].PublishedAt != "2026-06-24" {
+		t.Fatalf("expected merged date, got %+v", results[0])
+	}
+	if results[0].FreshnessScore < 0.9 {
+		t.Fatalf("expected freshness to be recomputed after merge, got %+v", results[0])
 	}
 }
 

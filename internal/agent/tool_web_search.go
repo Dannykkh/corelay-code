@@ -510,6 +510,9 @@ func fuseSearchResults(opts webSearchOptions, byProvider map[string][]webSearchR
 	results := make([]webSearchResult, 0, len(fused))
 	for _, f := range fused {
 		r := f.result
+		r.RelevanceScore = relevanceScore(opts.Query, r.Title+" "+r.Snippet+" "+r.URL)
+		r.FreshnessScore = freshnessScore(r.PublishedAt, r.UpdatedAt, opts)
+		r.AuthorityScore = authorityScore(r.URL)
 		providerScore := math.Min(1, float64(len(f.providers))/3)
 		r.Score = combinedSearchScore(r, providerScore, opts)
 		results = append(results, r)
