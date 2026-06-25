@@ -23,6 +23,9 @@ const (
 	defaultFetchTop      = 3
 	defaultFetchChars    = 12000
 	maxFetchChars        = 30000
+	maxFrameDepth        = 2
+	maxFrameFetches      = 3
+	minReadableFrameText = 800
 )
 
 type webSearchArgs struct {
@@ -372,16 +375,28 @@ func duckDuckGoSearch(ctx context.Context, query string, maxResults int) ([]webS
 }
 
 func directWebFetch(ctx context.Context, targetURL string, maxChars int) (webFetchResult, error) {
-	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	client := &http.Client{Timeout: 35 * time.Second}
+	visited := map[string]bool{}
+	return directWebFetchRecursive(ctx, client, targetURL, maxChars, 0, visited)
+}
+
+func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL string, maxChars, depth int, visited map[string]bool) (webFetchResult, error) {
+	originalURL := strings.TrimSpace(targetURL)
+	fetchURL := canonicalWebFetchURL(originalURL)
+	parsed, err := url.Parse(fetchURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return webFetchResult{}, fmt.Errorf("invalid URL: %s", targetURL)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return webFetchResult{}, fmt.Errorf("unsupported URL scheme: %s", parsed.Scheme)
 	}
+	normalized := parsed.String()
+	if visited[normalized] {
+		return webFetchResult{}, fmt.Errorf("skipping already fetched URL: %s", normalized)
+	}
+	visited[normalized] = true
 
-	log.Printf("[WebFetch] Direct: %s", targetURL)
-	client := &http.Client{Timeout: 35 * time.Second}
+	log.Printf("[WebFetch] Direct: %s", fetchURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return webFetchResult{}, fmt.Errorf("invalid URL: %w", err)
@@ -407,16 +422,32 @@ func directWebFetch(ctx context.Context, targetURL string, maxChars int) (webFet
 	title := ""
 	links := []string{}
 	if strings.Contains(strings.ToLower(contentType), "html") || looksLikeHTML(content) {
-		title = extractHTMLTitle(content)
-		links = extractLinks(content, resp.Request.URL)
-		content = htmlToText(content)
+		rawHTML := content
+		title = extractHTMLTitle(rawHTML)
+		links = extractLinks(rawHTML, resp.Request.URL)
+		content = htmlToText(rawHTML)
+
+		if shouldFetchFrames(rawHTML, content, depth) {
+			frameURLs := extractFrameSources(rawHTML, resp.Request.URL, maxFrameFetches)
+			for _, frameURL := range frameURLs {
+				frameResult, ferr := directWebFetchRecursive(ctx, client, frameURL, maxChars, depth+1, visited)
+				if ferr != nil || strings.TrimSpace(frameResult.Content) == "" {
+					continue
+				}
+				if title == "" {
+					title = frameResult.Title
+				}
+				links = appendUniqueStrings(links, frameResult.Links...)
+				content = strings.TrimSpace(content + "\n\n--- Frame: " + frameResult.URL + " ---\n" + frameResult.Content)
+			}
+		}
 	}
 	if maxChars <= 0 {
 		maxChars = defaultFetchChars
 	}
 	content = truncateString(content, maxChars)
 	return webFetchResult{
-		URL:         targetURL,
+		URL:         originalURL,
 		FinalURL:    resp.Request.URL.String(),
 		Title:       title,
 		Status:      resp.StatusCode,
@@ -425,6 +456,152 @@ func directWebFetch(ctx context.Context, targetURL string, maxChars int) (webFet
 		Links:       links,
 		Source:      "direct",
 	}, nil
+}
+
+func canonicalWebFetchURL(raw string) string {
+	if mobileURL, ok := naverMobilePostURL(raw); ok {
+		return mobileURL
+	}
+	return raw
+}
+
+func naverMobilePostURL(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "blog.naver.com" && host != "m.blog.naver.com" {
+		return "", false
+	}
+
+	parts := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	if len(parts) >= 2 && parts[0] != "" && isDigits(parts[1]) {
+		return "https://m.blog.naver.com/" + parts[0] + "/" + parts[1], true
+	}
+
+	if strings.EqualFold(strings.Trim(u.Path, "/"), "PostView.naver") {
+		blogID := strings.TrimSpace(u.Query().Get("blogId"))
+		logNo := strings.TrimSpace(u.Query().Get("logNo"))
+		if blogID != "" && isDigits(logNo) {
+			return "https://m.blog.naver.com/" + url.PathEscape(blogID) + "/" + logNo, true
+		}
+	}
+	return "", false
+}
+
+func shouldFetchFrames(pageHTML, text string, depth int) bool {
+	if depth >= maxFrameDepth || !strings.Contains(strings.ToLower(pageHTML), "<iframe") {
+		return false
+	}
+	if len([]rune(strings.TrimSpace(text))) < minReadableFrameText {
+		return true
+	}
+	lower := strings.ToLower(pageHTML)
+	return strings.Contains(lower, `id="mainframe"`) ||
+		strings.Contains(lower, `name="mainframe"`) ||
+		strings.Contains(lower, "postview.naver")
+}
+
+func extractFrameSources(page string, base *url.URL, limit int) []string {
+	frameMatches := regexp.MustCompile(`(?is)<iframe\b([^>]*)>`).FindAllStringSubmatch(page, -1)
+	type candidate struct {
+		url      string
+		priority int
+		idx      int
+	}
+	candidates := make([]candidate, 0, len(frameMatches))
+	seen := map[string]bool{}
+	for i, m := range frameMatches {
+		if len(m) < 2 {
+			continue
+		}
+		attrs := m[1]
+		src := htmlAttrValue(attrs, "src")
+		if src == "" {
+			continue
+		}
+		resolved, ok := resolveFrameURL(src, base)
+		if !ok || seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		lowerAttrs := strings.ToLower(attrs)
+		priority := 0
+		if strings.Contains(lowerAttrs, "mainframe") || strings.Contains(strings.ToLower(resolved), "postview.naver") {
+			priority = 2
+		} else if base != nil {
+			if parsed, err := url.Parse(resolved); err == nil && canFetchFrame(base, parsed) {
+				priority = 1
+			}
+		}
+		candidates = append(candidates, candidate{url: resolved, priority: priority, idx: i})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].priority == candidates[j].priority {
+			return candidates[i].idx < candidates[j].idx
+		}
+		return candidates[i].priority > candidates[j].priority
+	})
+	if limit <= 0 || len(candidates) < limit {
+		limit = len(candidates)
+	}
+	out := make([]string, 0, limit)
+	for _, c := range candidates[:limit] {
+		parsed, err := url.Parse(c.url)
+		if err == nil && base != nil && !canFetchFrame(base, parsed) {
+			continue
+		}
+		out = append(out, c.url)
+	}
+	return out
+}
+
+func htmlAttrValue(attrs, name string) string {
+	pattern := fmt.Sprintf(`(?is)\b%s\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))`, regexp.QuoteMeta(name))
+	match := regexp.MustCompile(pattern).FindStringSubmatch(attrs)
+	if len(match) == 0 {
+		return ""
+	}
+	for _, value := range match[2:] {
+		if value != "" {
+			return html.UnescapeString(strings.TrimSpace(value))
+		}
+	}
+	return ""
+}
+
+func resolveFrameURL(raw string, base *url.URL) (string, bool) {
+	raw = strings.TrimSpace(html.UnescapeString(raw))
+	if raw == "" || strings.HasPrefix(strings.ToLower(raw), "javascript:") || strings.HasPrefix(strings.ToLower(raw), "about:") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	if base != nil {
+		u = base.ResolveReference(u)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", false
+	}
+	return u.String(), true
+}
+
+func canFetchFrame(parent, child *url.URL) bool {
+	if parent == nil || child == nil {
+		return false
+	}
+	if !strings.EqualFold(parent.Hostname(), child.Hostname()) {
+		return isNaverHost(parent.Hostname()) && isNaverHost(child.Hostname())
+	}
+	return true
+}
+
+func isNaverHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "naver.com" || strings.HasSuffix(host, ".naver.com")
 }
 
 func extractDuckDuckGoResults(page string, maxResults int) []webSearchResult {
@@ -675,6 +852,18 @@ func keywordSet(s string) map[string]bool {
 	return out
 }
 
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizePositiveLimit(value, fallback, maxValue int) int {
 	if value <= 0 {
 		value = fallback
@@ -701,6 +890,21 @@ func limitStrings(in []string, limit int) []string {
 		return in
 	}
 	return in[:limit]
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	seen := map[string]bool{}
+	for _, value := range base {
+		seen[value] = true
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		base = append(base, value)
+	}
+	return base
 }
 
 func browserUserAgent() string {

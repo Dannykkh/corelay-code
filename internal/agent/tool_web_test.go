@@ -85,6 +85,61 @@ func TestDefaultWebProvidersIgnoreOllamaAPIKey(t *testing.T) {
 	}
 }
 
+func TestExecuteWebFetchFollowsNestedFrames(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`<html><head><title>Outer Shell</title></head><body><iframe id="mainFrame" src="/frame1"></iframe></body></html>`))
+		case "/frame1":
+			_, _ = w.Write([]byte(`<html><body><iframe name="mainFrame" src="/frame2"></iframe></body></html>`))
+		case "/frame2":
+			_, _ = w.Write([]byte(`<html><body><main><p>Nested iframe body content for Naver style blogs.</p><a href="/source">Source</a></main></body></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	input, _ := json.Marshal(map[string]any{
+		"url":       server.URL,
+		"max_chars": 2000,
+	})
+	out, isErr := executeWebFetch(input, t.TempDir())
+	if isErr {
+		t.Fatalf("executeWebFetch returned error: %s", out)
+	}
+	for _, want := range []string{
+		"Title: Outer Shell",
+		"--- Frame: " + server.URL + "/frame1 ---",
+		"--- Frame: " + server.URL + "/frame2 ---",
+		"Nested iframe body content for Naver style blogs.",
+		server.URL + "/source",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected output to contain %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestNaverMobilePostURL(t *testing.T) {
+	cases := map[string]string{
+		"https://blog.naver.com/naverofficial/224313722912":                                           "https://m.blog.naver.com/naverofficial/224313722912",
+		"https://m.blog.naver.com/naverofficial/224313722912":                                         "https://m.blog.naver.com/naverofficial/224313722912",
+		"https://blog.naver.com/PostView.naver?blogId=naverofficial&logNo=224313722912&redirect=Dlog": "https://m.blog.naver.com/naverofficial/224313722912",
+	}
+	for raw, want := range cases {
+		got, ok := naverMobilePostURL(raw)
+		if !ok {
+			t.Fatalf("naverMobilePostURL(%q) did not match", raw)
+		}
+		if got != want {
+			t.Fatalf("naverMobilePostURL(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestOllamaWebSearchUsesConfiguredBase(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/web_search" {
