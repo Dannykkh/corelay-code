@@ -45,18 +45,25 @@ func mergeConsecutiveSameRole(messages []types.Message) []types.Message {
 
 		if msg.Role == current.Role {
 			// Same role — merge content
-			currentText := extractText(current.Content)
-			nextText := extractText(msg.Content)
-
-			if currentText != "" && nextText != "" {
-				combined := currentText + "\n\n" + nextText
-				current.Content = mustMarshalString(combined)
-			} else if nextText != "" {
-				current.Content = msg.Content
-			}
 			// If both are tool results (array format), merge arrays
 			if isArrayContent(current.Content) && isArrayContent(msg.Content) {
 				current.Content = mergeArrayContent(current.Content, msg.Content)
+				continue
+			}
+
+			currentIsArray := isArrayContent(current.Content)
+			nextIsArray := isArrayContent(msg.Content)
+			currentText := extractText(current.Content)
+			nextText := extractText(msg.Content)
+
+			if !currentIsArray && !nextIsArray && currentText != "" && nextText != "" {
+				combined := currentText + "\n\n" + nextText
+				current.Content = mustMarshalString(combined)
+			} else if !currentIsArray && !nextIsArray && nextText != "" {
+				current.Content = msg.Content
+			} else {
+				merged = append(merged, current)
+				current = msg
 			}
 		} else {
 			merged = append(merged, current)

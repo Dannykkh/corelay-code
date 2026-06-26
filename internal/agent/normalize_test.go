@@ -78,6 +78,30 @@ func TestEnsureAlternatingRoles(t *testing.T) {
 	}
 }
 
+func TestMergeConsecutiveSameRolePreservesMixedContent(t *testing.T) {
+	toolResult := json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}]`)
+	messages := []types.Message{
+		makeMsg("user", "question"),
+		{Role: "user", Content: toolResult},
+	}
+
+	result := mergeConsecutiveSameRole(messages)
+
+	if len(result) != 2 {
+		t.Fatalf("messages = %d, want 2", len(result))
+	}
+	if extractText(result[0].Content) != "question" {
+		t.Fatalf("first message changed: %s", result[0].Content)
+	}
+	var blocks []types.ContentBlockParam
+	if err := json.Unmarshal(result[1].Content, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || blocks[0].Type != "tool_result" {
+		t.Fatalf("tool result was not preserved: %+v", blocks)
+	}
+}
+
 func TestCapMessageCount(t *testing.T) {
 	// Create 250 messages
 	var messages []types.Message
@@ -133,6 +157,30 @@ func TestNormalizeMessagesHoistsToolResultsBeforeRoleRepair(t *testing.T) {
 	}
 	if result[0].Role != "user" {
 		t.Fatalf("role = %q, want user", result[0].Role)
+	}
+}
+
+func TestNormalizeMessagesPreservesHoistedToolResultAfterUser(t *testing.T) {
+	content := json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]`)
+	messages := []types.Message{
+		makeMsg("user", "question"),
+		{Role: "assistant", Content: content},
+	}
+
+	result := NormalizeMessages(messages)
+
+	if len(result) != 3 {
+		t.Fatalf("messages = %d, want 3", len(result))
+	}
+	if result[0].Role != "user" || result[1].Role != "assistant" || result[2].Role != "user" {
+		t.Fatalf("roles = %s/%s/%s", result[0].Role, result[1].Role, result[2].Role)
+	}
+	var blocks []types.ContentBlockParam
+	if err := json.Unmarshal(result[2].Content, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || blocks[0].Type != "tool_result" || blocks[0].ToolUseID != "toolu_1" {
+		t.Fatalf("tool result was not preserved: %+v", blocks)
 	}
 }
 

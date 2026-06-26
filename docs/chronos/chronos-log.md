@@ -197,6 +197,12 @@ Fix: Wired `HoistToolResults` into `NormalizeMessages` and split assistant conte
 Verify: go test ./internal/agent -run "TestHoistToolResults|TestNormalizeMessages" -count=1 -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS; git diff --check -> PASS
 -----------------------------------------------------------
 
+-- Cycle 31 -----------------------------------------------
+Issue: After tool-result hoisting, `mergeConsecutiveSameRole` could still drop mixed same-role content such as a plain user message followed by a user-role `tool_result` array because it only knew how to merge text+text or array+array.
+Fix: Changed same-role merging to preserve unmergeable mixed content as separate messages, leaving `ensureAlternatingRoles` to insert a filler role instead of losing tool output.
+Verify: go test ./internal/agent -run "TestMergeConsecutiveSameRole|TestNormalizeMessages|TestHoistToolResults" -count=1 -> PASS; go test ./... -count=1 -> PASS; go vet ./... -> PASS; go build ./cmd/proxy -> PASS; git diff --check -> PASS
+-----------------------------------------------------------
+
 Current Completion Gate:
 - go test ./... -count=1 -> PASS
 - go vet ./... -> PASS
