@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -298,6 +299,42 @@ func TestSelectSearchProvidersAllSkipsUnconfiguredAPIs(t *testing.T) {
 	}
 }
 
+func TestRunSearchProvidersKeepsFastResultsWhenAnotherProviderTimesOut(t *testing.T) {
+	opts := webSearchOptions{
+		Query:      "fast result",
+		MaxResults: 5,
+		Sort:       "relevance",
+		SearchedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
+	}
+	providers := []webSearchProvider{
+		blockingSearchProvider{name: "slow"},
+		staticSearchProvider{
+			name: "fast",
+			results: []webSearchResult{{
+				Rank:    1,
+				Title:   "Fast Result",
+				URL:     "https://example.com/fast",
+				Snippet: "fast result",
+			}},
+		},
+	}
+
+	start := time.Now()
+	byProvider, notes := runSearchProvidersWithTimeout(context.Background(), providers, opts, 20*time.Millisecond)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("parallel search took too long: %v", elapsed)
+	}
+	if got := len(byProvider["fast"]); got != 1 {
+		t.Fatalf("fast provider result missing: got %d results, byProvider=%+v notes=%v", got, byProvider, notes)
+	}
+	if _, ok := byProvider["slow"]; ok {
+		t.Fatalf("slow provider should have timed out, byProvider=%+v", byProvider)
+	}
+	if len(notes) == 0 || !strings.Contains(strings.Join(notes, ";"), "slow failed") {
+		t.Fatalf("expected slow failure note, got %v", notes)
+	}
+}
+
 func TestResearchFetchProviderSeparatesSearchAndFetch(t *testing.T) {
 	if got := researchFetchProvider(webResearchArgs{Provider: "google"}); got != "direct" {
 		t.Fatalf("google search should fetch direct, got %q", got)
@@ -311,6 +348,32 @@ func TestResearchFetchProviderSeparatesSearchAndFetch(t *testing.T) {
 	if got := researchFetchProvider(webResearchArgs{Providers: []string{"ollama", "duckduckgo"}}); got != "direct" {
 		t.Fatalf("mixed search providers should fetch direct, got %q", got)
 	}
+}
+
+type staticSearchProvider struct {
+	name    string
+	results []webSearchResult
+}
+
+func (p staticSearchProvider) Name() string { return p.name }
+func (p staticSearchProvider) Configured() bool {
+	return true
+}
+func (p staticSearchProvider) Search(context.Context, webSearchOptions) ([]webSearchResult, error) {
+	return p.results, nil
+}
+
+type blockingSearchProvider struct {
+	name string
+}
+
+func (p blockingSearchProvider) Name() string { return p.name }
+func (p blockingSearchProvider) Configured() bool {
+	return true
+}
+func (p blockingSearchProvider) Search(ctx context.Context, _ webSearchOptions) ([]webSearchResult, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func TestOllamaWebSearchUsesConfiguredBase(t *testing.T) {

@@ -6,6 +6,7 @@ type RunOptions struct {
 	Recorder          RunRecorder
 	WorkerID          string
 	OwnershipChecker  func(workerID, filePath string) (bool, string)
+	EvidencePolicy    EvidencePolicyConfig
 }
 
 type RunRecorder interface {

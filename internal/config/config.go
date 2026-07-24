@@ -5,11 +5,23 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 type ProviderSettings struct {
 	APIKey  string `json:"apiKey,omitempty"`
 	BaseURL string `json:"baseUrl,omitempty"`
+}
+
+type RuntimeQuotaSource struct {
+	Name            string            `json:"name,omitempty"`
+	Type            string            `json:"type"`
+	Path            string            `json:"path,omitempty"`
+	URL             string            `json:"url,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	IntervalSeconds int               `json:"intervalSeconds,omitempty"`
+	TimeoutSeconds  int               `json:"timeoutSeconds,omitempty"`
+	Disabled        bool              `json:"disabled,omitempty"`
 }
 
 type Project struct {
@@ -18,19 +30,22 @@ type Project struct {
 }
 
 type Config struct {
-	Projects        []Project                   `json:"projects"`       // registered projects
-	Port            int                         `json:"port"`
-	DefaultProvider string                      `json:"defaultProvider"`
-	DefaultModel    string                      `json:"defaultModel"`
-	RouterEnabled   bool                        `json:"routerEnabled"`
-	ResponseLang    string                      `json:"responseLang"`    // "ko", "en", "ja", "zh", "auto"
-	UILang          string                      `json:"uiLang"`          // "ko", "en"
-	SkillSource     string                      `json:"skillSource"`     // "claude", "codex", "gemini", "all", "none"
-	SkillDirs       []string                    `json:"skillDirs"`       // extra custom skill directories
-	MCPConfigPaths  []string                    `json:"mcpConfigPaths"`  // extra MCP config file paths
-	WorkDir         string                      `json:"workDir"`         // default workspace
-	AccessToken     string                      `json:"accessToken"`     // web UI access token (empty = no auth)
-	Providers       map[string]ProviderSettings  `json:"providers"`
+	Projects              []Project                   `json:"projects"` // registered projects
+	Port                  int                         `json:"port"`
+	DefaultProvider       string                      `json:"defaultProvider"`
+	DefaultModel          string                      `json:"defaultModel"`
+	RouterEnabled         bool                        `json:"routerEnabled"`
+	ResponseLang          string                      `json:"responseLang"`   // "ko", "en", "ja", "zh", "auto"
+	UILang                string                      `json:"uiLang"`         // "ko", "en"
+	SkillSource           string                      `json:"skillSource"`    // "claude", "codex", "gemini", "all", "none"
+	SkillDirs             []string                    `json:"skillDirs"`      // extra custom skill directories
+	MCPConfigPaths        []string                    `json:"mcpConfigPaths"` // extra MCP config file paths
+	WorkDir               string                      `json:"workDir"`        // default workspace
+	AccessToken           string                      `json:"accessToken"`    // web UI access token (empty = no auth)
+	Providers             map[string]ProviderSettings `json:"providers"`
+	RuntimeQuotaSources   []RuntimeQuotaSource        `json:"runtimeQuotaSources,omitempty"`
+	EvidencePolicy        string                      `json:"evidencePolicy,omitempty"`        // off, measure, advisory, block
+	EvidenceMaxStopBlocks int                         `json:"evidenceMaxStopBlocks,omitempty"` // max blocked completion nudges before allowing
 
 	// Agent-loop tuning for local models (Ollama/SGLang). Zero/absent values use
 	// built-in defaults; these only apply to local providers (cloud models keep
@@ -54,6 +69,9 @@ func DefaultConfig() Config {
 }
 
 func configDir() string {
+	if dir := strings.TrimSpace(os.Getenv("ANICLEW_CONFIG_DIR")); dir != "" {
+		return dir
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".claude-proxy")
 }
@@ -91,4 +109,4 @@ func ConfigPath() string {
 	return configPath()
 }
 
-func _ () string { return runtime.GOOS } // keep import
+func _() string { return runtime.GOOS } // keep import

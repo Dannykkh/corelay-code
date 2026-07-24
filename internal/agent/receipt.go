@@ -74,8 +74,13 @@ type TeamTaskReceipt struct {
 }
 
 type ReceiptVerification struct {
-	Status string `json:"status"` // passed, failed, not-run
-	Source string `json:"source"` // auto-verify, none
+	Status   string           `json:"status"` // passed, failed, not-run
+	Source   string           `json:"source"` // auto-verify, team-verify, none
+	Command  string           `json:"command,omitempty"`
+	Summary  string           `json:"summary,omitempty"`
+	Gate     string           `json:"gate,omitempty"`
+	Mode     string           `json:"mode,omitempty"`
+	Evidence []EvidenceRecord `json:"evidence,omitempty"`
 }
 
 func writeAgentReceipt(workDir string, receipt AgentReceipt) (string, error) {

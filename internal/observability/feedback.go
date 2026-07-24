@@ -21,11 +21,11 @@ type Feedback struct {
 
 // FeedbackStats summarizes feedback.
 type FeedbackStats struct {
-	Total     int                `json:"total"`
-	ThumbsUp  int                `json:"thumbsUp"`
-	ThumbsDown int               `json:"thumbsDown"`
-	Score     float64            `json:"score"` // 0.0 - 1.0
-	ByModel   map[string]ModelScore `json:"byModel"`
+	Total      int                   `json:"total"`
+	ThumbsUp   int                   `json:"thumbsUp"`
+	ThumbsDown int                   `json:"thumbsDown"`
+	Score      float64               `json:"score"` // 0.0 - 1.0
+	ByModel    map[string]ModelScore `json:"byModel"`
 }
 
 // ModelScore is per-model feedback.
@@ -37,16 +37,16 @@ type ModelScore struct {
 
 // FeedbackStore manages user feedback.
 type FeedbackStore struct {
-	mu       sync.RWMutex
-	items    []Feedback
-	dir      string
+	mu    sync.RWMutex
+	items []Feedback
+	dir   string
 }
 
 func NewFeedbackStore(baseDir string) *FeedbackStore {
 	dir := filepath.Join(baseDir, "feedback")
 	os.MkdirAll(dir, 0755)
 	fs := &FeedbackStore{
-		items: make([]Feedback, 0, 1000),
+		items: make([]Feedback, 0, feedbackMemoryLimit),
 		dir:   dir,
 	}
 	fs.load()
@@ -60,6 +60,7 @@ func (f *FeedbackStore) Add(fb Feedback) {
 	fb.Timestamp = time.Now()
 	fb.ID = fb.Timestamp.Format("20060102-150405")
 	f.items = append(f.items, fb)
+	f.items = trimFeedback(f.items)
 	f.save()
 }
 
@@ -124,5 +125,7 @@ func (f *FeedbackStore) load() {
 	if err != nil {
 		return
 	}
-	json.Unmarshal(data, &f.items)
+	if json.Unmarshal(data, &f.items) == nil {
+		f.items = trimFeedback(f.items)
+	}
 }

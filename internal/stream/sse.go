@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +29,17 @@ func WriteSSEEvent(w http.ResponseWriter, event types.SSEEvent) error {
 }
 
 // ReadOpenAISSE reads OpenAI-format SSE from a reader and sends parsed chunks to a channel.
-func ReadOpenAISSE(body io.ReadCloser, ch chan<- types.OAIStreamChunk) {
+func ReadOpenAISSE(ctx context.Context, body io.ReadCloser, ch chan<- types.OAIStreamChunk) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			body.Close()
+		case <-done:
+		}
+	}()
+
+	defer close(done)
 	defer body.Close()
 	defer close(ch)
 
@@ -50,7 +61,11 @@ func ReadOpenAISSE(body io.ReadCloser, ch chan<- types.OAIStreamChunk) {
 			if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
 				continue
 			}
-			ch <- chunk
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- chunk:
+			}
 		}
 	}
 }

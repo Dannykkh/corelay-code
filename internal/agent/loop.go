@@ -574,6 +574,7 @@ func RunLoopWithOptions(
 	checkpointStarted := false // clear the undo buffer on this turn's first edit
 	var editedFiles []string   // files changed this session, for the completion summary
 	testResult := ""           // auto-verify outcome for the summary ("passed"/"failed"/"")
+	evidence := NewEvidenceLedger(lastUserText(userMessages), opts.EvidencePolicy)
 
 	for i := 0; i < maxIterations; i++ {
 		// ── Read-only over-exploration guard ──
@@ -860,6 +861,7 @@ func RunLoopWithOptions(
 					"attempt":   fmt.Sprintf("%d", verifyAttempts+1),
 				})
 				vout, vfailed, vran := runAutoVerify(workDir)
+				evidence.ObserveAutoVerify(vout, vfailed, vran)
 				if vran && vfailed {
 					testResult = "failed"
 					finishCheckSpan("failed", map[string]string{"outputChars": fmt.Sprintf("%d", len(vout))})
@@ -887,6 +889,21 @@ func RunLoopWithOptions(
 				}
 			}
 
+			gate := evidence.Evaluate()
+			if gate.Decision == EvidenceGateBlock {
+				evidence.MarkStopBlock()
+				eventCh <- Event{Type: "status", Data: "Evidence gate blocked completion: verification evidence required"}
+				if textContent != "" {
+					messages = append(messages, types.Message{Role: "assistant", Content: mustJSON([]map[string]interface{}{{"type": "text", "text": textContent}})})
+				}
+				messages = append(messages, types.Message{Role: "user", Content: mustJSON(
+					"Evidence gate blocked completion: this deep task changed files but no successful verification evidence was recorded.\n\nRun the narrowest relevant verification command now, or explain why no verification is applicable. If verification fails because of this change, fix it before stopping.")})
+				continue
+			}
+			if gate.Decision != EvidenceGateAllow {
+				eventCh <- Event{Type: "status", Data: fmt.Sprintf("Evidence gate: %s — %s", gate.Decision, gate.Summary)}
+			}
+
 			// Completion summary: a one-line recap of what changed this session,
 			// appended after the model's final answer (persists in both clients).
 			if didEdit {
@@ -911,7 +928,7 @@ func RunLoopWithOptions(
 					PlanMode:     planMode,
 					Iterations:   i + 1,
 					EditedFiles:  uniqueStrings(editedFiles),
-					Verification: receiptVerification(testResult),
+					Verification: evidence.ApplyToReceipt(receiptVerification(testResult)),
 				}
 				if path, err := writeAgentReceipt(workDir, receipt); err != nil {
 					log.Printf("[Agent] receipt write failed: %v", err)
@@ -956,7 +973,7 @@ func RunLoopWithOptions(
 					PlanMode:     planMode,
 					Iterations:   i + 1,
 					EditedFiles:  uniqueStrings(editedFiles),
-					Verification: receiptVerification(testResult),
+					Verification: evidence.ApplyToReceipt(receiptVerification(testResult)),
 					ReceiptPath:  receiptPath,
 				})
 			}
@@ -969,7 +986,7 @@ func RunLoopWithOptions(
 
 		// Note file edits so auto-verify knows to run tests at completion.
 		for _, tu := range toolUses {
-			if tu.Name == "Write" || tu.Name == "Edit" {
+			if isEditTool(tu.Name) {
 				didEdit = true
 			}
 		}
@@ -1014,6 +1031,9 @@ func RunLoopWithOptions(
 				idx    int
 				result map[string]interface{}
 				event  Event
+				tool   toolUseBlock
+				output string
+				isErr  bool
 			}
 			resultCh := make(chan toolResultEntry, len(concurrentTools))
 
@@ -1028,7 +1048,10 @@ func RunLoopWithOptions(
 						"TOOL_ERROR": fmt.Sprintf("%v", isErr),
 					})
 					resultCh <- toolResultEntry{
-						idx: i,
+						idx:    i,
+						tool:   t,
+						output: r,
+						isErr:  isErr,
 						result: map[string]interface{}{
 							"type": "tool_result", "tool_use_id": t.ID,
 							"content": r, "is_error": isErr,
@@ -1047,6 +1070,7 @@ func RunLoopWithOptions(
 				collected[entry.idx] = entry
 			}
 			for _, entry := range collected {
+				evidence.ObserveToolResult(entry.tool.Name, entry.tool.Input, entry.output, entry.isErr)
 				eventCh <- entry.event
 				toolResults = append(toolResults, entry.result)
 			}
@@ -1133,6 +1157,7 @@ func RunLoopWithOptions(
 			}
 
 			result, isError := ExecuteToolWithOptions(tu.Name, tu.Input, workDir, toolExecOptions)
+			evidence.ObserveToolResult(tu.Name, tu.Input, result, isError)
 
 			// ── Post-tool hook ──
 			hookRegistry.Execute(hooks.HookPostToolUse, map[string]string{

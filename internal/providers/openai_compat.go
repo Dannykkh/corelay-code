@@ -21,10 +21,10 @@ type OpenAICompat struct {
 	AuthHeader   func() (string, string) // returns (headerName, headerValue)
 }
 
-func (p *OpenAICompat) Name() string                { return p.ProviderName }
-func (p *OpenAICompat) DisplayName() string          { return p.ProviderDisp }
-func (p *OpenAICompat) Models() []types.ModelInfo    { return p.ModelList }
-func (p *OpenAICompat) Validate() error              { return nil }
+func (p *OpenAICompat) Name() string              { return p.ProviderName }
+func (p *OpenAICompat) DisplayName() string       { return p.ProviderDisp }
+func (p *OpenAICompat) Models() []types.ModelInfo { return p.ModelList }
+func (p *OpenAICompat) Validate() error           { return nil }
 
 func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesRequest, opts *types.StreamOptions) (<-chan types.SSEEvent, error) {
 	oaiReq := translate.ToOpenAI(req, req.Model)
@@ -60,6 +60,7 @@ func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesReq
 	if err != nil {
 		return nil, fmt.Errorf("%s connection failed: %w", p.ProviderName, err)
 	}
+	opts.ObserveResponse(resp.StatusCode, resp.Header)
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("%s API error %d", p.ProviderName, resp.StatusCode)
@@ -68,18 +69,23 @@ func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesReq
 	ch := make(chan types.SSEEvent, 64)
 
 	go func() {
+		defer resp.Body.Close()
 		defer close(ch)
 
 		translator := translate.NewTranslator(req.Model)
-		ch <- translator.Start()
+		if !sendSSEEvent(ctx, ch, translator.Start()) {
+			return
+		}
 
 		chunks := make(chan types.OAIStreamChunk, 64)
-		go stream.ReadOpenAISSE(resp.Body, chunks)
+		go stream.ReadOpenAISSE(ctx, resp.Body, chunks)
 
 		finished := false
 		for chunk := range chunks {
 			for _, event := range translator.Translate(chunk) {
-				ch <- event
+				if !sendSSEEvent(ctx, ch, event) {
+					return
+				}
 				if event.Type == "message_stop" {
 					finished = true
 				}
@@ -87,7 +93,9 @@ func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesReq
 		}
 		if !finished {
 			for _, event := range translator.End() {
-				ch <- event
+				if !sendSSEEvent(ctx, ch, event) {
+					return
+				}
 			}
 		}
 	}()

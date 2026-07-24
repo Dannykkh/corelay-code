@@ -355,12 +355,38 @@ func (s *Server) handleRunTeamRegressionCase(w http.ResponseWriter, r *http.Requ
 		if plan.VerifyCommand != "" {
 			passed, verifyDetail := team.Verify(r.Context())
 			if passed {
-				verification = agent.ReceiptVerification{Status: "passed", Source: "team-verify"}
+				verification = agent.ReceiptVerification{
+					Status:  "passed",
+					Source:  "team-verify",
+					Command: plan.VerifyCommand,
+					Summary: trimEvidenceText(verifyDetail),
+					Gate:    agent.EvidenceGateAllow,
+					Mode:    agent.EvidenceModeDeep,
+					Evidence: []agent.EvidenceRecord{{
+						Source:  "team-verify",
+						Command: plan.VerifyCommand,
+						Status:  "passed",
+						Summary: trimEvidenceText(verifyDetail),
+					}},
+				}
 				eventCh <- agent.Event{Type: "status", Data: "Verification PASSED"}
 			} else {
 				runStatus = "failed"
 				detail = verifyDetail
-				verification = agent.ReceiptVerification{Status: "failed", Source: "team-verify"}
+				verification = agent.ReceiptVerification{
+					Status:  "failed",
+					Source:  "team-verify",
+					Command: plan.VerifyCommand,
+					Summary: trimEvidenceText(verifyDetail),
+					Gate:    agent.EvidenceGateBlock,
+					Mode:    agent.EvidenceModeDeep,
+					Evidence: []agent.EvidenceRecord{{
+						Source:  "team-verify",
+						Command: plan.VerifyCommand,
+						Status:  "failed",
+						Summary: trimEvidenceText(verifyDetail),
+					}},
+				}
 				eventCh <- agent.Event{Type: "status", Data: "Verification FAILED: " + verifyDetail}
 			}
 		}

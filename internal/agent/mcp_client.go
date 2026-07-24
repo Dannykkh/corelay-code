@@ -117,7 +117,7 @@ func NewMCPClient(name, command string, args []string, workDir string, env map[s
 func (c *MCPClient) initialize() error {
 	resp, err := c.call("initialize", map[string]interface{}{
 		"protocolVersion": "2024-11-05",
-		"capabilities":   map[string]interface{}{},
+		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]string{
 			"name":    "aniclew",
 			"version": "1.0.0",
@@ -195,13 +195,26 @@ func (c *MCPClient) CallTool(name string, args json.RawMessage) (string, bool) {
 func (c *MCPClient) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.running {
+	c.closeLocked()
+}
+
+func (c *MCPClient) closeLocked() {
+	if !c.running && c.cmd == nil && c.stdin == nil && c.stdout == nil {
 		return
 	}
 	c.running = false
-	c.stdin.Close()
-	c.cmd.Process.Kill()
-	c.cmd.Wait()
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+		c.stdin = nil
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
+	if c.cmd != nil {
+		_ = c.cmd.Wait()
+		c.cmd = nil
+	}
+	c.stdout = nil
 	log.Printf("[MCP] Disconnected from '%s'", c.name)
 }
 
@@ -212,6 +225,10 @@ const mcpCallTimeout = 30 * time.Second
 func (c *MCPClient) call(method string, params interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if !c.running || c.stdin == nil || c.stdout == nil {
+		return nil, fmt.Errorf("MCP server '%s' is not running", c.name)
+	}
 
 	id := c.nextID.Add(1)
 
@@ -253,9 +270,8 @@ func (c *MCPClient) call(method string, params interface{}) (json.RawMessage, er
 		return resp.Result, nil
 
 	case <-time.After(mcpCallTimeout):
-		// Mark as not running — goroutine will exit when pipe closes
-		c.running = false
-		log.Printf("[MCP] Call '%s' timed out after %v — marking server as dead", method, mcpCallTimeout)
+		log.Printf("[MCP] Call '%s' timed out after %v — closing server", method, mcpCallTimeout)
+		c.closeLocked()
 		return nil, fmt.Errorf("MCP call '%s' timed out after %v", method, mcpCallTimeout)
 	}
 }

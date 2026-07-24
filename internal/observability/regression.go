@@ -122,9 +122,7 @@ func (t *Tracker) CreateRegressionCase(traceID string) (RegressionCase, error) {
 		return RegressionCase{}, err
 	}
 	t.regressionCases = append(t.regressionCases, c)
-	if len(t.regressionCases) > 1000 {
-		t.regressionCases = t.regressionCases[len(t.regressionCases)-500:]
-	}
+	t.regressionCases = trimRegressionCases(t.regressionCases)
 	return c, nil
 }
 
@@ -233,9 +231,7 @@ func (t *Tracker) RecordRegressionRun(run RegressionRun) {
 		run.Status = "failed"
 	}
 	t.regressionRuns = append(t.regressionRuns, run)
-	if len(t.regressionRuns) > 1000 {
-		t.regressionRuns = t.regressionRuns[len(t.regressionRuns)-500:]
-	}
+	t.regressionRuns = trimRegressionRuns(t.regressionRuns)
 	t.appendRegressionRunToFile(run)
 }
 
@@ -400,6 +396,7 @@ func (t *Tracker) loadRegressionCases() {
 	sort.SliceStable(t.regressionCases, func(i, j int) bool {
 		return t.regressionCases[i].CreatedAt.Before(t.regressionCases[j].CreatedAt)
 	})
+	t.regressionCases = trimRegressionCases(t.regressionCases)
 }
 
 func (t *Tracker) regressionRunTodayFile() string {
@@ -418,16 +415,13 @@ func (t *Tracker) appendRegressionRunToFile(run RegressionRun) {
 }
 
 func (t *Tracker) loadRegressionRunsToday() {
-	data, err := os.ReadFile(t.regressionRunTodayFile())
-	if err != nil {
-		return
-	}
-	for _, line := range splitLines(data) {
+	scanJSONL(t.regressionRunTodayFile(), func(line []byte) {
 		var run RegressionRun
 		if json.Unmarshal(line, &run) == nil {
 			t.regressionRuns = append(t.regressionRuns, run)
+			t.regressionRuns = trimRegressionRuns(t.regressionRuns)
 		}
-	}
+	})
 }
 
 func sanitizeRegressionID(s string) string {

@@ -13,28 +13,29 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	defaultBashTimeout     = 120 * time.Second
-	maxBashTimeout         = 600 * time.Second
-	autoBackgroundAfter    = 15 * time.Second
-	maxOutputBytes         = 100000
-	outputTailKeep         = 10000 // keep last 10KB when truncating
-	outputHeadKeep         = 50000 // keep first 50KB when truncating
-	sleepBlockThreshold    = 300   // block sleep > 5 minutes
+	defaultBashTimeout  = 120 * time.Second
+	maxBashTimeout      = 600 * time.Second
+	autoBackgroundAfter = 15 * time.Second
+	maxOutputBytes      = 100000
+	outputTailKeep      = 10000 // keep last 10KB when truncating
+	outputHeadKeep      = 50000 // keep first 50KB when truncating
+	sleepBlockThreshold = 300   // block sleep > 5 minutes
 )
 
 // BashExecResult holds the complete result of a bash execution.
 type BashExecResult struct {
-	Output      string        `json:"output"`
-	ExitCode    int           `json:"exitCode"`
-	IsError     bool          `json:"isError"`
-	Duration    time.Duration `json:"duration"`
-	Truncated   bool          `json:"truncated"`
-	TimedOut    bool          `json:"timedOut"`
-	Backgrounded bool        `json:"backgrounded"`
+	Output        string               `json:"output"`
+	ExitCode      int                  `json:"exitCode"`
+	IsError       bool                 `json:"isError"`
+	Duration      time.Duration        `json:"duration"`
+	Truncated     bool                 `json:"truncated"`
+	TimedOut      bool                 `json:"timedOut"`
+	Backgrounded  bool                 `json:"backgrounded"`
 	SecurityBlock *SecurityCheckResult `json:"securityBlock,omitempty"`
 }
 
@@ -118,15 +119,27 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 	}
 
 	// Auto-background timer
-	backgrounded := false
+	var backgrounded atomic.Bool
 	bgTimer := time.NewTimer(autoBackgroundAfter)
-	defer bgTimer.Stop()
+	bgDone := make(chan struct{})
+	defer func() {
+		if !bgTimer.Stop() {
+			select {
+			case <-bgTimer.C:
+			default:
+			}
+		}
+		close(bgDone)
+	}()
 
 	go func() {
-		<-bgTimer.C
-		if cmd.Process != nil && cmd.ProcessState == nil {
-			backgrounded = true
-			log.Printf("[Bash] Auto-backgrounded after %v: %s", autoBackgroundAfter, truncateForDisplay(command, 80))
+		select {
+		case <-bgTimer.C:
+			if cmd.Process != nil && cmd.ProcessState == nil {
+				backgrounded.Store(true)
+				log.Printf("[Bash] Auto-backgrounded after %v: %s", autoBackgroundAfter, truncateForDisplay(command, 80))
+			}
+		case <-bgDone:
 		}
 	}()
 
@@ -227,7 +240,7 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 	}
 
 	// Add footer
-	if backgrounded {
+	if backgrounded.Load() {
 		result.Backgrounded = true
 		output += fmt.Sprintf("\n[backgrounded after %v]", autoBackgroundAfter)
 	}

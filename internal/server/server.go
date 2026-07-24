@@ -27,6 +27,7 @@ import (
 	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/providers"
 	"github.com/aniclew/aniclew/internal/router"
+	"github.com/aniclew/aniclew/internal/runtimeplane"
 	"github.com/aniclew/aniclew/internal/stream"
 	"github.com/aniclew/aniclew/internal/types"
 	"github.com/aniclew/aniclew/internal/workstream"
@@ -39,21 +40,27 @@ var dashboardHTML []byte
 var webFS embed.FS
 
 type Server struct {
-	mu             sync.RWMutex
-	activeProvider types.Provider
-	activeModel    string
-	responseLang   string // "ko", "en", "ja", "zh", "auto"
-	router         *router.Router
-	daemon         *kairos.Daemon
-	memory         *kairos.Memory
-	abTester       *kairos.ABTester
-	gw             *gateway.Gateway
-	sessions       *agent.SessionStore
-	tracker        *observability.Tracker
-	feedback       *observability.FeedbackStore
-	workDir        string // current workspace
-	port           int
-	loops          *agent.LoopRegistry
+	mu               sync.RWMutex
+	activeProvider   types.Provider
+	activeModel      string
+	responseLang     string // "ko", "en", "ja", "zh", "auto"
+	router           *router.Router
+	daemon           *kairos.Daemon
+	memory           *kairos.Memory
+	abTester         *kairos.ABTester
+	gw               *gateway.Gateway
+	sessions         *agent.SessionStore
+	tracker          *observability.Tracker
+	feedback         *observability.FeedbackStore
+	runtimeTelemetry *runtimeplane.TelemetryStore
+	runtimeLeases    *runtimeplane.LeaseStore
+	runtimeQuota     *runtimeplane.QuotaCollector
+	runtimeQuotaStop context.CancelFunc
+	workDir          string // current workspace
+	port             int
+	loops            *agent.LoopRegistry
+	evidenceMu       sync.RWMutex
+	evidencePolicy   agent.EvidencePolicyConfig
 }
 
 func (s *Server) SetTracker(t *observability.Tracker) {
@@ -79,13 +86,16 @@ func (s *Server) SetResponseLang(lang string) {
 
 func New(provider types.Provider, model string, port int) *Server {
 	return &Server{
-		activeProvider: provider,
-		activeModel:    model,
-		port:           port,
+		activeProvider:   provider,
+		activeModel:      model,
+		port:             port,
+		runtimeTelemetry: runtimeplane.NewTelemetryStore(),
+		runtimeLeases:    runtimeplane.NewLeaseStore(),
 		// Concurrency cap for simultaneous agent loops across all
 		// projects. 3 is the Wave-1 default — raise it if users report
 		// contention, but a low cap keeps provider spend predictable.
-		loops: agent.NewLoopRegistry(3),
+		loops:          agent.NewLoopRegistry(3),
+		evidencePolicy: agent.DefaultEvidencePolicyConfig(),
 	}
 }
 
@@ -185,6 +195,15 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/providers/register", s.handleRegisterProvider)
 	mux.HandleFunc("GET /api/ollama/models", s.handleOllamaModels)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	mux.HandleFunc("GET /api/runtime", s.handleRuntimeStatus)
+	mux.HandleFunc("POST /api/runtime/telemetry", s.handleRuntimeTelemetry)
+	mux.HandleFunc("GET /api/runtime/quota-sources", s.handleRuntimeQuotaSources)
+	mux.HandleFunc("POST /api/runtime/quota-sources", s.handleRuntimeQuotaSourceCreate)
+	mux.HandleFunc("POST /api/runtime/quota-sources/sample", s.handleRuntimeQuotaSourceSample)
+	mux.HandleFunc("POST /api/runtime/quota-sources/test", s.handleRuntimeQuotaSourceTest)
+	mux.HandleFunc("PATCH /api/runtime/quota-sources/{index}", s.handleRuntimeQuotaSourcePatch)
+	mux.HandleFunc("DELETE /api/runtime/quota-sources/{index}", s.handleRuntimeQuotaSourceDelete)
+	mux.HandleFunc("POST /api/runtime/quota-sources/{index}/test", s.handleRuntimeQuotaSourceTestSaved)
 
 	// Projects
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
@@ -210,6 +229,9 @@ func (s *Server) Start() error {
 	// Observability
 	mux.HandleFunc("GET /api/traces", s.handleTraces)
 	mux.HandleFunc("GET /api/run-traces", s.handleRunTraces)
+	mux.HandleFunc("GET /api/evidence/policy", s.handleEvidencePolicy)
+	mux.HandleFunc("PUT /api/evidence/policy", s.handleEvidencePolicyUpdate)
+	mux.HandleFunc("GET /api/evidence/recent", s.handleEvidenceRecent)
 	mux.HandleFunc("POST /api/run-traces/{id}/regression", s.handleCreateRegressionCase)
 	mux.HandleFunc("GET /api/regressions", s.handleRegressionCases)
 	mux.HandleFunc("POST /api/regressions/{id}/run", s.handleRunRegressionCase)
@@ -393,6 +415,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	activeModel := s.activeModel
 	rt := s.router
 	gw := s.gw
+	telemetry := s.runtimeTelemetry
+	leases := s.runtimeLeases
 	s.mu.RUnlock()
 
 	// ── Team Gateway auth check ──
@@ -426,6 +450,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 	opts := &types.StreamOptions{IncomingHeaders: extractHeaders(r)}
+	runtimeSessionID := runtimeSessionIDFromHeaders(opts.IncomingHeaders)
 
 	// Detect source from headers
 	source := "api"
@@ -440,8 +465,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// ── Smart Router or Direct ──
 	var provider types.Provider
 	var model string
+	var target runtimeplane.RuntimeTarget
 
-	if rt != nil {
+	if rt != nil && !explicitModelOverridesRouter(req.Model) {
 		decision := rt.Route(&req)
 		provider, err = rt.GetProvider(decision)
 		if err != nil {
@@ -450,14 +476,32 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			model = activeModel
 		} else {
 			model = decision.Model
+			if provider != nil {
+				target = runtimeTargetForProviderModel(provider.Name(), model)
+			}
 			log.Printf("→ [%s] %s/%s (%s) msgs=%d tools=%d",
 				decision.Role, decision.Provider, model, decision.Reason,
 				len(req.Messages), len(req.Tools))
 		}
 	} else {
-		provider = activeProvider
-		model = activeModel
-		log.Printf("→ %s/%s msgs=%d tools=%d", provider.Name(), model, len(req.Messages), len(req.Tools))
+		targetProvider, targetModel, resolvedTarget, selection, targetErr := resolveDirectRuntimeProvider(activeProvider, activeModel, req.Model, telemetry, leases, runtimeSessionID)
+		target = resolvedTarget
+		if targetErr != nil {
+			log.Printf("Runtime target error, falling back: %v", targetErr)
+			provider = activeProvider
+			model = target.Model
+			if model == "" {
+				model = activeModel
+			}
+		} else {
+			provider = targetProvider
+			model = targetModel
+		}
+		providerName := "<nil>"
+		if provider != nil {
+			providerName = provider.Name()
+		}
+		log.Printf("→ %s/%s [%s:%s] msgs=%d tools=%d", providerName, model, target.Group, selection.AccountID, len(req.Messages), len(req.Tools))
 	}
 
 	if provider == nil {
@@ -466,6 +510,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Model = model
+	opts.OnResponse = func(response types.ProviderResponse) {
+		recordRuntimeResponse(telemetry, provider, target, response)
+	}
 
 	// ── Stream with retry + 529 fallback ──
 	var ch <-chan types.SSEEvent
@@ -473,12 +520,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	retryCfg.MaxRetries = 5
 	consecutive529 := 0
 
+	streamCtx, streamCancel := context.WithCancel(r.Context())
+	defer streamCancel()
+
 	var lastErr error
 	for attempt := 1; attempt <= retryCfg.MaxRetries; attempt++ {
-		ch, lastErr = provider.StreamMessage(r.Context(), &req, opts)
+		ch, lastErr = provider.StreamMessage(streamCtx, &req, opts)
 		if lastErr == nil {
 			break
 		}
+		recordRuntimeFailure(telemetry, provider, target, lastErr)
 
 		log.Printf("[Proxy] Attempt %d/%d failed: %v", attempt, retryCfg.MaxRetries, lastErr)
 
@@ -499,7 +550,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			delay := apiPkg.CalculateBackoff(attempt, retryCfg, "")
 			log.Printf("[Proxy] Retrying in %v", delay)
 			select {
-			case <-r.Context().Done():
+			case <-streamCtx.Done():
 				writeError(w, 499, "Client disconnected")
 				return
 			case <-time.After(delay):
@@ -518,8 +569,15 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					Provider: fallback.Provider, Model: fallback.Model,
 				})
 				if fbErr == nil {
+					provider = fbProvider
+					model = fallback.Model
+					target = runtimeTargetForProviderModel(provider.Name(), model)
 					req.Model = fallback.Model
-					ch, lastErr = fbProvider.StreamMessage(r.Context(), &req, opts)
+					ch, lastErr = fbProvider.StreamMessage(streamCtx, &req, opts)
+					if lastErr == nil {
+					} else {
+						recordRuntimeFailure(telemetry, fbProvider, runtimeTargetForProviderModel(fbProvider.Name(), fallback.Model), lastErr)
+					}
 				}
 			}
 		}
@@ -541,9 +599,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	inputTokens := 0
 	flusher, hasFlusher := w.(http.Flusher)
 
-	_, streamCancel := context.WithCancel(r.Context())
-	defer streamCancel()
-
 	watchdog := apiPkg.NewStreamWatchdog(func() {
 		log.Printf("[Stream] Idle timeout for %s/%s — aborting", provider.Name(), model)
 		streamCancel() // Actually abort the stream
@@ -553,6 +608,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	for event := range ch {
 		watchdog.Ping()
 		if err := stream.WriteSSEEvent(w, event); err != nil {
+			streamCancel()
 			break
 		}
 		if hasFlusher {
@@ -577,6 +633,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 	})
+	recordRuntimeSuccess(telemetry, provider, target, inputTokens, outputTokens)
 
 	// Record cost
 	if rt != nil {
@@ -2182,20 +2239,37 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		ResponseLang:      respLang,
 		WorkstreamContext: workstreamContext,
 		Recorder:          recorder,
+		EvidencePolicy:    s.currentEvidencePolicy(),
 	}, eventCh)
 
+	clientGone := false
 	for event := range eventCh {
-		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if clientGone {
+			continue
+		}
+		if !writeAgentSSE(w, event) {
+			clientGone = true
+			s.loops.Cancel(sessionID)
+		}
+	}
+
+	if !clientGone {
+		fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 	}
+}
 
-	fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
+func writeAgentSSE(w http.ResponseWriter, event agent.Event) bool {
+	data, _ := json.Marshal(event)
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return false
+	}
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	return true
 }
 
 type workstreamRunRecorder struct {
@@ -2672,6 +2746,8 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eventCh := make(chan agent.Event, 64)
+	streamCtx, streamCancel := context.WithCancel(r.Context())
+	defer streamCancel()
 	traceStartedAt := time.Now().UTC()
 
 	go func() {
@@ -2680,7 +2756,7 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		runStatus := "completed"
 		failureDetail := ""
 
-		if err := team.ExecuteWaves(r.Context(), eventCh); err != nil {
+		if err := team.ExecuteWaves(streamCtx, eventCh); err != nil {
 			runStatus = "failed"
 			failureDetail = err.Error()
 			eventCh <- agent.Event{Type: "error", Data: err.Error()}
@@ -2694,14 +2770,40 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 
 		// Verify if command configured
 		if body.VerifyCommand != "" {
-			passed, detail := team.Verify(r.Context())
+			passed, detail := team.Verify(streamCtx)
 			if passed {
-				verification = agent.ReceiptVerification{Status: "passed", Source: "team-verify"}
+				verification = agent.ReceiptVerification{
+					Status:  "passed",
+					Source:  "team-verify",
+					Command: body.VerifyCommand,
+					Summary: trimEvidenceText(detail),
+					Gate:    agent.EvidenceGateAllow,
+					Mode:    agent.EvidenceModeDeep,
+					Evidence: []agent.EvidenceRecord{{
+						Source:  "team-verify",
+						Command: body.VerifyCommand,
+						Status:  "passed",
+						Summary: trimEvidenceText(detail),
+					}},
+				}
 				eventCh <- agent.Event{Type: "status", Data: "Verification PASSED"}
 			} else {
 				runStatus = "failed"
 				failureDetail = detail
-				verification = agent.ReceiptVerification{Status: "failed", Source: "team-verify"}
+				verification = agent.ReceiptVerification{
+					Status:  "failed",
+					Source:  "team-verify",
+					Command: body.VerifyCommand,
+					Summary: trimEvidenceText(detail),
+					Gate:    agent.EvidenceGateBlock,
+					Mode:    agent.EvidenceModeDeep,
+					Evidence: []agent.EvidenceRecord{{
+						Source:  "team-verify",
+						Command: body.VerifyCommand,
+						Status:  "failed",
+						Summary: trimEvidenceText(detail),
+					}},
+				}
 				eventCh <- agent.Event{Type: "status", Data: "Verification FAILED: " + detail}
 			}
 		}
@@ -2713,16 +2815,21 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		eventCh <- agent.Event{Type: "done", Data: nil}
 	}()
 
+	clientGone := false
 	for event := range eventCh {
-		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if clientGone {
+			continue
+		}
+		if !writeAgentSSE(w, event) {
+			clientGone = true
+			streamCancel()
+		}
+	}
+	if !clientGone {
+		fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-	}
-	fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
 	}
 }
 
@@ -2954,6 +3061,8 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 
 	eventCh := make(chan agent.Event, 64)
+	streamCtx, streamCancel := context.WithCancel(r.Context())
+	defer streamCancel()
 	traceStartedAt := time.Now().UTC()
 	chronosTrace := observability.RunTrace{
 		ID:           traceID,
@@ -3004,9 +3113,10 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	go agent.RunChronos(r.Context(), provider, model, body.Task, workDir, cfg, eventCh)
+	go agent.RunChronos(streamCtx, provider, model, body.Task, workDir, cfg, eventCh)
 
 	recordedChronosEnd := false
+	clientGone := false
 	for event := range eventCh {
 		if !recordedChronosEnd {
 			switch event.Type {
@@ -3017,11 +3127,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 					tracker.RecordRun(chronosTrace)
 				}
 				if wsStore != nil && ws != nil {
-					verification := workstream.VerificationResult{
-						Status:  "not-run",
-						Source:  "chronos",
-						Summary: "chronos run completed",
-					}
+					verification := chronosVerificationFromDone(event.Data, cfg.VerifyCommand)
 					if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
 						log.Printf("[workstream] record chronos verification failed: %v", err)
 					}
@@ -3069,16 +3175,20 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		if clientGone {
+			continue
+		}
+		if !writeAgentSSE(w, event) {
+			clientGone = true
+			streamCancel()
 		}
 	}
 
-	fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	if !clientGone {
+		fmt.Fprintf(w, "data: {\"type\":\"stream_end\"}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 }
 

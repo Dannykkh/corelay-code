@@ -94,6 +94,12 @@ func main() {
 	}
 
 	srv := server.New(provider, *model, *port)
+	if cfg.EvidencePolicy != "" || cfg.EvidenceMaxStopBlocks > 0 {
+		srv.SetEvidencePolicy(agent.EvidencePolicyConfig{
+			Policy:        cfg.EvidencePolicy,
+			MaxStopBlocks: cfg.EvidenceMaxStopBlocks,
+		})
+	}
 
 	// ── Initialize all subsystems ──
 	homeDir, _ := os.UserHomeDir()
@@ -152,6 +158,8 @@ func main() {
 	sessions := agent.NewSessionStore(baseDir)
 	srv.SetSessionStore(sessions)
 
+	runtimeQuotaCollectors := srv.StartRuntimeQuotaCollectors(cfg.RuntimeQuotaSources)
+
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "  ╔══════════════════════════════════════╗\n")
 	fmt.Fprintf(os.Stderr, "  ║   AniClew v1.0 — Any Model, One Agent   ║\n")
@@ -162,6 +170,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  Provider:  %s\n", provider.DisplayName())
 	fmt.Fprintf(os.Stderr, "  Model:     %s\n", *model)
 	fmt.Fprintf(os.Stderr, "  Router:    %s\n", routerStatus)
+	if runtimeQuotaCollectors > 0 {
+		fmt.Fprintf(os.Stderr, "  Quota:     collector polling %d source(s)\n", runtimeQuotaCollectors)
+	}
 	if agent.OfflineMode() {
 		fmt.Fprintf(os.Stderr, "  Network:   AIR-GAP (ANICLEW_OFFLINE) — WebSearch/WebFetch/HTTPRequest disabled\n")
 	}
@@ -227,6 +238,7 @@ func main() {
 	if !agent.WaitForMemoryTasks(30 * time.Second) {
 		fmt.Fprintf(os.Stderr, "  Warning: background memory tasks did not finish within 30s\n")
 	}
+	srv.StopRuntimeQuotaCollectors()
 	agent.DisconnectAllMCP()
 	fmt.Fprintf(os.Stderr, "  Goodbye.\n")
 }

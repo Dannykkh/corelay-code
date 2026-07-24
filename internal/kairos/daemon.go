@@ -83,12 +83,30 @@ type Daemon struct {
 }
 
 func NewDaemon(cfg DaemonConfig) *Daemon {
+	cfg = normalizeDaemonConfig(cfg)
 	return &Daemon{
 		config:   cfg,
 		state:    StateIdle,
 		logs:     make([]LogEntry, 0, 1000),
 		notifier: NewNotifier(),
 	}
+}
+
+func normalizeDaemonConfig(cfg DaemonConfig) DaemonConfig {
+	defaults := DefaultDaemonConfig()
+	if cfg.TickInterval <= 0 {
+		cfg.TickInterval = defaults.TickInterval
+	}
+	if cfg.BlockingBudget <= 0 {
+		cfg.BlockingBudget = defaults.BlockingBudget
+	}
+	if cfg.CacheExpiry <= 0 {
+		cfg.CacheExpiry = defaults.CacheExpiry
+	}
+	if strings.TrimSpace(cfg.Autonomy) == "" {
+		cfg.Autonomy = defaults.Autonomy
+	}
+	return cfg
 }
 
 // Notifier returns the daemon's notifier.

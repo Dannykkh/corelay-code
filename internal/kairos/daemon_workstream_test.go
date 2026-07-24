@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/types"
@@ -81,6 +82,30 @@ func TestDaemonExecuteTaskRecordsWorkstream(t *testing.T) {
 	}
 	if !hasRunSpan(runTraces[0], "kairos.task") {
 		t.Fatalf("kairos run trace missing task span: %+v", runTraces[0].Spans)
+	}
+}
+
+func TestNewDaemonNormalizesZeroDurations(t *testing.T) {
+	daemon := NewDaemon(DaemonConfig{})
+	cfg := daemon.GetConfig()
+	if cfg.TickInterval <= 0 {
+		t.Fatalf("TickInterval was not normalized: %v", cfg.TickInterval)
+	}
+	if cfg.BlockingBudget <= 0 {
+		t.Fatalf("BlockingBudget was not normalized: %v", cfg.BlockingBudget)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		daemon.Start()
+		daemon.Stop()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("daemon Start/Stop with zero config did not return")
 	}
 }
 

@@ -27,7 +27,7 @@ func NewGemini(cfg *types.ProviderConfig) types.Provider {
 }
 
 func (p *GeminiProvider) Name() string        { return "gemini" }
-func (p *GeminiProvider) DisplayName() string  { return "Google Gemini" }
+func (p *GeminiProvider) DisplayName() string { return "Google Gemini" }
 func (p *GeminiProvider) Models() []types.ModelInfo {
 	return []types.ModelInfo{
 		{ID: "gemini-3-pro-preview", DisplayName: "Gemini 3 Pro (최신 플래그십)", ContextWindow: 1048576},
@@ -72,30 +72,33 @@ func (p *GeminiProvider) StreamMessage(ctx context.Context, req *types.MessagesR
 	if err != nil {
 		return nil, fmt.Errorf("gemini connection failed: %w", err)
 	}
+	opts.ObserveResponse(resp.StatusCode, resp.Header)
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("gemini API error %d", resp.StatusCode)
 	}
 
 	ch := make(chan types.SSEEvent, 64)
-	go p.translateStream(resp, req.Model, ch)
+	go p.translateStream(ctx, resp, req.Model, ch)
 	return ch, nil
 }
 
-func (p *GeminiProvider) translateStream(resp *http.Response, model string, ch chan<- types.SSEEvent) {
+func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Response, model string, ch chan<- types.SSEEvent) {
 	defer resp.Body.Close()
 	defer close(ch)
 
 	msgID := translate.NewTranslator(model) // just for the ID
 	_ = msgID
 
-	ch <- types.SSEEvent{
+	if !sendSSEEvent(ctx, ch, types.SSEEvent{
 		Type: "message_start",
 		Message: &types.SSEMessage{
 			ID: "msg_gemini", Type: "message", Role: "assistant", Model: model,
 			Content: json.RawMessage(`[]`),
 			Usage:   &types.SSEUsage{},
 		},
+	}) {
+		return
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -137,7 +140,9 @@ func (p *GeminiProvider) translateStream(resp *http.Response, model string, ch c
 		cand := chunk.Candidates[0]
 
 		for _, partRaw := range cand.Content.Parts {
-			var textPart struct{ Text string `json:"text"` }
+			var textPart struct {
+				Text string `json:"text"`
+			}
 			var fnPart struct {
 				FunctionCall *struct {
 					Name string          `json:"name"`
@@ -148,36 +153,48 @@ func (p *GeminiProvider) translateStream(resp *http.Response, model string, ch c
 			if json.Unmarshal(partRaw, &textPart) == nil && textPart.Text != "" {
 				if !textOpen {
 					idx := blockIndex
-					ch <- types.SSEEvent{
+					if !sendSSEEvent(ctx, ch, types.SSEEvent{
 						Type: "content_block_start", Index: &idx,
 						ContentBlock: mustJSON(map[string]string{"type": "text", "text": ""}),
+					}) {
+						return
 					}
 					textOpen = true
 				}
 				idx := blockIndex
-				ch <- types.SSEEvent{
+				if !sendSSEEvent(ctx, ch, types.SSEEvent{
 					Type: "content_block_delta", Index: &idx,
 					Delta: mustJSON(map[string]string{"type": "text_delta", "text": textPart.Text}),
+				}) {
+					return
 				}
 			} else if json.Unmarshal(partRaw, &fnPart) == nil && fnPart.FunctionCall != nil {
 				if textOpen {
 					idx := blockIndex
-					ch <- types.SSEEvent{Type: "content_block_stop", Index: &idx}
+					if !sendSSEEvent(ctx, ch, types.SSEEvent{Type: "content_block_stop", Index: &idx}) {
+						return
+					}
 					blockIndex++
 					textOpen = false
 				}
 				idx := blockIndex
-				ch <- types.SSEEvent{
+				if !sendSSEEvent(ctx, ch, types.SSEEvent{
 					Type: "content_block_start", Index: &idx,
 					ContentBlock: mustJSON(map[string]any{
 						"type": "tool_use", "id": "toolu_gemini", "name": fnPart.FunctionCall.Name, "input": "",
 					}),
+				}) {
+					return
 				}
-				ch <- types.SSEEvent{
+				if !sendSSEEvent(ctx, ch, types.SSEEvent{
 					Type: "content_block_delta", Index: &idx,
 					Delta: mustJSON(map[string]string{"type": "input_json_delta", "partial_json": string(fnPart.FunctionCall.Args)}),
+				}) {
+					return
 				}
-				ch <- types.SSEEvent{Type: "content_block_stop", Index: &idx}
+				if !sendSSEEvent(ctx, ch, types.SSEEvent{Type: "content_block_stop", Index: &idx}) {
+					return
+				}
 				blockIndex++
 				stopReason = "tool_use"
 			}
@@ -190,15 +207,19 @@ func (p *GeminiProvider) translateStream(resp *http.Response, model string, ch c
 
 	if textOpen {
 		idx := blockIndex
-		ch <- types.SSEEvent{Type: "content_block_stop", Index: &idx}
+		if !sendSSEEvent(ctx, ch, types.SSEEvent{Type: "content_block_stop", Index: &idx}) {
+			return
+		}
 	}
 
-	ch <- types.SSEEvent{
+	if !sendSSEEvent(ctx, ch, types.SSEEvent{
 		Type:  "message_delta",
 		Delta: mustJSON(map[string]any{"stop_reason": stopReason, "stop_sequence": nil}),
 		Usage: &types.SSEUsage{OutputTokens: outputTokens},
+	}) {
+		return
 	}
-	ch <- types.SSEEvent{Type: "message_stop"}
+	sendSSEEvent(ctx, ch, types.SSEEvent{Type: "message_stop"})
 }
 
 func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
@@ -220,7 +241,9 @@ func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
 	var contents []map[string]any
 	for _, msg := range req.Messages {
 		role := "user"
-		if msg.Role == "assistant" { role = "model" }
+		if msg.Role == "assistant" {
+			role = "model"
+		}
 
 		var text string
 		json.Unmarshal(msg.Content, &text)
@@ -229,7 +252,9 @@ func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
 			var blocks []struct{ Type, Text string }
 			json.Unmarshal(msg.Content, &blocks)
 			for _, b := range blocks {
-				if b.Text != "" { text += b.Text }
+				if b.Text != "" {
+					text += b.Text
+				}
 			}
 		}
 		if text != "" {

@@ -417,6 +417,7 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	task.AssignedTo = workerID
 	t.mailbox.EnsureInbox(workerID)
 	t.mu.Unlock()
+	defer workerCancel()
 
 	log.Printf("[Team] Worker %s starting task %s: %s", workerID, task.ID, task.Name)
 
@@ -506,6 +507,7 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	w := t.workers[workerID]
 	w.Status = "idle"
 	w.IdleSince = time.Now()
+	w.cancel = nil
 	callbacks := make([]func(string), len(w.onIdle))
 	copy(callbacks, w.onIdle)
 	t.mu.Unlock()

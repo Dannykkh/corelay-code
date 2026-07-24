@@ -26,7 +26,7 @@ func NewAnthropic(cfg *types.ProviderConfig) types.Provider {
 }
 
 func (p *AnthropicProvider) Name() string        { return "anthropic" }
-func (p *AnthropicProvider) DisplayName() string  { return "Anthropic (passthrough)" }
+func (p *AnthropicProvider) DisplayName() string { return "Anthropic (passthrough)" }
 func (p *AnthropicProvider) Models() []types.ModelInfo {
 	return []types.ModelInfo{
 		{ID: "claude-opus-4-8", DisplayName: "Claude Opus 4.8 (최신 최상급)", ContextWindow: 1000000},
@@ -90,6 +90,7 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, req *types.Messag
 	if err != nil {
 		return nil, fmt.Errorf("anthropic connection failed: %w", err)
 	}
+	opts.ObserveResponse(resp.StatusCode, resp.Header)
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("anthropic API error %d", resp.StatusCode)
@@ -114,7 +115,9 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, req *types.Messag
 				if err := json.Unmarshal([]byte(line[6:]), &event); err != nil {
 					continue
 				}
-				ch <- event
+				if !sendSSEEvent(ctx, ch, event) {
+					return
+				}
 				if event.Type == "message_stop" {
 					return
 				}

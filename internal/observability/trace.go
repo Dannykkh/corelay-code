@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,20 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+)
+
+const (
+	requestTraceMemoryLimit       = 10000
+	requestTraceRetainCount       = 5000
+	runTraceMemoryLimit           = 1000
+	runTraceRetainCount           = 500
+	regressionCaseMemoryLimit     = 1000
+	regressionCaseRetainCount     = 500
+	regressionRunMemoryLimit      = 1000
+	regressionRunRetainCount      = 500
+	feedbackMemoryLimit           = 1000
+	feedbackRetainCount           = 500
+	observabilityMaxJSONLineBytes = 4 * 1024 * 1024
 )
 
 // RequestTrace records a single LLM API request.
@@ -99,10 +114,10 @@ func NewTracker(baseDir string) *Tracker {
 	os.MkdirAll(regressionDir, 0755)
 	os.MkdirAll(regressionRunDir, 0755)
 	t := &Tracker{
-		traces:           make([]RequestTrace, 0, 10000),
-		runTraces:        make([]RunTrace, 0, 1000),
-		regressionCases:  make([]RegressionCase, 0, 1000),
-		regressionRuns:   make([]RegressionRun, 0, 1000),
+		traces:           make([]RequestTrace, 0, requestTraceMemoryLimit),
+		runTraces:        make([]RunTrace, 0, runTraceMemoryLimit),
+		regressionCases:  make([]RegressionCase, 0, regressionCaseMemoryLimit),
+		regressionRuns:   make([]RegressionRun, 0, regressionRunMemoryLimit),
 		dir:              dir,
 		runDir:           runDir,
 		regressionDir:    regressionDir,
@@ -120,11 +135,7 @@ func (t *Tracker) Record(trace RequestTrace) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.traces = append(t.traces, trace)
-
-	// Keep in-memory limit
-	if len(t.traces) > 10000 {
-		t.traces = t.traces[len(t.traces)-5000:]
-	}
+	t.traces = trimRequestTraces(t.traces)
 
 	// Append to daily file
 	t.appendToFile(trace)
@@ -150,9 +161,7 @@ func (t *Tracker) RecordRun(trace RunTrace) {
 		trace.Status = "ok"
 	}
 	t.runTraces = append(t.runTraces, trace)
-	if len(t.runTraces) > 1000 {
-		t.runTraces = t.runTraces[len(t.runTraces)-500:]
-	}
+	t.runTraces = trimRunTraces(t.runTraces)
 	t.appendRunToFile(trace)
 }
 
@@ -286,29 +295,23 @@ func (t *Tracker) appendRunToFile(trace RunTrace) {
 }
 
 func (t *Tracker) loadToday() {
-	data, err := os.ReadFile(t.todayFile())
-	if err != nil {
-		return
-	}
-	for _, line := range splitLines(data) {
+	scanJSONL(t.todayFile(), func(line []byte) {
 		var trace RequestTrace
 		if json.Unmarshal(line, &trace) == nil {
 			t.traces = append(t.traces, trace)
+			t.traces = trimRequestTraces(t.traces)
 		}
-	}
+	})
 }
 
 func (t *Tracker) loadRunToday() {
-	data, err := os.ReadFile(t.runTodayFile())
-	if err != nil {
-		return
-	}
-	for _, line := range splitLines(data) {
+	scanJSONL(t.runTodayFile(), func(line []byte) {
 		var trace RunTrace
 		if json.Unmarshal(line, &trace) == nil {
 			t.runTraces = append(t.runTraces, trace)
+			t.runTraces = trimRunTraces(t.runTraces)
 		}
-	}
+	})
 }
 
 func NewTraceID(prefix string) string {
@@ -322,21 +325,57 @@ func NewTraceID(prefix string) string {
 	return prefix + "_" + time.Now().UTC().Format("20060102T150405") + "_" + hex.EncodeToString(b[:])
 }
 
-func splitLines(data []byte) [][]byte {
-	var lines [][]byte
-	start := 0
-	for i, b := range data {
-		if b == '\n' {
-			if i > start {
-				lines = append(lines, data[start:i])
-			}
-			start = i + 1
+func scanJSONL(path string, visit func([]byte)) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), observabilityMaxJSONLineBytes)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
 		}
+		visit(line)
 	}
-	if start < len(data) {
-		lines = append(lines, data[start:])
+}
+
+func trimRequestTraces(traces []RequestTrace) []RequestTrace {
+	if len(traces) <= requestTraceMemoryLimit {
+		return traces
 	}
-	return lines
+	return append([]RequestTrace(nil), traces[len(traces)-requestTraceRetainCount:]...)
+}
+
+func trimRunTraces(traces []RunTrace) []RunTrace {
+	if len(traces) <= runTraceMemoryLimit {
+		return traces
+	}
+	return append([]RunTrace(nil), traces[len(traces)-runTraceRetainCount:]...)
+}
+
+func trimRegressionCases(cases []RegressionCase) []RegressionCase {
+	if len(cases) <= regressionCaseMemoryLimit {
+		return cases
+	}
+	return append([]RegressionCase(nil), cases[len(cases)-regressionCaseRetainCount:]...)
+}
+
+func trimRegressionRuns(runs []RegressionRun) []RegressionRun {
+	if len(runs) <= regressionRunMemoryLimit {
+		return runs
+	}
+	return append([]RegressionRun(nil), runs[len(runs)-regressionRunRetainCount:]...)
+}
+
+func trimFeedback(items []Feedback) []Feedback {
+	if len(items) <= feedbackMemoryLimit {
+		return items
+	}
+	return append([]Feedback(nil), items[len(items)-feedbackRetainCount:]...)
 }
 
 func sortInt64s(a []int64) {

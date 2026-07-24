@@ -13,8 +13,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+const multiSearchProviderTimeout = 8 * time.Second
 
 type webSearchOptions struct {
 	Query      string
@@ -56,21 +59,10 @@ func searchWebWithProviders(ctx context.Context, args webSearchArgs) ([]webSearc
 		return nil, label, strings.Join(selectionNotes, "; "), err
 	}
 
-	byProvider := map[string][]webSearchResult{}
 	var notes []string
 	notes = append(notes, selectionNotes...)
-	for _, provider := range providers {
-		results, perr := provider.Search(ctx, opts)
-		if perr != nil {
-			notes = append(notes, fmt.Sprintf("%s failed: %v", provider.Name(), perr))
-			continue
-		}
-		if len(results) == 0 {
-			notes = append(notes, provider.Name()+" returned no results")
-			continue
-		}
-		byProvider[provider.Name()] = results
-	}
+	byProvider, providerNotes := runSearchProviders(ctx, providers, opts)
+	notes = append(notes, providerNotes...)
 
 	results := fuseSearchResults(opts, byProvider)
 	if len(results) == 0 {
@@ -80,6 +72,53 @@ func searchWebWithProviders(ctx context.Context, args webSearchArgs) ([]webSearc
 		return nil, label, strings.Join(notes, "; "), fmt.Errorf("%s", strings.Join(notes, "; "))
 	}
 	return results, label, strings.Join(notes, "; "), nil
+}
+
+func runSearchProviders(ctx context.Context, providers []webSearchProvider, opts webSearchOptions) (map[string][]webSearchResult, []string) {
+	return runSearchProvidersWithTimeout(ctx, providers, opts, multiSearchProviderTimeout)
+}
+
+func runSearchProvidersWithTimeout(ctx context.Context, providers []webSearchProvider, opts webSearchOptions, timeout time.Duration) (map[string][]webSearchResult, []string) {
+	type providerRun struct {
+		name    string
+		results []webSearchResult
+		err     error
+	}
+
+	runs := make([]providerRun, len(providers))
+	var wg sync.WaitGroup
+	for i, provider := range providers {
+		i, provider := i, provider
+		runs[i].name = provider.Name()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			providerCtx := ctx
+			cancel := func() {}
+			if len(providers) > 1 && timeout > 0 {
+				providerCtx, cancel = context.WithTimeout(ctx, timeout)
+			}
+			defer cancel()
+			results, err := provider.Search(providerCtx, opts)
+			runs[i] = providerRun{name: provider.Name(), results: results, err: err}
+		}()
+	}
+	wg.Wait()
+
+	byProvider := map[string][]webSearchResult{}
+	var notes []string
+	for _, run := range runs {
+		if run.err != nil {
+			notes = append(notes, fmt.Sprintf("%s failed: %v", run.name, run.err))
+			continue
+		}
+		if len(run.results) == 0 {
+			notes = append(notes, run.name+" returned no results")
+			continue
+		}
+		byProvider[run.name] = run.results
+	}
+	return byProvider, notes
 }
 
 func selectSearchProviders(args webSearchArgs) ([]webSearchProvider, string, []string, error) {

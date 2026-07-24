@@ -1,6 +1,9 @@
 package types
 
-import "context"
+import (
+	"context"
+	"net/http"
+)
 
 type ModelInfo struct {
 	ID            string `json:"id"`
@@ -16,6 +19,22 @@ type ProviderConfig struct {
 
 type StreamOptions struct {
 	IncomingHeaders map[string]string
+	OnResponse      func(ProviderResponse)
+}
+
+type ProviderResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func (opts *StreamOptions) ObserveResponse(statusCode int, header http.Header) {
+	if opts == nil || opts.OnResponse == nil {
+		return
+	}
+	opts.OnResponse(ProviderResponse{
+		StatusCode: statusCode,
+		Header:     header.Clone(),
+	})
 }
 
 type Provider interface {
