@@ -6,7 +6,7 @@ import { ChatPage } from './pages/Chat';
 import { RoutesPage } from './pages/Routes';
 import { CostsPage } from './pages/Costs';
 import { KairosPage } from './pages/Kairos';
-import { SettingsPage } from './pages/Settings';
+import { SettingsPage } from './pages/RuntimeSettings';
 import { MemoryPage } from './pages/Memory';
 import { TeamPage } from './pages/Team';
 import { fetchJSON, putJSON } from './lib/api';

@@ -11,12 +11,15 @@
   },
   "dependencies": {
     "@types/react-syntax-highlighter": "^15.5.13",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.26.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-markdown": "^10.1.0",
     "react-syntax-highlighter": "^16.1.1",
     "rehype-highlight": "^7.0.2",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",

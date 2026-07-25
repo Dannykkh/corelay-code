@@ -13,6 +13,26 @@
   --color-yellow: #fbbf24;
   --color-red: #f87171;
   --color-orange: #fb923c;
+
+  /* Numbered scale used by the ported settings UI.
+     Dark theme: higher number = darker surface, lower number = brighter text. */
+  --color-surface-100: #e4e6ed;
+  --color-surface-200: #c9ccd8;
+  --color-surface-300: #a8acbd;
+  --color-surface-400: #8b8fa3;
+  --color-surface-500: #6b7285;
+  --color-surface-600: #4a5168;
+  --color-surface-700: #3a4055;
+  --color-surface-800: #2e3343;
+  --color-surface-900: #1a1d27;
+  --color-surface-950: #0f1117;
+
+  --color-brand-200: #b9c6ff;
+  --color-brand-300: #9db0ff;
+  --color-brand-400: #849cff;
+  --color-brand-500: #6c8cff;
+  --color-brand-600: #4a6adf;
+  --color-brand-700: #3454c5;
 }
 
 /* Light theme */
@@ -29,6 +49,26 @@
   --color-yellow: #d97706;
   --color-red: #dc2626;
   --color-orange: #ea580c;
+
+  /* Same roles, inverted lightness. Without this the ported components keep
+     dark backgrounds and dark text in light mode. */
+  --color-surface-100: #1a1d27;
+  --color-surface-200: #2e3343;
+  --color-surface-300: #4a4f5e;
+  --color-surface-400: #6b7080;
+  --color-surface-500: #8b8fa3;
+  --color-surface-600: #b8bdc9;
+  --color-surface-700: #d1d5dd;
+  --color-surface-800: #e2e4e9;
+  --color-surface-900: #ffffff;
+  --color-surface-950: #f8f9fb;
+
+  --color-brand-200: #3454c5;
+  --color-brand-300: #3f5ed2;
+  --color-brand-400: #4462d9;
+  --color-brand-500: #4a6adf;
+  --color-brand-600: #3454c5;
+  --color-brand-700: #2a44a3;
 }
 
 body {
