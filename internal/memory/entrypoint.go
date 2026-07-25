@@ -86,8 +86,8 @@ func TruncateEntrypoint(raw string) EntrypointTruncation {
 
 	reason := truncationReason(lineCount, byteCount, lineCapped, byteCapped)
 	warning := "\n\n> WARNING: " + EntrypointName + " is " + reason +
-		". Only part of it was loaded. Keep index entries to one line " +
-		"under ~200 chars; move detail into topic files."
+		". Only a prefix reached the model. Index rows should stay on a " +
+		"single line; put anything longer in the per-topic files."
 
 	return EntrypointTruncation{
 		Content:    truncated + warning,

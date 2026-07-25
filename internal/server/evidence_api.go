@@ -279,7 +279,7 @@ func agentEvidenceSummary(receipt agent.AgentReceipt) string {
 	if len(receipt.EditedFiles) > 0 {
 		return fmt.Sprintf("%d edited file(s), no successful verification evidence", len(receipt.EditedFiles))
 	}
-	return "No verification evidence recorded"
+	return "No verification evidence on file"
 }
 
 func teamEvidenceSummary(receipt agent.TeamRunReceipt, command string) string {

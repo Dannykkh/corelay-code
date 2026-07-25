@@ -35,7 +35,7 @@ func TestScoreEntry_OverlapAndNoOverlap(t *testing.T) {
 
 	match := Entry{
 		Name:        "DB rule",
-		Description: "integration tests must hit a real database",
+		Description: "integration suites require a live database instance",
 		Body:        "migration divergence incident",
 	}
 	nomatch := Entry{
