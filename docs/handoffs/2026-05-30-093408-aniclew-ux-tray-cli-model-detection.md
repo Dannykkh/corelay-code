@@ -2,9 +2,9 @@
 
 ## Session Metadata
 - Created: 2026-05-30 09:34
-- Project: `D:\git\claudecode\proxy-go` (Go module `github.com/aniclew/aniclew`, 앱 이름 "AniClew")
+- Project: `D:\git\aniclew` (Go module `github.com/aniclew/aniclew`, 앱 이름 "AniClew") — 세션 당시 경로는 `D:\git\claudecode\proxy-go`
 - Branch: `main` (origin보다 앞섬, 미푸시)
-- 상위 워크스페이스: `D:\git\claudecode` (Claude Code 포크). **proxy-go는 .gitignore로 제외된 별도 git 레포** — 커밋은 `git -C D:\git\claudecode\proxy-go`.
+- 저장소: 2026-07-25 독립 분리 완료. 커밋은 `git -C D:\git\aniclew`. (분리 전에는 상위 워크스페이스 `D:\git\claudecode`에서 `.gitignore`로 제외된 중첩 레포였음)
 - 이전 핸드오프: `docs/handoffs/2026-05-27-sglang-harness-hardening.md` (Session 1~3: SGLang provider, 4중 안전망, 스킬 억제 버그, 에어갭).
 
 ## Current State Summary

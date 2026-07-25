@@ -2,7 +2,7 @@
 
 ## Session Metadata
 - Created: 2026-06-19 10:17 (KST)
-- Project: D:\git\claudecode\proxy-go  (Go module `github.com/aniclew/aniclew`, 중첩 git 저장소)
+- Project: `D:\git\aniclew` (Go module `github.com/aniclew/aniclew`) — 세션 당시 경로는 `D:\git\claudecode\proxy-go`(중첩 저장소), 2026-07-25 독립 분리
 - Branch: main
 - Commits this session: 18 (`0bbec98` … `5651d9d`), 17 files, ~1,127 insertions
 

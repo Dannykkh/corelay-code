@@ -2,9 +2,9 @@
 
 ## Session Metadata
 - Created: 2026-05-27
-- Project: `D:\git\claudecode\proxy-go` (Go module `github.com/aniclew/aniclew`)
+- Project: `D:\git\aniclew` (Go module `github.com/aniclew/aniclew`) — 세션 당시 경로는 `D:\git\claudecode\proxy-go`
 - Branch: `main`
-- 상위 워크스페이스: `D:\git\claudecode` (Claude Code 포크 / leaked source)
+- 저장소: 2026-07-25 독립 분리 완료. (분리 전 상위 워크스페이스는 `D:\git\claudecode` — 출처와 검증 기록은 `docs/ip-provenance.md` 참조)
 
 ## Current State Summary
 proxy-go를 "어떤 오픈 모델이든 SGLang 등으로 서빙해서, Claude Code 수준으로 활용하는
@@ -74,8 +74,8 @@ tool_result를 user 메시지로 되돌리는 구조라 이미 존재했음 → 
 - 최종 목표: **폐쇄망(에어갭)** 배포. 인터넷 없이 동작해야 함.
 
 ### Potential Gotchas
-- **proxy-go는 메인 `claudecode` 레포에서 `.gitignore`로 제외된 별도 git 레포다.**
-  커밋은 반드시 `git -C D:\git\claudecode\proxy-go ...` 로 proxy-go 레포에서.
+- **AniClew는 독립 git 레포다** — 커밋은 `git -C D:\git\aniclew ...`.
+  (2026-07-25 이전에는 상위 `claudecode` 레포에서 `.gitignore`로 제외된 중첩 레포였다.)
 - **사용자의 미커밋 작업이 working tree에 있다**: `internal/server/server.go`(M),
   `internal/agent/loop_registry.go`, `loop_registry_test.go`(??). **건드리지 말고
   선별 커밋할 것** (내 파일만 `git add` 지정).
