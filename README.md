@@ -1,8 +1,20 @@
 # AniClew
 
-**Any Model, One Agent** — LLM Harness that unifies Claude CLI, Codex CLI, and Gemini CLI under a single proxy with a web dashboard.
+**Run Claude Code on your own models.**
 
-AniClew sits between your coding CLI tools and LLM providers, giving you multi-provider routing, per-project management, multi-agent orchestration, and a visual control plane.
+Point Claude Code — or Codex CLI, or Gemini CLI — at AniClew and it keeps
+working: same commands, same subagents, same skills, same project memory. Behind
+it, the model can be Ollama, SGLang, or anything else you host.
+
+The hard part is not translating an API. It is that a local model fails
+differently. It emits a tool call with the wrong shape, stops mid-sequence, or
+quietly runs past its context window — and a harness built for a hosted model
+reads that as success. AniClew absorbs those failures in the runtime layer so
+the harness never sees them.
+
+Everything else here — multi-provider routing, account and quota scheduling,
+teams, the daemon, observability — exists to keep that substitution working
+under real use.
 
 ## Screenshots
 
@@ -16,6 +28,27 @@ AniClew sits between your coding CLI tools and LLM providers, giving you multi-p
 
 ## Features
 
+### Local Model Runtime
+
+Where most of this project's work went. A router gets a local model *answering*;
+this is what it takes to make one usable through a real coding harness.
+
+- **Harness stays put**: `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` is the only
+  change. Slash commands, subagents, skills, hooks, and project memory keep working
+- **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
+  converted both ways, including streaming and tool-call frames
+- **Thinking models**: qwen3 and DeepSeek-R1 reasoning is parsed out of the
+  stream rather than leaking into the answer, and shown as collapsible blocks in
+  the web UI
+- **Context auto-compaction**: LLM-based summarization with a snip fallback and a
+  circuit breaker, so a long run degrades instead of dying at the window edge
+- **Capacity-aware execution**: local defaults hold Ollama/SGLang to a single
+  model worker while still allowing bounded tool and web fan-out — one 8B model
+  does not get eight concurrent requests
+- **Failure absorption**: malformed tool calls, truncated sequences, and
+  transient provider errors are retried or repaired below the harness, which is
+  what keeps a weak model from silently reporting success
+
 ### Multi-Provider Proxy
 - **7 providers**: Anthropic, OpenAI, Gemini, Groq, Ollama, GitHub Copilot, z.ai (Grok)
 - **Auth passthrough**: CLI tools send their own API keys through AniClew transparently
@@ -25,16 +58,32 @@ AniClew sits between your coding CLI tools and LLM providers, giving you multi-p
 
 ### Coding Agent
 - **Tool-using agent**: Bash, Read, Write, Edit, Glob, Grep
-- **Thinking model support**: qwen3, DeepSeek-R1 reasoning in collapsible blocks
 - **23 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
 - **60+ read-only allowlist**: Per-command flag validation for safe auto-approval
 - **Parallel tool execution**: Read-only tools run concurrently, write tools serial
 - **Verification receipts**: File-changing runs write compact JSON proof under `~/.claude-proxy/receipts/`
-- **Context auto-compaction**: LLM-based summarization with snip fallback + circuit breaker
+
+### Account & Quota Scheduling
+
+Applies to hosted accounts; local models skip most of it.
+
+- **Per-account quota windows**: five-hour and seven-day usage tracked separately
+  per account, not just a global rate limit
+- **Health-aware selection**: accounts are scored and only eligible ones are
+  picked; unhealthy accounts are skipped rather than retried into the ground
+- **Soft vs hard cooldown**: a 429 quota cooldown survives later successes; a
+  transient 5xx only triggers a short avoidance window
+- **Escalating backoff**: repeated transient failures step 30s to 2m to 10m to
+  30m, and an account recovers only after two consecutive successes
+- **Session leases**: a run sticks to its account for continuity and is
+  re-evaluated on a fixed interval instead of every request
+- **Deterministic rotation**: when every account is stale, selection round-robins
+  instead of hammering the same one
+- **Quota collectors**: file or HTTP snapshots update scheduler state without
+  hand-editing config
 
 ### Multi-Agent Teams
 - **TeamPlan contract**: Provider-neutral Daedalus-style plan with AgentTask, AgentSpec, stages, dependencies, and evidence criteria
-- **Capacity scheduling**: Local-model defaults keep Ollama/SGLang to one model worker while allowing bounded tool/web fan-out
 - **Resource-aware waves**: Team waves are internally batched by model/tool/web/test slots and file-scope locks
 - **Task routing**: TeamPlan tasks can override provider/model for role-specific execution
 - **Team dashboard**: The web Team page submits objectives, verification commands, capacity, per-task kind/role/provider/model, read-only mode, dependencies, file scopes, and resource reservations
@@ -175,17 +224,20 @@ OPENAI_BASE_URL=http://localhost:4000 codex
 ## Architecture
 
 ```
-CLI Tools (Claude/Codex/Gemini)
+CLI Tools (Claude Code / Codex / Gemini)   <- unchanged
         |
-        v
+        v   ANTHROPIC_BASE_URL / OPENAI_BASE_URL
   +-----------+     +---------+
   |  AniClew  | <-> | Web UI  |
   +-----------+     +---------+
-   |    |    |
-   v    v    v
-Anthropic OpenAI Ollama ...
    |
-   +-- Agent Loop (tools, hooks, permissions)
+   +-- Translate (Anthropic <-> OpenAI, streaming, tool frames)
+   +-- Agent Loop (tools, hooks, permissions, compaction)
+   +-- Runtime Plane (accounts, 5h/7d windows, cooldowns, leases)
+   |    |    |
+   |    v    v
+   | Ollama SGLang Anthropic OpenAI ...
+   |
    +-- KAIROS Daemon (cron, git-watch)
    +-- Team (waves, mailbox, worktree)
    +-- Observability (traces, metrics, feedback)
@@ -197,6 +249,10 @@ Anthropic OpenAI Ollama ...
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/messages` | Anthropic-compatible proxy |
+| `GET /api/runtime` | Runtime status: accounts, routing, quota windows |
+| `GET /api/runtime/telemetry` | Account health, cooldowns, selection telemetry |
+| `GET/POST /api/runtime/quota-sources` | Quota collectors (file / HTTP) |
+| `POST /api/runtime/quota-sources/test` | Validate a collector before saving |
 | `GET/PUT /api/config` | Provider & settings |
 | `GET/POST/DELETE /api/projects` | Project management |
 | `GET /api/tree` | File tree |
@@ -222,10 +278,9 @@ Anthropic OpenAI Ollama ...
 
 ## Stats
 
-- **17,871 lines** Go backend
-- **214 tests** across 4 packages
-- **95% technical fidelity**
-- **11 runtime-verified features**
+- **43,300 lines** Go
+- **302 test functions** across 18 internal packages
+- `go build ./... && go vet ./... && go test ./...` green as of 2026-07-25
 
 ## License
 
