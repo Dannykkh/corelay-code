@@ -282,35 +282,71 @@ OPENAI_BASE_URL=http://localhost:4000 codex
 
 ## API
 
+The server exposes 106 routes; these are the ones worth knowing. The rest are
+reachable and stable, just narrower — browse `internal/server` for the full set.
+
+**Entry points**
+
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/messages` | Anthropic-compatible proxy |
-| `GET /api/runtime` | Runtime status: accounts, routing, quota windows |
-| `GET /api/runtime/telemetry` | Account health, cooldowns, selection telemetry |
-| `GET/POST /api/runtime/quota-sources` | Quota collectors (file / HTTP) |
-| `POST /api/runtime/quota-sources/test` | Validate a collector before saving |
-| `GET/PUT /api/config` | Provider & settings |
-| `GET/POST/DELETE /api/projects` | Project management |
-| `GET /api/tree` | File tree |
-| `GET /api/file` | File content |
-| `GET/POST /api/sessions` | Chat sessions |
-| `POST /api/agent` | Coding agent (SSE) |
+| `POST /v1/messages` | Anthropic-compatible proxy — the CLI path |
+| `POST /api/agent` | Coding agent, SSE — the own-agent path |
 | `POST /api/team` | Team execution (SSE) |
 | `POST /api/chronos` | Autonomous loop (SSE) |
-| `GET /api/run-traces` | Agentic run traces |
-| `POST /api/run-traces/{id}/regression` | Promote failed run trace to regression case |
-| `GET /api/regressions` | Regression cases |
-| `POST /api/regressions/{id}/run` | Replay regression case |
-| `GET /api/regression-runs` | Regression replay attempts |
-| `GET/POST /api/kairos/*` | Daemon control |
-| `GET /api/traces` | Request traces |
-| `GET /api/metrics` | Computed metrics |
-| `GET/POST /api/feedback` | Response quality |
+| `GET /health` | Liveness, active provider and model |
+| `GET /app`, `GET /dashboard` | Web UI |
+
+**Runtime plane**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/runtime` | Accounts, routing, quota windows |
+| `GET /api/runtime/telemetry` | Account health, cooldowns, selection telemetry |
+| `GET/POST/DELETE /api/runtime/quota-sources` | Quota collectors (file / HTTP) |
+| `POST /api/runtime/quota-sources/test` | Validate a collector before saving |
+| `GET /api/providers` | Available providers and models |
+| `GET /api/routes` | Router rules and previews |
+
+**Workspace**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET/PUT /api/config` | Provider and settings |
+| `GET/POST/DELETE /api/projects` | Project management |
+| `GET/PUT /api/workspace` | Active workspace |
+| `GET /api/tree`, `GET /api/file` | File tree and contents |
+| `GET/POST /api/sessions` | Chat sessions |
+
+**Harness surfaces**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/agent-types` | Available agent types |
+| `GET /api/commands` | Slash commands |
+| `GET /api/skills` | Loaded skills |
 | `GET /api/hooks` | Loaded hooks |
 | `GET /api/permissions` | Permission snapshot |
-| `GET /api/agent-types` | Available agent types |
-| `GET /api/worktrees` | Git worktrees |
 | `GET /api/mcp` | MCP servers |
+| `GET /api/memory`, `GET /api/memory/search` | Project memory |
+| `GET /api/workstreams` | Workstreams and handoffs |
+| `GET /api/plan` | Plan-mode state |
+
+**Observability**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/usage` | Requests and tokens per provider/model |
+| `GET /api/metrics` | Latency, error rate, per-provider breakdown |
+| `GET /api/traces` | Request traces |
+| `GET /api/run-traces` | Agentic run traces |
+| `POST /api/run-traces/{id}/regression` | Promote a failed run into a regression case |
+| `GET /api/regressions` | Regression cases |
+| `POST /api/regressions/{id}/run` | Replay a regression case |
+| `GET /api/regression-runs` | Replay attempts |
+| `GET /api/evidence/policy`, `GET /api/evidence/recent` | Evidence Gate policy and receipts |
+| `GET/POST /api/feedback` | Response quality |
+| `GET/POST /api/kairos/*` | Daemon control |
+| `GET /api/worktrees` | Git worktrees |
 
 ## Stats
 
