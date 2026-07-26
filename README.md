@@ -69,7 +69,7 @@ router's job; this is what it takes to get one to *finish*.
   the web UI
 
 ### Proxy (bring your own CLI)
-- **7 providers**: Anthropic, OpenAI, Gemini, Groq, Ollama, GitHub Copilot, z.ai (Grok)
+- **8 providers**: Anthropic, OpenAI, Gemini, Groq, Ollama, SGLang, GitHub Copilot, z.ai (Grok)
 - **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
   converted both ways, including streaming and tool-call frames
 - **Nothing else changes**: env vars are the only edit. Slash commands,
@@ -84,8 +84,8 @@ router's job; this is what it takes to get one to *finish*.
 
 ### Coding Agent
 - **Tool-using agent**: Bash, Read, Write, Edit, Glob, Grep
-- **23 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
-- **60+ read-only allowlist**: Per-command flag validation for safe auto-approval
+- **22 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
+- **115-command read-only allowlist**: Per-command flag validation for safe auto-approval
 - **Parallel tool execution**: Read-only tools run concurrently, write tools serial
 - **Verification receipts**: File-changing runs write compact JSON proof under `~/.aniclew/receipts/`
 
@@ -314,9 +314,9 @@ OPENAI_BASE_URL=http://localhost:4000 codex
 
 ## Stats
 
-- **43,300 lines** Go
-- **302 test functions** across 18 internal packages
-- `go build ./... && go vet ./... && go test ./...` green as of 2026-07-25
+- **43,385 lines** Go
+- **315 test functions** across 18 internal packages
+- `go build ./... && go vet ./... && go test ./...` green as of 2026-07-26
 
 ## License
 
