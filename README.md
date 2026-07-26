@@ -1,20 +1,22 @@
 # AniClew
 
-**Run Claude Code on your own models.**
+**Small models, finished work.**
 
-Point Claude Code — or Codex CLI, or Gemini CLI — at AniClew and it keeps
-working: same commands, same subagents, same skills, same project memory. Behind
-it, the model can be Ollama, SGLang, or anything else you host.
+AniClew is a coding agent and control plane for models you run yourself.
 
-The hard part is not translating an API. It is that a local model fails
-differently. It emits a tool call with the wrong shape, stops mid-sequence, or
-quietly runs past its context window — and a harness built for a hosted model
-reads that as success. AniClew absorbs those failures in the runtime layer so
-the harness never sees them.
+A 12B model does not fail by being stupid. It misquotes the line it wants to
+edit, forgets the change it made two steps ago, and hands back a tool call in
+the wrong shape. Left alone it stalls on any of those. AniClew catches them and
+returns something the model can act on — where the text actually is, what the
+test actually printed, which edit was rolled back and why — so the run finishes.
 
-Everything else here — multi-provider routing, account and quota scheduling,
-teams, the daemon, observability — exists to keep that substitution working
-under real use.
+Measured on `gemma4:12b-it-qat`: two bugs across two files, the second hidden
+behind the first, and a prompt that names no file and gives no order. Ten runs,
+ten completions. Details and limits in
+[docs/measurements](docs/measurements/local-model-edit-hint.md).
+
+It is also a proxy. Point an existing CLI at it to reach any provider through
+one endpoint, with account pooling and quota windows for hosted models.
 
 ## Screenshots
 
@@ -26,35 +28,55 @@ under real use.
 |--------------|----------|
 | ![Kairos](docs/screenshots/kairos.png) | ![Costs](docs/screenshots/costs.png) |
 
+## Two ways to use it
+
+The two entry points do not share a loop, and that distinction matters more than
+any feature below.
+
+| | Own agent | Proxy |
+|---|---|---|
+| Entry | Web UI, `/api/agent` | `/v1/messages`, your CLI |
+| Owns the loop | AniClew | your CLI |
+| Built for | models you host | any provider |
+| Gets the hardening below | yes | partly — request shaping and routing only |
+
+Everything in **Agent Hardening** happens inside AniClew's own loop. A CLI
+pointed at the proxy runs its own loop, so it sees translation, routing, tool
+pruning and retries — but not the edit repair or compaction.
+
 ## Features
 
-### Local Model Runtime
+### Agent Hardening (own agent, local models)
 
-Where most of this project's work went. A router gets a local model *answering*;
-this is what it takes to make one usable through a real coding harness.
+Where most of this project's work went. Getting a local model to *answer* is a
+router's job; this is what it takes to get one to *finish*.
 
-- **Harness stays put**: env vars are the only change. Slash commands, subagents,
-  skills, hooks, and project memory keep working
-- **No silent hijack**: `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` makes Claude Code
-  ignore provider settings left in `~/.claude/settings.json` by other proxy tools,
-  so a stale base URL cannot quietly take routing back. Model slots set there are
-  dropped as well — the model comes from AniClew
-- **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
-  converted both ways, including streaming and tool-call frames
-- **Thinking models**: qwen3 and DeepSeek-R1 reasoning is parsed out of the
-  stream rather than leaking into the answer, and shown as collapsible blocks in
-  the web UI
+- **Failure absorption**: malformed tool calls and truncated sequences are
+  repaired rather than passed along as success
+- **Edit repair**: a failed edit comes back with the lines it probably meant and
+  their numbers, so a misquote is correctable instead of a dead end
+- **Lint gate**: an edit that breaks syntax is rolled back and reported, and the
+  model retries against the real error
 - **Context auto-compaction**: LLM-based summarization with a snip fallback and a
   circuit breaker, so a long run degrades instead of dying at the window edge
+- **Per-model profiles**: tool budget and temperature by model, with tool lists
+  pruned so a small model is not handed thirty options
 - **Capacity-aware execution**: local defaults hold Ollama/SGLang to a single
   model worker while still allowing bounded tool and web fan-out — one 8B model
   does not get eight concurrent requests
-- **Failure absorption**: malformed tool calls, truncated sequences, and
-  transient provider errors are retried or repaired below the harness, which is
-  what keeps a weak model from silently reporting success
+- **Thinking models**: qwen3 and DeepSeek-R1 reasoning is parsed out of the
+  stream rather than leaking into the answer, and shown as collapsible blocks in
+  the web UI
 
-### Multi-Provider Proxy
+### Proxy (bring your own CLI)
 - **7 providers**: Anthropic, OpenAI, Gemini, Groq, Ollama, GitHub Copilot, z.ai (Grok)
+- **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
+  converted both ways, including streaming and tool-call frames
+- **Nothing else changes**: env vars are the only edit. Slash commands,
+  subagents, skills, hooks, and project memory keep working
+- **No silent hijack**: setting `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` makes the
+  CLI ignore provider settings left in its own config by other proxy tools, so a
+  stale base URL cannot quietly take routing back
 - **Auth passthrough**: CLI tools send their own API keys through AniClew transparently
 - **Runtime switching**: Change provider/model without restarting
 - **Smart retry**: Exponential backoff with jitter, 529 fallback model switching
@@ -199,10 +221,10 @@ Browser opens at `http://localhost:4000/app`.
 ### Connect your CLI tools
 
 ```bash
-# Claude Code → AniClew → any model
+# Anthropic-compatible CLI → AniClew → any provider
 ANTHROPIC_BASE_URL=http://localhost:4000 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude
 
-# Codex CLI → AniClew → any model
+# OpenAI-compatible CLI → AniClew → any provider
 OPENAI_BASE_URL=http://localhost:4000 codex
 ```
 
@@ -228,20 +250,30 @@ OPENAI_BASE_URL=http://localhost:4000 codex
 ## Architecture
 
 ```
-CLI Tools (Claude Code / Codex / Gemini)   <- unchanged
-        |
-        v   ANTHROPIC_BASE_URL / OPENAI_BASE_URL
-  +-----------+     +---------+
-  |  AniClew  | <-> | Web UI  |
-  +-----------+     +---------+
-   |
-   +-- Translate (Anthropic <-> OpenAI, streaming, tool frames)
-   +-- Agent Loop (tools, hooks, permissions, compaction)
-   +-- Runtime Plane (accounts, 5h/7d windows, cooldowns, leases)
-   |    |    |
-   |    v    v
-   | Ollama SGLang Anthropic OpenAI ...
-   |
+  Web UI / API                      Your CLI (unchanged)
+       |                                  |
+       | /api/agent                       | /v1/messages
+       |                                  |   ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+       v                                  v
+  +----------------------+     +----------------------+
+  |     Agent Loop       |     |      Translate       |
+  |  tools, permissions  |     | Anthropic <-> OpenAI |
+  |  edit repair, lint   |     |  streaming, tools    |
+  |  compaction, hooks   |     |  tool pruning        |
+  +----------------------+     +----------------------+
+       |                                  |
+       +----------------+-----------------+
+                        v
+          +-------------------------------+
+          |         Runtime Plane         |
+          | accounts, 5h/7d windows,      |
+          | cooldowns, leases, routing    |
+          +-------------------------------+
+                        |
+                        v
+           Ollama  SGLang  Anthropic  OpenAI  ...
+
+  AniClew also runs:
    +-- KAIROS Daemon (cron, git-watch)
    +-- Team (waves, mailbox, worktree)
    +-- Observability (traces, metrics, feedback)
