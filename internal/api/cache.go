@@ -132,17 +132,6 @@ func ShouldCache(strategy CacheStrategy, model string) bool {
 	return true
 }
 
-// CacheSavingsEstimate estimates cost savings from cache usage.
-func CacheSavingsEstimate(model string, cacheReadTokens int) float64 {
-	pricing, ok := PricingTable[model]
-	if !ok {
-		return 0
-	}
-	// Savings = (full input price - cache read price) * tokens
-	savings := (pricing.InputPerMillion - pricing.CacheReadPerMillion) * float64(cacheReadTokens) / 1_000_000
-	return savings
-}
-
 // ── Keep-alive for cache warmth ──
 
 // CacheKeepAlive tracks when the last request was made to maintain cache warmth.

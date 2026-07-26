@@ -14,7 +14,7 @@ type Router struct {
 	config        RouterConfig
 	providerCache map[string]types.Provider
 	providerCfgs  map[string]*types.ProviderConfig
-	costs         map[string]*CostEntry // key: "provider/model"
+	usage         map[string]*UsageEntry // key: "provider/model"
 }
 
 func New(cfg *RouterConfig, provCfgs map[string]*types.ProviderConfig) *Router {
@@ -29,7 +29,7 @@ func New(cfg *RouterConfig, provCfgs map[string]*types.ProviderConfig) *Router {
 		config:        *cfg,
 		providerCache: map[string]types.Provider{},
 		providerCfgs:  provCfgs,
-		costs:         map[string]*CostEntry{},
+		usage:         map[string]*UsageEntry{},
 	}
 }
 
@@ -112,43 +112,31 @@ func (r *Router) SetRule(role RoleID, provider, model string, fallback *Target) 
 	log.Printf("Rule added: [%s] → %s/%s", role, provider, model)
 }
 
-// TrackUsage records cost for a request.
+// TrackUsage records traffic for a request.
 func (r *Router) TrackUsage(provider, model string, outputTokens int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	key := fmt.Sprintf("%s/%s", provider, model)
-	entry, ok := r.costs[key]
+	entry, ok := r.usage[key]
 	if !ok {
-		entry = &CostEntry{Provider: provider, Model: model}
-		r.costs[key] = entry
+		entry = &UsageEntry{Provider: provider, Model: model}
+		r.usage[key] = entry
 	}
 	entry.Requests++
 	entry.Tokens += outputTokens
-	entry.Cost += estimateCost(provider, model, outputTokens)
 }
 
-// GetCostSummary returns all cost entries sorted by cost descending.
-func (r *Router) GetCostSummary() []CostEntry {
+// GetUsageSummary returns per provider/model traffic counts.
+func (r *Router) GetUsageSummary() []UsageEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	result := make([]CostEntry, 0, len(r.costs))
-	for _, e := range r.costs {
+	result := make([]UsageEntry, 0, len(r.usage))
+	for _, e := range r.usage {
 		result = append(result, *e)
 	}
 	return result
-}
-
-// GetTotalCost returns total cost across all models.
-func (r *Router) GetTotalCost() float64 {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	var total float64
-	for _, e := range r.costs {
-		total += e.Cost
-	}
-	return total
 }
 
 // GetConfig returns current config.
@@ -165,32 +153,4 @@ func (r *Router) findRule(role RoleID) *RouteRule {
 		}
 	}
 	return nil
-}
-
-// Price per 1M output tokens
-var prices = map[string]float64{
-	"ollama/":                        0,
-	"openai/gpt-4o":                  15,
-	"openai/gpt-4o-mini":             0.6,
-	"openai/o3":                      40,
-	"anthropic/claude-opus-4-20250514":   75,
-	"anthropic/claude-sonnet-4-20250514": 15,
-	"anthropic/claude-haiku-4-20250506":  5,
-	"gemini/gemini-2.5-pro-preview-05-06":  10,
-	"gemini/gemini-2.5-flash-preview-05-20": 1.5,
-	"groq/":                          0.5,
-	"zai/grok-3":                     10,
-}
-
-func estimateCost(provider, model string, outputTokens int) float64 {
-	key := fmt.Sprintf("%s/%s", provider, model)
-	if p, ok := prices[key]; ok {
-		return float64(outputTokens) / 1_000_000 * p
-	}
-	// Try prefix
-	prefix := provider + "/"
-	if p, ok := prices[prefix]; ok {
-		return float64(outputTokens) / 1_000_000 * p
-	}
-	return float64(outputTokens) / 1_000_000 * 5 // default
 }

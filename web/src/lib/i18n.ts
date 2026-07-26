@@ -5,7 +5,7 @@ const translations = {
   'nav.chat': { ko: '채팅', en: 'Chat' },
   'nav.settings': { ko: '설정', en: 'Settings' },
   'nav.routes': { ko: '라우팅 규칙', en: 'Routes' },
-  'nav.costs': { ko: '비용', en: 'Costs' },
+  'nav.costs': { ko: '활동', en: 'Activity' },
   'nav.kairos': { ko: 'KAIROS', en: 'KAIROS' },
   'nav.workspace': { ko: '워크스페이스', en: 'Workspace' },
   'nav.explorer': { ko: '파일 탐색기', en: 'Explorer' },
@@ -56,8 +56,7 @@ const translations = {
   'routes.fallback': { ko: '폴백', en: 'Fallback' },
 
   // ── Costs ──
-  'costs.title': { ko: '비용 분석', en: 'Cost Breakdown' },
-  'costs.total': { ko: '총 비용', en: 'Total Cost' },
+  'costs.title': { ko: '사용량 분석', en: 'Usage Breakdown' },
   'costs.requests': { ko: '요청 수', en: 'Requests' },
   'costs.modelsUsed': { ko: '사용 모델', en: 'Models Used' },
   'costs.noData': { ko: '아직 요청이 없습니다', en: 'No requests yet' },

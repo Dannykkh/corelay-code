@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { fetchJSON, type CostEntry } from '../lib/api';
+import { fetchJSON, type UsageEntry } from '../lib/api';
 
 type RunTrace = {
   id: string;
@@ -47,7 +47,6 @@ type RegressionRun = {
 type ProviderMetrics = {
   requests: number;
   avgLatencyMs: number;
-  cost: number;
   errors: number;
 };
 
@@ -112,7 +111,7 @@ function regressionReplayTitle(c: RegressionCase): string {
 }
 
 export function CostsPage() {
-  const [costs, setCosts] = useState<{ total: number; breakdown: CostEntry[] }>({ total: 0, breakdown: [] });
+  const [usage, setUsage] = useState<{ breakdown: UsageEntry[] }>({ breakdown: [] });
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [traces, setTraces] = useState<RequestTrace[]>([]);
   const [runTraces, setRunTraces] = useState<RunTrace[]>([]);
@@ -133,7 +132,7 @@ export function CostsPage() {
 
   async function load() {
     const [c, m, t, rt, rc, rr, f] = await Promise.all([
-      fetchJSON<{ total: number; breakdown: CostEntry[] }>('/api/costs').catch(() => ({ total: 0, breakdown: [] })),
+      fetchJSON<{ breakdown: UsageEntry[] }>('/api/usage').catch(() => ({ breakdown: [] })),
       fetchJSON<Metrics>('/api/metrics?window=60').catch(() => null),
       fetchJSON<RequestTrace[]>('/api/traces?limit=20').catch(() => []),
       fetchJSON<RunTrace[]>('/api/run-traces?limit=40').catch(() => []),
@@ -141,7 +140,7 @@ export function CostsPage() {
       fetchJSON<RegressionRun[]>('/api/regression-runs?limit=40').catch(() => []),
       fetchJSON<FeedbackStats>('/api/feedback').catch(() => null),
     ]);
-    setCosts(c);
+    setUsage(c);
     setMetrics(m);
     setTraces(Array.isArray(t) ? t : []);
     setRunTraces(Array.isArray(rt) ? rt : []);
@@ -189,7 +188,7 @@ export function CostsPage() {
     }
   }
 
-  const maxCost = Math.max(...costs.breakdown.map((b) => b.cost), 0.001);
+  const maxTokens = Math.max(...usage.breakdown.map((b) => b.tokens), 1);
   const failedRuns = runTraces.filter((t) => t.status === 'failed').slice().reverse().slice(0, 6);
   const recentAgenticRuns = runTraces.slice().reverse().slice(0, 8);
   const latestRegressionRuns = regressionRuns.slice().reverse().slice(0, 8);
@@ -202,14 +201,10 @@ export function CostsPage() {
   return (
     <div className="p-6 w-full overflow-y-auto h-full">
       <h1 className="text-xl font-semibold mb-1">Activity</h1>
-      <p className="text-sm text-[var(--color-text2)] mb-6">How your AI is being used — requests, speed, costs, and quality</p>
+      <p className="text-sm text-[var(--color-text2)] mb-6">How your AI is being used — requests, speed, and quality</p>
 
       {/* Metrics Cards */}
-      <div className="grid grid-cols-5 gap-3 mb-6">
-        <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-4">
-          <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">Total Cost</div>
-          <div className="text-xl font-bold text-[var(--color-green)]">${costs.total.toFixed(4)}</div>
-        </div>
+      <div className="grid grid-cols-4 gap-3 mb-6">
         <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-4">
           <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">Requests (1h)</div>
           <div className="text-xl font-bold text-[var(--color-accent)]">{metrics?.totalRequests || 0}</div>
@@ -243,7 +238,6 @@ export function CostsPage() {
                   <div className="flex gap-4 text-xs text-[var(--color-text2)]">
                     <span>{pm.requests} reqs</span>
                     <span>{pm.avgLatencyMs}ms</span>
-                    <span>${pm.cost.toFixed(4)}</span>
                     {pm.errors > 0 && <span className="text-[var(--color-red)]">{pm.errors} err</span>}
                   </div>
                 </div>
@@ -286,7 +280,7 @@ export function CostsPage() {
         </div>
       </div>
 
-      {/* Cost Table */}
+      {/* Usage Table */}
       <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl overflow-hidden mb-6">
         <table className="w-full">
           <thead>
@@ -294,23 +288,21 @@ export function CostsPage() {
               <th className="text-left px-4 py-3">Provider / Model</th>
               <th className="text-left px-4 py-3">Requests</th>
               <th className="text-left px-4 py-3">Tokens</th>
-              <th className="text-left px-4 py-3">Cost</th>
               <th className="text-left px-4 py-3">Share</th>
             </tr>
           </thead>
           <tbody>
-            {costs.breakdown.length === 0 ? (
-              <tr><td colSpan={5} className="text-center py-6 text-[var(--color-text2)] text-sm">No requests yet</td></tr>
+            {usage.breakdown.length === 0 ? (
+              <tr><td colSpan={4} className="text-center py-6 text-[var(--color-text2)] text-sm">No requests yet</td></tr>
             ) : (
-              costs.breakdown.map((b) => (
+              usage.breakdown.map((b) => (
                 <tr key={`${b.provider}/${b.model}`} className="border-t border-[var(--color-border)]">
                   <td className="px-4 py-2.5 text-sm">{b.provider}/{b.model}</td>
                   <td className="px-4 py-2.5 text-sm">{b.requests}</td>
                   <td className="px-4 py-2.5 text-sm">{b.tokens.toLocaleString()}</td>
-                  <td className="px-4 py-2.5 text-sm">${b.cost.toFixed(4)}</td>
                   <td className="px-4 py-2.5 w-32">
                     <div className="h-4 bg-[var(--color-bg)] rounded overflow-hidden">
-                      <div className="h-full bg-[var(--color-accent)] rounded" style={{ width: `${(b.cost / maxCost) * 100}%` }} />
+                      <div className="h-full bg-[var(--color-accent)] rounded" style={{ width: `${(b.tokens / maxTokens) * 100}%` }} />
                     </div>
                   </td>
                 </tr>

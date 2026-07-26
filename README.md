@@ -24,9 +24,9 @@ one endpoint, with account pooling and quota windows for hosted models.
 |------|----------------|
 | ![Chat](docs/screenshots/chat.png) | ![Projects](docs/screenshots/project-browser.png) |
 
-| KAIROS Daemon | Observability |
+| KAIROS Daemon | Activity |
 |--------------|----------|
-| ![Kairos](docs/screenshots/kairos.png) | ![Costs](docs/screenshots/costs.png) |
+| ![Kairos](docs/screenshots/kairos.png) | ![Activity](docs/screenshots/costs.png) |
 
 ## Two ways to use it
 
@@ -139,7 +139,7 @@ Applies to hosted accounts; local models skip most of it.
 - **Per-project**: Tasks and memory isolated per workspace
 
 ### Observability
-- **Request tracing**: Per-request provider, model, latency, tokens, cost (JSONL persistence)
+- **Request tracing**: Per-request provider, model, latency, tokens (JSONL persistence)
 - **Agentic run traces**: Chronos and Team runs record durable run traces with spans, receipts, and workstream metadata
 - **Regression replay**: Failed Chronos/Team traces can be promoted into regression cases and replayed from captured task inputs or Team receipts
 - **Metrics**: Average/P95 latency, error rate, requests/min, per-provider breakdown

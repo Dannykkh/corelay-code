@@ -21,8 +21,6 @@ type User struct {
 	Token     string   `json:"token"`
 	Role      string   `json:"role"` // "admin", "developer", "viewer"
 	AllowedProviders []string `json:"allowedProviders,omitempty"` // empty = all
-	MonthlyBudget    float64  `json:"monthlyBudget"`
-	CurrentSpend     float64  `json:"currentSpend"`
 	Enabled   bool     `json:"enabled"`
 }
 
@@ -34,11 +32,10 @@ type AuditEntry struct {
 	Model    string    `json:"model"`
 	Role     string    `json:"role"` // routing role
 	Tokens   int       `json:"tokens"`
-	Cost     float64   `json:"cost"`
 	Masked   bool      `json:"masked"` // PII was masked
 }
 
-// Gateway manages team access, budgets, and auditing.
+// Gateway manages team access and auditing.
 type Gateway struct {
 	mu     sync.RWMutex
 	users  map[string]*User // token -> user
@@ -60,7 +57,7 @@ func New(baseDir string) *Gateway {
 }
 
 // AddUser creates a new team user.
-func (g *Gateway) AddUser(name, role string, budget float64, allowed []string) *User {
+func (g *Gateway) AddUser(name, role string, allowed []string) *User {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -71,7 +68,6 @@ func (g *Gateway) AddUser(name, role string, budget float64, allowed []string) *
 		Token:            token,
 		Role:             role,
 		AllowedProviders: allowed,
-		MonthlyBudget:    budget,
 		Enabled:          true,
 	}
 	g.users[token] = user
@@ -108,16 +104,6 @@ func (g *Gateway) Authenticate(r *http.Request) (*User, error) {
 	return user, nil
 }
 
-// CheckBudget returns true if the user has budget remaining.
-func (g *Gateway) CheckBudget(user *User) bool {
-	if user.MonthlyBudget <= 0 {
-		return true // no limit
-	}
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return user.CurrentSpend < user.MonthlyBudget
-}
-
 // CheckProvider returns true if the user is allowed to use this provider.
 func (g *Gateway) CheckProvider(user *User, provider string) bool {
 	if len(user.AllowedProviders) == 0 {
@@ -131,19 +117,11 @@ func (g *Gateway) CheckProvider(user *User, provider string) bool {
 	return false
 }
 
-// RecordUsage adds cost to user and audit log.
-func (g *Gateway) RecordUsage(userID, provider, model, role string, tokens int, cost float64) {
+// RecordUsage appends an audit entry for a completed request.
+func (g *Gateway) RecordUsage(userID, provider, model, role string, tokens int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Update user spend
-	for _, u := range g.users {
-		if u.ID == userID {
-			u.CurrentSpend += cost
-		}
-	}
-
-	// Audit log
 	g.audit = append(g.audit, AuditEntry{
 		Time:     time.Now(),
 		UserID:   userID,
@@ -151,7 +129,6 @@ func (g *Gateway) RecordUsage(userID, provider, model, role string, tokens int, 
 		Model:    model,
 		Role:     role,
 		Tokens:   tokens,
-		Cost:     cost,
 	})
 
 	// Trim old entries

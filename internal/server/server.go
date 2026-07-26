@@ -220,7 +220,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("PUT /api/config", s.handleSetConfig)
 	mux.HandleFunc("GET /api/routes", s.handleGetRoutes)
 	mux.HandleFunc("PUT /api/routes", s.handleSetRoute)
-	mux.HandleFunc("GET /api/costs", s.handleGetCosts)
+	mux.HandleFunc("GET /api/usage", s.handleGetUsage)
 	// KAIROS daemon
 	// Hooks & Permissions
 	mux.HandleFunc("GET /api/hooks", s.handleListHooks)
@@ -429,10 +429,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if user != nil {
 			gwUser = user
-			if !gw.CheckBudget(user) {
-				writeError(w, 429, "Monthly budget exceeded. Contact admin.")
-				return
-			}
 		}
 	}
 
@@ -628,22 +624,15 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Calculate accurate cost
-	cost := apiPkg.CalculateCost(model, apiPkg.TokenUsage{
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-	})
 	recordRuntimeSuccess(telemetry, provider, target, inputTokens, outputTokens)
 
-	// Record cost
 	if rt != nil {
 		rt.TrackUsage(provider.Name(), model, outputTokens)
 	}
 
 	// Gateway audit
 	if gw != nil && gwUser != nil {
-		cost := float64(outputTokens) / 1_000_000 * 5 // rough estimate
-		gw.RecordUsage(gwUser.ID, provider.Name(), model, "", outputTokens, cost)
+		gw.RecordUsage(gwUser.ID, provider.Name(), model, "", outputTokens)
 	}
 
 	// Observability trace
@@ -661,7 +650,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			LatencyMs:    latency,
 			InputTokens:  len(req.Messages) * 100, // estimate
 			OutputTokens: outputTokens,
-			Cost:         cost,
 			Status:       "ok",
 			Source:       source,
 			WorkDir:      wd,
@@ -1217,17 +1205,16 @@ func (s *Server) handleSetRoute(w http.ResponseWriter, r *http.Request) {
 
 // ── Costs API ──
 
-func (s *Server) handleGetCosts(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleGetUsage(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	rt := s.router
 	s.mu.RUnlock()
 	if rt == nil {
-		writeJSON(w, map[string]any{"total": 0, "breakdown": []any{}})
+		writeJSON(w, map[string]any{"breakdown": []any{}})
 		return
 	}
 	writeJSON(w, map[string]any{
-		"total":     rt.GetTotalCost(),
-		"breakdown": rt.GetCostSummary(),
+		"breakdown": rt.GetUsageSummary(),
 	})
 }
 
@@ -1251,9 +1238,6 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 		"model":    s.activeModel,
 		"router":   s.router != nil,
 		"hint":     fmt.Sprintf("Set ANTHROPIC_BASE_URL=http://localhost:%d and CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 to use with your CLI tool", s.port),
-	}
-	if s.router != nil {
-		result["totalCost"] = fmt.Sprintf("$%.4f", s.router.GetTotalCost())
 	}
 	writeJSON(w, result)
 }
@@ -3355,14 +3339,13 @@ func (s *Server) handleGatewayAddUser(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name    string   `json:"name"`
 		Role    string   `json:"role"`
-		Budget  float64  `json:"budget"`
 		Allowed []string `json:"allowedProviders"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
 		return
 	}
-	user := gw.AddUser(body.Name, body.Role, body.Budget, body.Allowed)
+	user := gw.AddUser(body.Name, body.Role, body.Allowed)
 	writeJSON(w, user)
 }
 

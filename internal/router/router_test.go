@@ -149,14 +149,14 @@ func TestTrackUsage(t *testing.T) {
 	r.TrackUsage("ollama", "qwen3:14b", 1000)
 	r.TrackUsage("ollama", "qwen3:14b", 500)
 
-	costs := r.GetCostSummary()
-	if len(costs) != 1 {
-		t.Fatalf("Expected 1 cost entry, got %d", len(costs))
+	usage := r.GetUsageSummary()
+	if len(usage) != 1 {
+		t.Fatalf("Expected 1 usage entry, got %d", len(usage))
 	}
-	if costs[0].Requests != 2 {
-		t.Errorf("Expected 2 requests, got %d", costs[0].Requests)
+	if usage[0].Requests != 2 {
+		t.Errorf("Expected 2 requests, got %d", usage[0].Requests)
 	}
-	if costs[0].Tokens != 1500 {
-		t.Errorf("Expected 1500 tokens, got %d", costs[0].Tokens)
+	if usage[0].Tokens != 1500 {
+		t.Errorf("Expected 1500 tokens, got %d", usage[0].Tokens)
 	}
 }

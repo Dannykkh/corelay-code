@@ -50,12 +50,14 @@ type RouteDecision struct {
 	Reason   string `json:"reason"`
 }
 
-type CostEntry struct {
-	Provider string  `json:"provider"`
-	Model    string  `json:"model"`
-	Requests int     `json:"requests"`
-	Tokens   int     `json:"tokens"`
-	Cost     float64 `json:"cost"`
+// UsageEntry counts traffic per provider/model. Deliberately no cost field:
+// pricing was hardcoded and fell back to a flat $5/M for anything unknown,
+// which meant local models accrued charges they never incurred.
+type UsageEntry struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Requests int    `json:"requests"`
+	Tokens   int    `json:"tokens"`
 }
 
 func DefaultConfig() RouterConfig {

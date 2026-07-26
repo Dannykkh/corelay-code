@@ -35,7 +35,6 @@ type RequestTrace struct {
 	LatencyMs    int64     `json:"latencyMs"`
 	InputTokens  int       `json:"inputTokens"`
 	OutputTokens int       `json:"outputTokens"`
-	Cost         float64   `json:"cost"`
 	Status       string    `json:"status"` // "ok", "error"
 	Error        string    `json:"error,omitempty"`
 	Source       string    `json:"source"` // "web", "claude", "codex", "api"
@@ -74,7 +73,6 @@ type RunSpan struct {
 type Metrics struct {
 	TotalRequests  int                         `json:"totalRequests"`
 	TotalTokens    int                         `json:"totalTokens"`
-	TotalCost      float64                     `json:"totalCost"`
 	AvgLatencyMs   int64                       `json:"avgLatencyMs"`
 	P95LatencyMs   int64                       `json:"p95LatencyMs"`
 	ErrorRate      float64                     `json:"errorRate"`
@@ -84,11 +82,10 @@ type Metrics struct {
 
 // ProviderMetrics is per-provider breakdown.
 type ProviderMetrics struct {
-	Requests     int     `json:"requests"`
-	Tokens       int     `json:"tokens"`
-	Cost         float64 `json:"cost"`
-	AvgLatencyMs int64   `json:"avgLatencyMs"`
-	Errors       int     `json:"errors"`
+	Requests     int   `json:"requests"`
+	Tokens       int   `json:"tokens"`
+	AvgLatencyMs int64 `json:"avgLatencyMs"`
+	Errors       int   `json:"errors"`
 }
 
 // Tracker collects and queries request traces.
@@ -211,7 +208,6 @@ func (t *Tracker) Compute(windowMinutes int) Metrics {
 		}
 		m.TotalRequests++
 		m.TotalTokens += tr.InputTokens + tr.OutputTokens
-		m.TotalCost += tr.Cost
 		totalLatency += tr.LatencyMs
 		latencies = append(latencies, tr.LatencyMs)
 
@@ -226,7 +222,6 @@ func (t *Tracker) Compute(windowMinutes int) Metrics {
 		}
 		pm.Requests++
 		pm.Tokens += tr.InputTokens + tr.OutputTokens
-		pm.Cost += tr.Cost
 		pm.AvgLatencyMs += tr.LatencyMs
 		if tr.Status == "error" {
 			pm.Errors++

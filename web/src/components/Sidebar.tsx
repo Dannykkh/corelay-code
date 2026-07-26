@@ -12,7 +12,7 @@ const items: NavItem[] = [
   { id: 'explorer', labelKey: 'nav.explorer', icon: '📁' },
   { id: 'settings', labelKey: 'nav.settings', icon: '⚙️' },
   { id: 'routes', labelKey: 'nav.routes', icon: '🔀' },
-  { id: 'costs', labelKey: 'nav.costs', icon: '💰' },
+  { id: 'costs', labelKey: 'nav.costs', icon: '📊' },
   { id: 'kairos', labelKey: 'nav.kairos', icon: '🤖' },
   { id: 'memory', labelKey: 'nav.memory', icon: '🧠' },
   { id: 'team', labelKey: 'nav.team', icon: '👥' },

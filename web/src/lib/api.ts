@@ -106,10 +106,9 @@ export interface RouteRule {
   fallback?: { provider: string; model: string };
 }
 
-export interface CostEntry {
+export interface UsageEntry {
   provider: string;
   model: string;
   requests: number;
   tokens: number;
-  cost: number;
 }
