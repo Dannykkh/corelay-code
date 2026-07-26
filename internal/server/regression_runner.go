@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aniclew/aniclew/internal/agent"
+	"github.com/aniclew/aniclew/internal/config"
 	"github.com/aniclew/aniclew/internal/observability"
 	"github.com/aniclew/aniclew/internal/providers"
 	"github.com/aniclew/aniclew/internal/types"
@@ -268,8 +268,7 @@ func (s *Server) handleRunTeamRegressionCase(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	home, _ := os.UserHomeDir()
-	baseDir := filepath.Join(home, ".claude-proxy")
+	baseDir := config.BaseDir()
 	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
 		Name:              plan.Name,
 		VerifyCommand:     plan.VerifyCommand,

@@ -6,18 +6,19 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/aniclew/aniclew/internal/config"
 )
 
 // Checkpoint / undo: before the agent's first edit in a turn the previous undo
 // buffer is cleared (single-level, most-recent-turn undo); each edited file's
 // prior state is backed up once. "/undo" restores them — files the agent
 // created are deleted, files it modified are reverted. Backups live under
-// ~/.claude-proxy/undo/<hash> so the user's workspace stays clean.
+// <state dir>/undo/<hash> so the user's workspace stays clean.
 
 func checkpointDir(workDir string) string {
-	home, _ := os.UserHomeDir()
 	sum := sha1.Sum([]byte(workDir))
-	return filepath.Join(home, ".claude-proxy", "undo", hex.EncodeToString(sum[:10]))
+	return filepath.Join(config.BaseDir(), "undo", hex.EncodeToString(sum[:10]))
 }
 
 type ckptFile struct {

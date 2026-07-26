@@ -38,7 +38,7 @@ type TeamMessage struct {
 // Mailbox manages message passing between agents with file-based persistence.
 type Mailbox struct {
 	mu       sync.RWMutex
-	dir      string // ~/.claude-proxy/projects/<safe>/mailbox/
+	dir      string // <state dir>/projects/<safe>/mailbox/
 	nextID   int
 }
 

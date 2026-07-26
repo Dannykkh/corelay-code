@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -102,8 +101,7 @@ func main() {
 	}
 
 	// ── Initialize all subsystems ──
-	homeDir, _ := os.UserHomeDir()
-	baseDir := filepath.Join(homeDir, ".claude-proxy")
+	baseDir := config.BaseDir()
 
 	// Register custom providers from config
 	for name, settings := range cfg.Providers {

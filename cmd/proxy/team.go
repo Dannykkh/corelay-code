@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -46,7 +45,7 @@ func runTeamRun(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: plan, saved config, or ollama)")
 	model := fs.String("model", "", "Model ID (default: plan, saved config, or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
-	baseDir := fs.String("base-dir", "", "State directory (default: ~/.claude-proxy)")
+	baseDir := fs.String("base-dir", "", "State directory (default: ~/.aniclew)")
 	verifyCommand := fs.String("verify", "", "Override or set plan verification command")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "team: %v\n", err)
@@ -95,8 +94,7 @@ func runTeamRun(args []string) {
 		*workDir = wd
 	}
 	if *baseDir == "" {
-		home, _ := os.UserHomeDir()
-		*baseDir = filepath.Join(home, ".claude-proxy")
+		*baseDir = config.BaseDir()
 	}
 
 	provider, err := providers.Create(*providerName, &types.ProviderConfig{})

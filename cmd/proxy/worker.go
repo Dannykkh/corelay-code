@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -27,7 +26,7 @@ func runWorker(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: saved config or ollama)")
 	model := fs.String("model", "", "Model ID (default: saved config or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
-	baseDir := fs.String("base-dir", "", "State directory (default: ~/.claude-proxy)")
+	baseDir := fs.String("base-dir", "", "State directory (default: ~/.aniclew)")
 	verifyCommand := fs.String("verify", "", "Optional verification command to run after the worker")
 	responseLang := fs.String("lang", "auto", "Response language hint")
 	_ = responseLang // reserved for future per-worker output shaping
@@ -59,8 +58,7 @@ func runWorker(args []string) {
 		*workDir = wd
 	}
 	if *baseDir == "" {
-		home, _ := os.UserHomeDir()
-		*baseDir = filepath.Join(home, ".claude-proxy")
+		*baseDir = config.BaseDir()
 	}
 
 	task, err := workerTask(*taskPath, *prompt)

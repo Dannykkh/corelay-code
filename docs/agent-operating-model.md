@@ -82,7 +82,7 @@ For file-changing work, completion is backed by observable data:
 The loop writes JSON receipts under:
 
 ```text
-~/.claude-proxy/receipts/<workspace-key>/<timestamp>.json
+~/.aniclew/receipts/<workspace-key>/<timestamp>.json
 ```
 
 Receipt schema:
@@ -111,7 +111,7 @@ secrets.
 Team and worker runs use the same workspace namespace and add a `team-` prefix:
 
 ```text
-~/.claude-proxy/receipts/<workspace-key>/team-<timestamp>.json
+~/.aniclew/receipts/<workspace-key>/team-<timestamp>.json
 ```
 
 Team receipts record the run status, TeamPlan identity, provider/model,

@@ -87,7 +87,7 @@ router's job; this is what it takes to get one to *finish*.
 - **23 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
 - **60+ read-only allowlist**: Per-command flag validation for safe auto-approval
 - **Parallel tool execution**: Read-only tools run concurrently, write tools serial
-- **Verification receipts**: File-changing runs write compact JSON proof under `~/.claude-proxy/receipts/`
+- **Verification receipts**: File-changing runs write compact JSON proof under `~/.aniclew/receipts/`
 
 ### Account & Quota Scheduling
 
@@ -230,7 +230,7 @@ OPENAI_BASE_URL=http://localhost:4000 codex
 
 ## Configuration
 
-`~/.claude-proxy/config.json`:
+`~/.aniclew/config.json`:
 
 ```json
 {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+
+	"github.com/aniclew/aniclew/internal/config"
 )
 
 type DangerLevel string
@@ -132,13 +134,13 @@ func CheckPath(path string, workDir string, cfg PermissionConfig) (bool, string)
 	}
 
 	// Outside the workspace: still allow the same known-safe areas the original
-	// check did — unix /tmp and the AniClew config dir (~/.claude-proxy). We do
-	// NOT broaden this to the OS temp dir: that would loosen the boundary
-	// whenever the workspace itself lives under temp (common in tests/CI).
+	// check did — unix /tmp and AniClew's own state directory. We do NOT broaden
+	// this to the OS temp dir: that would loosen the boundary whenever the
+	// workspace itself lives under temp (common in tests/CI).
 	if absTmp, terr := filepath.Abs("/tmp"); terr == nil && pathWithin(absPath, absTmp) {
 		return true, ""
 	}
-	if strings.Contains(absPath, ".claude-proxy") {
+	if config.IsBaseDirPath(absPath) {
 		return true, ""
 	}
 

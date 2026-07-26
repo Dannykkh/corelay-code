@@ -75,7 +75,7 @@ type Daemon struct {
 	provider      types.Provider
 	model         string
 	workDir       string // current project directory
-	baseDir       string // ~/.claude-proxy/
+	baseDir       string // <state dir>, see config.BaseDir
 	cancel        context.CancelFunc
 	lastGitStatus *GitStatus
 	notifier      *Notifier

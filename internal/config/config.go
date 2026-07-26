@@ -68,12 +68,45 @@ func DefaultConfig() Config {
 	}
 }
 
-func configDir() string {
+// LegacyBaseDirName is the state directory this project used before it was its
+// own repository. Kept so existing installs are not orphaned.
+const (
+	BaseDirName       = ".aniclew"
+	LegacyBaseDirName = ".claude-proxy"
+)
+
+// BaseDir returns the directory holding config, receipts, undo snapshots and
+// per-project state.
+//
+// An existing legacy directory wins over a non-existent new one: renaming the
+// default must not strand a user's history. New installs get BaseDirName. Set
+// ANICLEW_CONFIG_DIR to override both.
+func BaseDir() string {
 	if dir := strings.TrimSpace(os.Getenv("ANICLEW_CONFIG_DIR")); dir != "" {
 		return dir
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude-proxy")
+
+	current := filepath.Join(home, BaseDirName)
+	if _, err := os.Stat(current); err == nil {
+		return current
+	}
+	legacy := filepath.Join(home, LegacyBaseDirName)
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return current
+}
+
+// IsBaseDirPath reports whether a path sits inside either the current or the
+// legacy state directory. Used by the permission layer, which must recognise
+// both names for as long as the legacy one can still be in service.
+func IsBaseDirPath(path string) bool {
+	return strings.Contains(path, BaseDirName) || strings.Contains(path, LegacyBaseDirName)
+}
+
+func configDir() string {
+	return BaseDir()
 }
 
 func configPath() string {

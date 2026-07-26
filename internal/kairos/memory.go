@@ -26,7 +26,7 @@ func SafeDirName(workspace string) string {
 // Each workspace/project gets its own memory directory.
 type Memory struct {
 	mu       sync.RWMutex
-	baseDir  string // ~/.claude-proxy/
+	baseDir  string // <state dir>, see config.BaseDir
 	dir      string // current project memory dir
 	sessions int
 	lastDream time.Time

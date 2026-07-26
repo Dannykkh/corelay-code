@@ -1281,8 +1281,7 @@ func (d *Server) handleKairosStart(w http.ResponseWriter, _ *http.Request) {
 	if daemon == nil {
 		cfg := kairos.DefaultDaemonConfig()
 		daemon = kairos.NewDaemon(cfg)
-		home, _ := os.UserHomeDir()
-		daemon.SetBaseDir(filepath.Join(home, ".claude-proxy"))
+		daemon.SetBaseDir(config.BaseDir())
 		d.SetDaemon(daemon)
 	}
 	// Sync daemon with current workspace
@@ -2629,8 +2628,7 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		workDir, _ = os.Getwd()
 	}
 
-	home, _ := os.UserHomeDir()
-	baseDir := filepath.Join(home, ".claude-proxy")
+	baseDir := config.BaseDir()
 	teamName := strings.TrimSpace(body.Name)
 	if teamName == "" {
 		teamName = "api-team"
