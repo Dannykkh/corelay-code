@@ -181,7 +181,10 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "  Usage:\n")
-	fmt.Fprintf(os.Stderr, "    ANTHROPIC_BASE_URL=http://localhost:%d claude\n", *port)
+	// CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST makes Claude Code drop provider vars that
+	// come from ~/.claude/settings.json, so a base URL left behind by another proxy
+	// tool cannot silently take routing back. It also drops model slots set there.
+	fmt.Fprintf(os.Stderr, "    ANTHROPIC_BASE_URL=http://localhost:%d CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude\n", *port)
 	fmt.Fprintf(os.Stderr, "\n")
 
 	// Graceful shutdown channel — wired to OS signals AND the tray Quit menu so

@@ -321,8 +321,12 @@ export function OverviewSettings({
   const selectedModel = MODELS.find((model) => model.id === settings.model);
   const enabledTools = Object.values(settings.permissions.autoApprove).filter(Boolean).length;
   const runtimeBaseUrl = settings.apiUrl.trim() || "http://localhost:3001";
-  const anthropicBaseEnv = `ANTHROPIC_BASE_URL=${runtimeBaseUrl}`;
-  const powerShellLaunch = `$env:ANTHROPIC_BASE_URL="${runtimeBaseUrl}"; claude`;
+  // CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST makes Claude Code drop provider vars that
+  // come from ~/.claude/settings.json, so a base URL left behind by another proxy
+  // tool cannot silently take routing back. Model slots set there are dropped too —
+  // the model comes from AniClew instead.
+  const anthropicBaseEnv = `ANTHROPIC_BASE_URL=${runtimeBaseUrl} CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`;
+  const powerShellLaunch = `$env:ANTHROPIC_BASE_URL="${runtimeBaseUrl}"; $env:CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST="1"; claude`;
   const isRuntimeOnline = runtime.status === "success" && Boolean(runtime.data);
   const accountCount = runtime.data?.accounts.length ?? 0;
   const providerCount = runtime.data?.providers.length ?? 0;

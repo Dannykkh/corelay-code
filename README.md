@@ -33,8 +33,12 @@ under real use.
 Where most of this project's work went. A router gets a local model *answering*;
 this is what it takes to make one usable through a real coding harness.
 
-- **Harness stays put**: `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` is the only
-  change. Slash commands, subagents, skills, hooks, and project memory keep working
+- **Harness stays put**: env vars are the only change. Slash commands, subagents,
+  skills, hooks, and project memory keep working
+- **No silent hijack**: `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` makes Claude Code
+  ignore provider settings left in `~/.claude/settings.json` by other proxy tools,
+  so a stale base URL cannot quietly take routing back. Model slots set there are
+  dropped as well — the model comes from AniClew
 - **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
   converted both ways, including streaming and tool-call frames
 - **Thinking models**: qwen3 and DeepSeek-R1 reasoning is parsed out of the
@@ -195,8 +199,8 @@ Browser opens at `http://localhost:4000/app`.
 ### Connect your CLI tools
 
 ```bash
-# Claude CLI → AniClew → any model
-ANTHROPIC_BASE_URL=http://localhost:4000 claude
+# Claude Code → AniClew → any model
+ANTHROPIC_BASE_URL=http://localhost:4000 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude
 
 # Codex CLI → AniClew → any model
 OPENAI_BASE_URL=http://localhost:4000 codex

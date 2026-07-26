@@ -1250,7 +1250,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 		"provider": s.activeProvider.Name(),
 		"model":    s.activeModel,
 		"router":   s.router != nil,
-		"hint":     fmt.Sprintf("Set ANTHROPIC_BASE_URL=http://localhost:%d to use with your CLI tool", s.port),
+		"hint":     fmt.Sprintf("Set ANTHROPIC_BASE_URL=http://localhost:%d and CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 to use with your CLI tool", s.port),
 	}
 	if s.router != nil {
 		result["totalCost"] = fmt.Sprintf("$%.4f", s.router.GetTotalCost())
