@@ -2,21 +2,46 @@
 
 **Small models, finished work.**
 
-AniClew is a coding agent and control plane for models you run yourself.
+AniClew is a coding agent and control plane for models you run yourself. It is
+also a proxy: point an existing CLI at it to reach any provider through one
+endpoint, with account pooling and quota windows for hosted models.
 
-A 12B model does not fail by being stupid. It misquotes the line it wants to
-edit, forgets the change it made two steps ago, and hands back a tool call in
-the wrong shape. Left alone it stalls on any of those. AniClew catches them and
-returns something the model can act on — where the text actually is, what the
-test actually printed, which edit was rolled back and why — so the run finishes.
+## Why it exists
 
-Measured on `gemma4:12b-it-qat`: two bugs across two files, the second hidden
-behind the first, and a prompt that names no file and gives no order. Ten runs,
-ten completions. Details and limits in
-[docs/measurements](docs/measurements/local-model-edit-hint.md).
+Run a 12B model against a real coding task and it will usually answer well and
+still fail to finish. Not from lack of reasoning — from the mechanics around it.
+It misquotes the line it means to edit. It forgets the change it made two steps
+ago. It returns a tool call in the wrong shape, or one the runtime silently
+accepts as success. Any one of those ends the run, and none of them is about
+whether the model understood the problem.
 
-It is also a proxy. Point an existing CLI at it to reach any provider through
-one endpoint, with account pooling and quota windows for hosted models.
+The usual answer is a bigger model. The other answer is to fix the layer the
+model is running inside, and that is what this is. When an edit misses, hand
+back the lines it probably meant, with numbers. When a test command cannot run,
+say so instead of reporting nothing as a pass. When an edit breaks syntax, roll
+it back and return the actual error. The model does not get smarter; it stops
+losing runs to things that were never its judgement.
+
+Four months of using it daily is what produced that list. Every entry came from
+watching a run stall, not from designing in advance.
+
+## What came of it
+
+`gemma4:12b-it-qat`, ten runs against the same task: two bugs across two files,
+the second hidden behind the first, and a prompt that names no file and gives no
+order. **Ten completions.** Half the runs contained a failed edit — the model
+quoting text that was no longer in the file — and finished anyway, because the
+failure came back with somewhere to look rather than a dead end.
+
+Measurement method, the A/B against a build without that repair, and the limits
+of a five-run sample: [docs/measurements](docs/measurements/local-model-edit-hint.md).
+
+The boundary is worth stating. This layer absorbs failures of execution —
+malformed calls, stale quotes, lost state, silent tool errors. It does not
+supply judgement. A model that misreads the problem or cannot devise the
+algorithm will fail here too, and no amount of runtime repair changes that.
+What it buys is that models which *do* know the answer stop losing to the
+plumbing.
 
 ## Screenshots
 
