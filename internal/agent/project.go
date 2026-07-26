@@ -46,11 +46,58 @@ func DetectProject(workDir string) ProjectInfo {
 		info.Type = "dotnet"
 	}
 
+	// Marker files are the strong signal, but plenty of real workspaces are just
+	// a folder of sources: a scripts directory, a fixture, an early prototype.
+	// Without this fallback the Test tool answers "no test runner configured"
+	// for a directory full of test_*.py — and reports that as a success.
+	if info.Type == "unknown" {
+		info.Type = detectTypeByExtension(workDir)
+	}
+
 	// Build file tree (max depth 3, max 100 items)
 	info.FileTree = buildFileTree(workDir, 3, 100)
 	info.FileCount = countFiles(workDir)
 
 	return info
+}
+
+// detectTypeByExtension counts source files directly under workDir and returns
+// the language with the most. Only used when no marker file was found.
+func detectTypeByExtension(workDir string) string {
+	langByExt := map[string]string{
+		".py":   "python",
+		".go":   "go",
+		".rs":   "rust",
+		".ts":   "node",
+		".tsx":  "node",
+		".js":   "node",
+		".jsx":  "node",
+		".java": "java",
+		".cs":   "dotnet",
+	}
+
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return "unknown"
+	}
+
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if lang, ok := langByExt[strings.ToLower(filepath.Ext(entry.Name()))]; ok {
+			counts[lang]++
+		}
+	}
+
+	best, bestCount := "unknown", 0
+	for lang, count := range counts {
+		if count > bestCount {
+			best, bestCount = lang, count
+		}
+	}
+	return best
 }
 
 // ProjectContext returns a system prompt section for the detected project.

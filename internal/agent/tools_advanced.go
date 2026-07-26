@@ -263,6 +263,18 @@ func executeLint(input json.RawMessage, workDir string) (string, bool) {
 
 // ── Auto Test ──
 
+// pythonExecutable prefers python3 but falls back to python. Windows installs
+// ship python.exe with no python3 alias, so hardcoding python3 made every Test
+// call fail there with "executable file not found".
+func pythonExecutable() string {
+	for _, name := range []string{"python3", "python"} {
+		if _, err := exec.LookPath(name); err == nil {
+			return name
+		}
+	}
+	return "python3"
+}
+
 func executeTest(input json.RawMessage, workDir string) (string, bool) {
 	var args struct {
 		Path   string `json:"path"`
@@ -299,7 +311,7 @@ func executeTest(input json.RawMessage, workDir string) (string, bool) {
 		if args.Path != "" {
 			testArgs = append(testArgs, args.Path)
 		}
-		cmd = exec.Command("python3", testArgs...)
+		cmd = exec.Command(pythonExecutable(), testArgs...)
 	case "rust":
 		testArgs := []string{"test"}
 		if args.Filter != "" {
@@ -307,7 +319,10 @@ func executeTest(input json.RawMessage, workDir string) (string, bool) {
 		}
 		cmd = exec.Command("cargo", testArgs...)
 	default:
-		return fmt.Sprintf("No test runner configured for: %s", project.Type), false
+		// Reported as an error on purpose: nothing ran. Returning this as a
+		// success let a model treat "no runner configured" as a passing test
+		// run and stop there.
+		return fmt.Sprintf("No test runner configured for project type %q. Run the test command directly with Bash.", project.Type), true
 	}
 
 	cmd.Dir = workDir
