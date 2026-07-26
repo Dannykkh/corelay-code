@@ -1,13 +1,16 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/aniclew/aniclew/internal/types"
 )
@@ -263,15 +266,46 @@ func executeLint(input json.RawMessage, workDir string) (string, bool) {
 
 // ── Auto Test ──
 
-// pythonExecutable prefers python3 but falls back to python. Windows installs
-// ship python.exe with no python3 alias, so hardcoding python3 made every Test
-// call fail there with "executable file not found".
+var pythonVersionRe = regexp.MustCompile(`(?i)^python \d+\.\d+`)
+
+// looksLikePythonVersion reports whether `--version` output came from a real
+// interpreter. Windows ships a python3.exe App Execution Alias that resolves on
+// PATH and exits 0, but prints a bare "Python" and runs nothing — so presence on
+// PATH is not evidence that the name works.
+func looksLikePythonVersion(out []byte) bool {
+	return pythonVersionRe.Match(bytes.TrimSpace(out))
+}
+
+var (
+	pythonExecOnce sync.Once
+	pythonExecName string
+)
+
+// pythonExecutable returns an interpreter name that actually runs, probing
+// `--version` rather than trusting LookPath. Resolved once per process.
 func pythonExecutable() string {
-	for _, name := range []string{"python3", "python"} {
-		if _, err := exec.LookPath(name); err == nil {
+	pythonExecOnce.Do(func() {
+		pythonExecName = resolvePythonExecutable([]string{"python3", "python", "py"})
+	})
+	return pythonExecName
+}
+
+func resolvePythonExecutable(candidates []string) string {
+	for _, name := range candidates {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(path, "--version").CombinedOutput()
+		if err != nil {
+			continue
+		}
+		if looksLikePythonVersion(out) {
 			return name
 		}
 	}
+	// Nothing verified; return the conventional name so the failure surfaces as
+	// a normal exec error instead of an empty command.
 	return "python3"
 }
 

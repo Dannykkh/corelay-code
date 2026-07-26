@@ -46,10 +46,34 @@ func TestDetectProjectStaysUnknownWithoutSources(t *testing.T) {
 	}
 }
 
-func TestPythonExecutableResolvesToSomethingOnPath(t *testing.T) {
-	// Whichever name exists on this machine, the result must not be empty —
-	// an empty command name turns into an opaque exec failure.
-	if got := pythonExecutable(); got != "python3" && got != "python" {
-		t.Fatalf("pythonExecutable() = %q, want python3 or python", got)
+func TestLooksLikePythonVersionRejectsWindowsStoreAlias(t *testing.T) {
+	// Observed on Windows: python3.exe is an App Execution Alias that resolves
+	// on PATH, exits 0, prints "Python", and runs nothing. Selecting it made the
+	// Test tool return "Python\n[tests failed]" with no pytest output at all.
+	cases := []struct {
+		out  string
+		want bool
+	}{
+		{"Python 3.12.4", true},
+		{"Python 3.14.0rc1", true},
+		{"python 3.9.7\n", true},
+		{"Python", false},
+		{"Python\n", false},
+		{"", false},
+		{"Microsoft Store", false},
+	}
+
+	for _, c := range cases {
+		if got := looksLikePythonVersion([]byte(c.out)); got != c.want {
+			t.Errorf("looksLikePythonVersion(%q) = %v, want %v", c.out, got, c.want)
+		}
+	}
+}
+
+func TestResolvePythonExecutableSkipsUnverifiableNames(t *testing.T) {
+	// A name that is not on PATH at all must be skipped rather than returned.
+	got := resolvePythonExecutable([]string{"definitely-not-a-python-abc123", "python", "python3"})
+	if got == "definitely-not-a-python-abc123" {
+		t.Fatalf("returned a name that is not on PATH: %q", got)
 	}
 }
