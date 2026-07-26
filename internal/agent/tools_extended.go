@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 
 	"github.com/aniclew/aniclew/internal/types"
@@ -406,11 +405,6 @@ func executeNotebookEdit(input json.RawMessage, workDir string) (string, bool) {
 }
 
 // ── Helpers ──
-
-func stripHTML(s string) string {
-	re := regexp.MustCompile(`<[^>]*>`)
-	return re.ReplaceAllString(s, "")
-}
 
 func formatSize(bytes int64) string {
 	if bytes < 1024 {
