@@ -121,7 +121,10 @@ func extractKeywords(query string) []string {
 	words := strings.Fields(strings.ToLower(query))
 	var keywords []string
 	for _, w := range words {
-		w = strings.Trim(w, "?!.,;:'\"()[]{}") // strip punctuation
+		// Backticks are in the set because prompts routinely quote commands and
+		// identifiers inline ("run `pytest`"); without them the keyword stays
+		// "`pytest" and matches nothing on disk.
+		w = strings.Trim(w, "?!.,;:'\"()[]{}`") // strip punctuation
 		if len(w) < 2 || stopWords[w] {
 			continue
 		}
