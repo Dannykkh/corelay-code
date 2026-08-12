@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -90,11 +91,14 @@ func runEvidenceLoop(t *testing.T, provider types.Provider, workDir string, poli
 	t.Helper()
 	userContent, _ := json.Marshal("크로노스. 완료까지 구현하자.")
 	eventCh := make(chan Event, 64)
+	runner := &fakeBashRunner{name: "evidence-loop", capabilities: fakeBashCapabilities()}
 	go RunLoopWithOptions(context.Background(), provider, "fake-model", []types.Message{
 		{Role: "user", Content: userContent},
 	}, workDir, RunOptions{
 		ResponseLang:   "auto",
 		EvidencePolicy: policy,
+		SandboxRunner:  runner,
+		SandboxPolicy:  fakeBashPolicy(sandbox.EnforcementRequired),
 	}, eventCh)
 
 	var events []Event

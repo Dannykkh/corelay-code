@@ -1,25 +1,64 @@
 package agent
 
 import (
+	"context"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 func TestLintFile_Go(t *testing.T) {
 	dir := t.TempDir()
+	opts := secureGoLintFixtureOptions(t)
 
 	valid := filepath.Join(dir, "ok.go")
-	os.WriteFile(valid, []byte("package x\n\nfunc F() int { return 1 }\n"), 0644)
-	if got := lintFile(valid); got != "" {
-		t.Errorf("valid go was flagged: %s", got)
+	validContent := []byte("package x\n\nfunc F() int { return 1 }\n")
+	os.WriteFile(valid, validContent, 0644)
+	if got := lintFileWithOptions(valid, artifactBytesRevision(validContent), opts); !got.Valid {
+		t.Errorf("valid go was flagged: %+v", got)
 	}
 
 	broken := filepath.Join(dir, "bad.go")
-	os.WriteFile(broken, []byte("package x\n\nfunc broken( {\n"), 0644)
-	if got := lintFile(broken); got == "" {
+	brokenContent := []byte("package x\n\nfunc broken( {\n")
+	os.WriteFile(broken, brokenContent, 0644)
+	if got := lintFileWithOptions(broken, artifactBytesRevision(brokenContent), opts); got.Valid || got.Failure != LintFailureSyntax {
 		t.Error("broken go syntax was NOT detected")
 	}
+}
+
+func secureGoLintFixtureOptions(t *testing.T) ToolExecutionOptions {
+	t.Helper()
+	runner := &fakeToolProcessRunner{
+		name:         "fake-go-lint",
+		capabilities: fakeBashCapabilities(),
+	}
+	runner.run = func(_ context.Context, policy sandbox.Policy, command sandbox.CommandSpec) (sandbox.Result, sandbox.Report) {
+		report := sandbox.Report{
+			Runner:               runner.Name(),
+			RequestedEnforcement: policy.Enforcement,
+			EffectiveEnforcement: policy.Enforcement,
+			Capabilities:         runner.Capabilities(),
+			Started:              true,
+		}
+		if command.Path != "gofmt" || len(command.Args) == 0 {
+			t.Fatalf("unexpected Go lint command: %#v", command)
+		}
+		_, err := parser.ParseFile(token.NewFileSet(), command.Args[len(command.Args)-1], nil, parser.AllErrors)
+		if err != nil {
+			return sandbox.Result{
+				Started:  true,
+				Stderr:   []byte(err.Error()),
+				ExitCode: 2,
+				Err:      err,
+			}, report
+		}
+		return sandbox.Result{Started: true, ExitCode: 0}, report
+	}
+	return secureToolProcessOptions(runner)
 }
 
 func TestLintFile_JSON(t *testing.T) {

@@ -27,7 +27,11 @@ func TestExecuteEditV2_ValidEdit(t *testing.T) {
 	f := filepath.Join(dir, "main.go")
 	os.WriteFile(f, []byte("package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n"), 0644)
 
-	out, isErr := executeEditV2(editInput(t, "main.go", "x := 1", "x := 42"), dir)
+	out, isErr := executeEditV2WithOptions(
+		editInput(t, "main.go", "x := 1", "x := 42"),
+		dir,
+		secureGoLintFixtureOptions(t),
+	)
 	if isErr {
 		t.Fatalf("valid edit failed: %s", out)
 	}
@@ -45,7 +49,11 @@ func TestExecuteEditV2_LintGateRollsBack(t *testing.T) {
 	os.WriteFile(f, []byte(original), 0644)
 
 	// Remove the closing brace → broken Go.
-	out, isErr := executeEditV2(editInput(t, "main.go", "\tprintln(\"hi\")\n}", "\tprintln(\"hi\")"), dir)
+	out, isErr := executeEditV2WithOptions(
+		editInput(t, "main.go", "\tprintln(\"hi\")\n}", "\tprintln(\"hi\")"),
+		dir,
+		secureGoLintFixtureOptions(t),
+	)
 	if !isErr {
 		t.Fatalf("expected lint gate to reject broken edit, got success: %s", out)
 	}
@@ -63,7 +71,11 @@ func TestExecuteEditV2_FuzzyMatch(t *testing.T) {
 	os.WriteFile(f, []byte("package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n"), 0644)
 
 	// old_string quotes it with 4 spaces — exact match fails, fuzzy should win.
-	out, isErr := executeEditV2(editInput(t, "main.go", "    x := 1", "\tx := 2"), dir)
+	out, isErr := executeEditV2WithOptions(
+		editInput(t, "main.go", "    x := 1", "\tx := 2"),
+		dir,
+		secureGoLintFixtureOptions(t),
+	)
 	if isErr {
 		t.Fatalf("fuzzy match should have applied the edit, got error: %s", out)
 	}
@@ -80,7 +92,11 @@ func TestExecuteEditV2_NoMatchHint(t *testing.T) {
 	original := "package main\n\nfunc main() {\n\tx := 1\n}\n"
 	os.WriteFile(f, []byte(original), 0644)
 
-	out, isErr := executeEditV2(editInput(t, "main.go", "this text does not exist", "y"), dir)
+	out, isErr := executeEditV2WithOptions(
+		editInput(t, "main.go", "this text does not exist", "y"),
+		dir,
+		secureGoLintFixtureOptions(t),
+	)
 	if !isErr {
 		t.Fatalf("expected error for missing text, got success: %s", out)
 	}
