@@ -161,6 +161,7 @@ func TestWindowsJobRunnerKillsDescendantWriterOnOutputLimit(t *testing.T) {
 
 func TestWindowsJobRunnerTimeoutOutputLimitRaceHasOneTerminalReason(t *testing.T) {
 	runner := newWindowsJobAdapter(AdapterDependencies{Lookup: exec.LookPath})
+	startedRuns := 0
 	for iteration := 0; iteration < 6; iteration++ {
 		command := outputHelperCommand(4096, 0, false, 75*time.Millisecond)
 		command.OutputLimitBytes = 32
@@ -169,7 +170,21 @@ func TestWindowsJobRunnerTimeoutOutputLimitRaceHasOneTerminalReason(t *testing.T
 			Enforcement: EnforcementRequired,
 			Required:    Capabilities{ProcessIsolation: true, ProcessTreeKill: true},
 		}, command)
-		if !result.Started || result.Canceled || !report.AppliedIsolation.ProcessTreeKill {
+		if !result.Started {
+			// The command timeout covers sandbox setup as well as execution. A
+			// cold or heavily loaded Windows runner may therefore exhaust this
+			// deliberately short race budget before the suspended process is
+			// assigned and resumed. That is a valid, fail-closed timeout, not a
+			// violation of the single-terminal-reason contract.
+			if !result.TimedOut || result.Canceled || result.OutputTruncated ||
+				report.Started || report.Failure != FailureTimedOut ||
+				report.AppliedIsolation != (Capabilities{}) {
+				t.Fatalf("pre-start timeout was not exclusive: iteration=%d result=%#v report=%#v", iteration, result, report)
+			}
+			continue
+		}
+		startedRuns++
+		if result.Canceled || !report.Started || !report.AppliedIsolation.ProcessTreeKill {
 			t.Fatalf("iteration=%d result=%#v report=%#v", iteration, result, report)
 		}
 		switch report.Failure {
@@ -184,6 +199,9 @@ func TestWindowsJobRunnerTimeoutOutputLimitRaceHasOneTerminalReason(t *testing.T
 		default:
 			t.Fatalf("iteration=%d failure=%q result=%#v report=%#v", iteration, report.Failure, result, report)
 		}
+	}
+	if startedRuns == 0 {
+		t.Fatal("all race attempts exhausted their deadlines during sandbox setup")
 	}
 }
 
