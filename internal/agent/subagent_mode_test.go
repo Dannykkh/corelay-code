@@ -286,13 +286,48 @@ func TestSubAgentSpawnCopiesOwnedFiles(t *testing.T) {
 	})
 	files := []string{"owned.go"}
 	task := manager.Spawn("copy", "finish", files)
+	taskID := task.ID
 	files[0] = "caller-mutated.go"
 	if len(task.Files) != 1 || task.Files[0] != "owned.go" {
 		t.Fatalf("Spawn() retained caller-owned Files slice: %#v", task.Files)
 	}
+	task.Name = "caller-mutated"
+	task.Files[0] = "caller-mutated.go"
+	current := manager.GetTask(taskID)
+	if current == nil || current.Name != "copy" || current.Files[0] != "owned.go" {
+		t.Fatalf("Spawn() returned manager-owned state: %#v", current)
+	}
 	manager.Wait(3 * time.Second)
-	if task.Status != "completed" {
-		t.Fatalf("spawned task status = %q, result=%q", task.Status, task.Result)
+	completed := manager.GetTask(taskID)
+	if completed == nil || completed.Status != "completed" {
+		t.Fatalf("spawned task = %#v", completed)
+	}
+}
+
+func TestSubAgentTaskQueriesReturnDetachedSnapshots(t *testing.T) {
+	manager := &SubAgentManager{
+		tasks: map[string]*SubAgentTask{
+			"sub-1": {
+				ID:      "sub-1",
+				Status:  "running",
+				Files:   []string{"owned.go"},
+				Sandbox: []SandboxExecutionRecord{{ToolID: "tool-1"}},
+			},
+		},
+	}
+
+	task := manager.GetTask("sub-1")
+	tasks := manager.GetTasks()
+	if task == nil || len(tasks) != 1 {
+		t.Fatalf("task snapshots = %#v / %#v", task, tasks)
+	}
+	task.Status = "caller-mutated"
+	task.Files[0] = "caller-mutated.go"
+	tasks[0].Sandbox[0].ToolID = "caller-mutated"
+
+	current := manager.GetTask("sub-1")
+	if current.Status != "running" || current.Files[0] != "owned.go" || current.Sandbox[0].ToolID != "tool-1" {
+		t.Fatalf("caller mutation reached manager-owned task: %#v", current)
 	}
 }
 

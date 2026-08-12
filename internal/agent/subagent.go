@@ -125,7 +125,8 @@ func (m *SubAgentManager) SessionID() string {
 	return m.sessionID
 }
 
-// Spawn creates and starts a sub-agent in a separate goroutine.
+// Spawn creates and starts a sub-agent in a separate goroutine, then returns a
+// detached snapshot of its initial state. Use GetTask to observe later updates.
 func (m *SubAgentManager) Spawn(name, instruction string, files []string) *SubAgentTask {
 	m.mu.Lock()
 	m.counter++
@@ -138,12 +139,13 @@ func (m *SubAgentManager) Spawn(name, instruction string, files []string) *SubAg
 		Status:      "pending",
 	}
 	m.tasks[id] = task
+	snapshot := cloneSubAgentTask(task)
 	m.mu.Unlock()
 
 	// Start in goroutine
 	go m.run(task)
 
-	return task
+	return snapshot
 }
 
 // SpawnMultiple creates multiple sub-agents and runs them in parallel.
@@ -188,22 +190,34 @@ func (m *SubAgentManager) AllDone() bool {
 	return true
 }
 
-// GetTasks returns all sub-agent tasks.
+// GetTasks returns detached snapshots of all sub-agent tasks. The manager keeps
+// mutable task state private so callers can safely inspect or encode the result
+// while a sub-agent is still running.
 func (m *SubAgentManager) GetTasks() []*SubAgentTask {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var result []*SubAgentTask
 	for _, t := range m.tasks {
-		result = append(result, t)
+		result = append(result, cloneSubAgentTask(t))
 	}
 	return result
 }
 
-// GetTask returns a specific task.
+// GetTask returns a detached snapshot of a specific task.
 func (m *SubAgentManager) GetTask(id string) *SubAgentTask {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.tasks[id]
+	return cloneSubAgentTask(m.tasks[id])
+}
+
+func cloneSubAgentTask(task *SubAgentTask) *SubAgentTask {
+	if task == nil {
+		return nil
+	}
+	clone := *task
+	clone.Files = append([]string(nil), task.Files...)
+	clone.Sandbox = append([]SandboxExecutionRecord(nil), task.Sandbox...)
+	return &clone
 }
 
 // run adapts one sub-agent task to the common Agent Kernel. The run mode owns

@@ -847,7 +847,7 @@ func TestBridgeRejectsClientMCPAndDisablesWorkspaceMCP(t *testing.T) {
 	if captured.SandboxRunner == nil || captured.SandboxPolicy.Enforcement == "" {
 		t.Fatalf("ACP run did not bind an explicit sandbox: %#v", captured.SandboxPolicy)
 	}
-	if captured.SandboxRunner.Capabilities().FilesystemIsolation && captured.SandboxPolicy.Workspace != fixture.workspace {
+	if captured.SandboxRunner.Capabilities().FilesystemIsolation && !sameWorkspace(captured.SandboxPolicy.Workspace, fixture.workspace) {
 		t.Fatalf("sandbox workspace = %q, want %q", captured.SandboxPolicy.Workspace, fixture.workspace)
 	}
 }
