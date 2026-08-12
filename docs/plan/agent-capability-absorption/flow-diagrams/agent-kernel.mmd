@@ -1,0 +1,27 @@
+flowchart TD
+    I[HTTP agent session ingress] --> K[RunLoopWithOptions single agent kernel]
+    Y[Capability profiler CLI ingress] --> K
+    C[Chronos ingress] --> K
+    S[SubAgent ingress] --> K
+    T[Team worker ingress] --> K
+    B[Bridge ingress] --> K
+    A[ACP prompt ingress] --> K
+    K --> M{RunMode configured?}
+    M -->|Yes| R[Phase and directive controller only]
+    M -->|No| P[Resolve immutable harness, context plan, and tool catalog]
+    R --> P
+    R -->|Mode error| X[Typed blocked or failure outcome]
+    P --> Q{Context and catalog valid?}
+    Q -->|No| X
+    Q -->|Yes| V[Call provider and parse bounded response]
+    V -->|Transport or parser failure| X
+    V --> U{Contains tool calls?}
+    U -->|Yes| G[Common schema, permission, approval, sandbox, journal, and dispatch]
+    G -->|Denied, journal-failed, or execution-failed| X
+    G -->|Executed after durable marker when configured| W[Persist tool results and evidence]
+    W --> K
+    U -->|No| O{Completion contract and evidence satisfied?}
+    O -->|Yes| F[Idempotent terminal finalizer]
+    O -->|Blocked or incomplete| X
+    X --> F
+    F --> Z([SessionEnd, recorder terminal, typed done, channel close])

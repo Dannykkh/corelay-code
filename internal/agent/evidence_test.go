@@ -32,8 +32,8 @@ func TestEvidenceGateDeepChangeMeasureWouldBlock(t *testing.T) {
 	ledger.ObserveChangedFile("proxy-go/internal/agent/loop.go")
 
 	got := ledger.Evaluate()
-	if got.Decision != EvidenceGateWouldBlock || got.Mode != EvidenceModeDeep {
-		t.Fatalf("Evaluate() = %+v, want would-block deep", got)
+	if got.Decision != EvidenceGateWouldBlock || got.TerminalState != EvidenceTerminalUnverified || got.Mode != EvidenceModeDeep {
+		t.Fatalf("Evaluate() = %+v, want would-block/unverified deep", got)
 	}
 }
 
@@ -45,13 +45,13 @@ func TestEvidenceGateBlockStopsUntilEvidence(t *testing.T) {
 	ledger.ObserveChangedFile("web/app/page.tsx")
 
 	first := ledger.Evaluate()
-	if first.Decision != EvidenceGateBlock {
-		t.Fatalf("first Evaluate() = %+v, want block", first)
+	if first.Decision != EvidenceGateBlock || first.TerminalState != EvidenceTerminalBlocked {
+		t.Fatalf("first Evaluate() = %+v, want block/blocked", first)
 	}
 	ledger.MarkStopBlock()
 	second := ledger.Evaluate()
-	if second.Decision != EvidenceGateWarn {
-		t.Fatalf("second Evaluate() = %+v, want warn after stop budget", second)
+	if second.Decision != EvidenceGateWarn || second.TerminalState != EvidenceTerminalUnverified {
+		t.Fatalf("second Evaluate() = %+v, want warn/unverified after stop budget", second)
 	}
 }
 
@@ -72,11 +72,37 @@ func TestEvidenceObservesVerificationCommand(t *testing.T) {
 	ledger.ObserveToolResult("Bash", input, "ok", false)
 
 	got := ledger.Evaluate()
-	if got.Decision != EvidenceGateAllow {
-		t.Fatalf("Evaluate() = %+v, want allow after verification", got)
+	if got.Decision != EvidenceGateAllow || got.TerminalState != EvidenceTerminalVerified {
+		t.Fatalf("Evaluate() = %+v, want allow/verified after verification", got)
 	}
 	receipt := ledger.ApplyToReceipt(ReceiptVerification{Status: "passed", Source: "auto-verify"})
-	if receipt.Gate != EvidenceGateAllow || receipt.Mode != EvidenceModeDeep || len(receipt.Evidence) != 1 {
+	if receipt.Gate != EvidenceGateAllow || receipt.TerminalState != EvidenceTerminalVerified || receipt.Mode != EvidenceModeDeep || len(receipt.Evidence) != 1 {
 		t.Fatalf("receipt evidence not applied: %+v", receipt)
+	}
+}
+
+func TestEvidenceTerminalStateTable(t *testing.T) {
+	tests := []struct {
+		name     string
+		decision string
+		status   string
+		records  []EvidenceRecord
+		want     string
+	}{
+		{name: "policy block", decision: EvidenceGateBlock, status: "passed", want: EvidenceTerminalBlocked},
+		{name: "clean pass", decision: EvidenceGateAllow, status: "passed", want: EvidenceTerminalVerified},
+		{name: "passed receipt without gate", status: "passed", want: EvidenceTerminalVerified},
+		{name: "mixed evidence", decision: EvidenceGateAllow, records: []EvidenceRecord{{Status: "failed"}, {Status: "passed"}}, want: EvidenceTerminalPartiallyVerified},
+		{name: "advisory pass", decision: EvidenceGateWarn, status: "passed", want: EvidenceTerminalPartiallyVerified},
+		{name: "failed only", decision: EvidenceGateAllow, status: "failed", want: EvidenceTerminalUnverified},
+		{name: "no evidence", decision: EvidenceGateAllow, status: "not-run", want: EvidenceTerminalUnverified},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := evidenceTerminalState(tt.decision, tt.status, tt.records); got != tt.want {
+				t.Fatalf("evidenceTerminalState(%q, %q, %#v) = %q, want %q", tt.decision, tt.status, tt.records, got, tt.want)
+			}
+		})
 	}
 }

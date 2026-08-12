@@ -9,10 +9,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func runWorker(args []string) {
@@ -26,7 +26,7 @@ func runWorker(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: saved config or ollama)")
 	model := fs.String("model", "", "Model ID (default: saved config or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
-	baseDir := fs.String("base-dir", "", "State directory (default: ~/.aniclew)")
+	baseDir := fs.String("base-dir", "", "State directory (default: ~/.corelay)")
 	verifyCommand := fs.String("verify", "", "Optional verification command to run after the worker")
 	responseLang := fs.String("lang", "auto", "Response language hint")
 	_ = responseLang // reserved for future per-worker output shaping
@@ -91,12 +91,15 @@ func runWorker(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(*workDir)
 	team := agent.NewTeam(provider, *model, *workDir, *baseDir, agent.TeamConfig{
 		Name:            "cli-worker",
 		MaxWaveSize:     1,
 		VerifyCommand:   *verifyCommand,
 		Capacity:        agent.DefaultLocalCapacity(),
 		ProviderFactory: createProviderByName,
+		SandboxRunner:   sandboxRunner,
+		SandboxPolicy:   sandboxPolicy,
 	})
 	team.AddTask(task.ToTeamTask())
 

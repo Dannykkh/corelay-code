@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
 )
 
 type runtimeTelemetryUpdate struct {

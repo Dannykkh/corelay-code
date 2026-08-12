@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
-
-	"github.com/aniclew/aniclew/internal/config"
 )
 
 type DangerLevel string
@@ -20,6 +18,24 @@ type PermissionConfig struct {
 	AutoApprove     string   `json:"autoApprove"` // "safe", "moderate", "all", "none"
 	BlockedPaths    []string `json:"blockedPaths"`
 	BlockedCommands []string `json:"blockedCommands"`
+}
+
+// PermissionDecision is the transport-neutral result consumed by the common
+// tool dispatcher. Approval is deliberately distinct from allow: callers must
+// complete an explicit approval round trip or fail closed.
+type PermissionDecision string
+
+const (
+	PermissionAllow    PermissionDecision = "allow"
+	PermissionDeny     PermissionDecision = "deny"
+	PermissionApproval PermissionDecision = "approval"
+)
+
+// PermissionResult records the resolved decision and its user-safe rationale.
+type PermissionResult struct {
+	Decision PermissionDecision
+	Reason   string
+	Danger   DangerLevel
 }
 
 func DefaultPermissionConfig() PermissionConfig {
@@ -50,6 +66,7 @@ var moderateBashPatterns = []string{
 
 // ClassifyDanger returns the danger level for a tool call.
 func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string) {
+	toolName = canonicalPermissionToolName(toolName)
 	switch toolName {
 	case "Bash":
 		var args struct {
@@ -79,12 +96,13 @@ func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string
 			Args    string `json:"args"`
 		}
 		json.Unmarshal(input, &args)
-		full := args.Command + " " + args.Args
+		command := strings.ToLower(strings.TrimSpace(args.Command))
+		argv := strings.Fields(args.Args)
 
-		if strings.Contains(full, "--force") || strings.Contains(full, "reset --hard") {
+		if dangerousGitInvocation(command, argv) {
 			return DangerDangerous, "Destructive git operation"
 		}
-		if args.Command == "push" || args.Command == "commit" || args.Command == "add" {
+		if mutatingGitInvocation(command, argv) {
 			return DangerModerate, "Git mutating command"
 		}
 		return DangerSafe, ""
@@ -92,7 +110,7 @@ func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string
 	case "Edit":
 		return DangerSafe, ""
 
-	case "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch", "WebResearch",
+	case "Read", "Glob", "Grep", "LS", loadToolResultToolName, reportCompletionToolName, "WebSearch", "WebFetch", "WebResearch",
 		"TaskCreate", "TaskUpdate", "TaskList",
 		"NotebookRead":
 		return DangerSafe, ""
@@ -105,46 +123,110 @@ func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string
 	}
 }
 
-// CheckPath validates that a file path is safe to access.
-func CheckPath(path string, workDir string, cfg PermissionConfig) (bool, string) {
-	// Block known sensitive paths
-	for _, blocked := range cfg.BlockedPaths {
-		if strings.Contains(path, blocked) {
-			return false, "Blocked path: " + blocked
+func dangerousGitInvocation(command string, argv []string) bool {
+	for _, argument := range argv {
+		flag := strings.ToLower(argument)
+		if strings.HasPrefix(flag, "--force") || (command == "push" && flag == "-f") {
+			return true
 		}
 	}
+	return command == "reset" && containsGitArgument(argv, "--hard")
+}
 
-	// Resolve the path the way the tools do: a relative path is joined with the
-	// agent's workDir, NOT the server process's working directory. Previously
-	// this used filepath.Abs(path) directly, which resolved a bare filename like
-	// "notes.txt" against the server's cwd and falsely reported it as outside
-	// the workspace — so the agent could never Write/Edit with a relative path.
-	resolved := path
-	if !filepath.IsAbs(resolved) {
-		resolved = filepath.Join(workDir, resolved)
+// mutatingGitInvocation is intentionally conservative: only structurally
+// read-only invocations are safe. A model-provided confirm field is not part of
+// this decision and can never substitute for the approval broker.
+func mutatingGitInvocation(command string, argv []string) bool {
+	switch command {
+	case "status", "diff", "log", "show", "blame", "grep", "shortlog",
+		"describe", "rev-parse", "ls-files", "ls-tree", "cat-file",
+		"name-rev", "for-each-ref":
+		return false
+	case "branch":
+		return mutatingGitBranch(argv)
+	case "stash":
+		return len(argv) == 0 || (strings.ToLower(argv[0]) != "list" && strings.ToLower(argv[0]) != "show")
+	case "remote":
+		if len(argv) == 0 || (len(argv) == 1 && (argv[0] == "-v" || argv[0] == "--verbose")) {
+			return false
+		}
+		first := strings.ToLower(argv[0])
+		return first != "show" && first != "get-url"
+	case "tag":
+		return mutatingGitTag(argv)
+	default:
+		// checkout/switch/reset/rebase/merge/cherry-pick and every unknown
+		// subcommand require explicit approval rather than optimistic execution.
+		return true
 	}
-	absPath, err := filepath.Abs(resolved)
+}
+
+func mutatingGitBranch(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	for _, argument := range argv {
+		flag := strings.ToLower(argument)
+		switch flag {
+		case "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "--edit-description", "--set-upstream-to", "--unset-upstream":
+			return true
+		}
+	}
+	for _, argument := range argv {
+		flag := strings.ToLower(argument)
+		if flag == "--list" || flag == "--show-current" || flag == "-a" || flag == "--all" ||
+			flag == "-r" || flag == "--remotes" || flag == "--contains" || strings.HasPrefix(flag, "--contains=") ||
+			flag == "--no-contains" || strings.HasPrefix(flag, "--no-contains=") || flag == "--merged" ||
+			strings.HasPrefix(flag, "--merged=") || flag == "--no-merged" || strings.HasPrefix(flag, "--no-merged=") ||
+			flag == "--points-at" || strings.HasPrefix(flag, "--points-at=") {
+			return false
+		}
+	}
+	// A bare branch name creates a branch. Ambiguous flag forms are approval-only.
+	return true
+}
+
+func mutatingGitTag(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	for _, argument := range argv {
+		flag := strings.ToLower(argument)
+		switch flag {
+		case "-d", "--delete", "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-m", "--message", "-F", "--file", "-f", "--force":
+			return true
+		}
+	}
+	first := strings.ToLower(argv[0])
+	if first == "-l" || first == "--list" || first == "-n" || first == "-v" || first == "--verify" ||
+		first == "--contains" || strings.HasPrefix(first, "--contains=") || first == "--no-contains" ||
+		strings.HasPrefix(first, "--no-contains=") || first == "--points-at" || strings.HasPrefix(first, "--points-at=") ||
+		first == "--merged" || strings.HasPrefix(first, "--merged=") || first == "--no-merged" || strings.HasPrefix(first, "--no-merged=") {
+		return false
+	}
+	// A bare tag name creates a lightweight tag.
+	return true
+}
+
+func containsGitArgument(argv []string, expected string) bool {
+	for _, argument := range argv {
+		if strings.EqualFold(argument, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckPath validates that a file path is safe to access.
+func CheckPath(path string, workDir string, cfg PermissionConfig) (bool, string) {
+	workspace, err := canonicalWorkspace(workDir)
 	if err != nil {
-		return true, "" // unresolvable — defer to the tool's own handling
+		return false, "Unsafe workspace path: " + err.Error()
 	}
-
-	// Inside the workspace → always allowed.
-	if absWork, werr := filepath.Abs(workDir); werr == nil && pathWithin(absPath, absWork) {
-		return true, ""
+	if _, err := canonicalPathWithinWorkspace(path, workDir, workspace, cfg); err != nil {
+		return false, err.Error()
 	}
-
-	// Outside the workspace: still allow the same known-safe areas the original
-	// check did — unix /tmp and AniClew's own state directory. We do NOT broaden
-	// this to the OS temp dir: that would loosen the boundary whenever the
-	// workspace itself lives under temp (common in tests/CI).
-	if absTmp, terr := filepath.Abs("/tmp"); terr == nil && pathWithin(absPath, absTmp) {
-		return true, ""
-	}
-	if config.IsBaseDirPath(absPath) {
-		return true, ""
-	}
-
-	return false, "Path outside workspace: " + path
+	return true, ""
 }
 
 // pathWithin reports whether target is base, or lives under it, using path
@@ -163,6 +245,7 @@ func pathWithin(target, base string) bool {
 
 // CheckPermission determines if a tool call should be allowed.
 func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg PermissionConfig) (bool, string, DangerLevel) {
+	toolName = canonicalPermissionToolName(toolName)
 	level, reason := ClassifyDanger(toolName, input)
 
 	// Check blocked commands for Bash
@@ -178,17 +261,10 @@ func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg
 		}
 	}
 
-	// Check file paths
-	if toolName == "Read" || toolName == "Write" || toolName == "Edit" {
-		var args struct {
-			FilePath string `json:"file_path"`
-		}
-		json.Unmarshal(input, &args)
-		if args.FilePath != "" {
-			if ok, msg := CheckPath(args.FilePath, workDir, cfg); !ok {
-				return false, msg, DangerDangerous
-			}
-		}
+	// All path-bearing tools and their explicit recovery aliases share the same
+	// canonical workspace boundary. Invalid or ambiguous input fails closed.
+	if ok, msg := checkToolWorkspacePaths(toolName, input, workDir, cfg); !ok {
+		return false, msg, DangerDangerous
 	}
 
 	// Auto-approve check
@@ -207,5 +283,54 @@ func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg
 			return false, reason, level
 		}
 		return true, "", level
+	}
+}
+
+// ResolvePermission applies hard path/command constraints before the immutable
+// permission snapshot. Explicit deny always wins. An unmatched snapshot then
+// falls through to the existing automatic policy; calls beyond that policy
+// require explicit approval instead of being silently promoted to allow.
+func ResolvePermission(
+	toolName string,
+	input json.RawMessage,
+	workDir string,
+	cfg PermissionConfig,
+	snapshotDecision string,
+) PermissionResult {
+	// AutoApprove=all isolates the non-overridable command and path checks from
+	// the configurable automatic-approval threshold.
+	hardCfg := cfg
+	hardCfg.AutoApprove = "all"
+	hardAllowed, hardReason, danger := CheckPermission(toolName, input, workDir, hardCfg)
+	if !hardAllowed {
+		return PermissionResult{
+			Decision: PermissionDeny,
+			Reason:   hardReason,
+			Danger:   danger,
+		}
+	}
+
+	switch snapshotDecision {
+	case "deny":
+		return PermissionResult{
+			Decision: PermissionDeny,
+			Reason:   "Denied by permission rule",
+			Danger:   danger,
+		}
+	case "allow":
+		return PermissionResult{Decision: PermissionAllow, Danger: danger}
+	}
+
+	autoAllowed, autoReason, _ := CheckPermission(toolName, input, workDir, cfg)
+	if autoAllowed {
+		return PermissionResult{Decision: PermissionAllow, Danger: danger}
+	}
+	if strings.TrimSpace(autoReason) == "" {
+		autoReason = "Explicit approval required"
+	}
+	return PermissionResult{
+		Decision: PermissionApproval,
+		Reason:   autoReason,
+		Danger:   danger,
 	}
 }

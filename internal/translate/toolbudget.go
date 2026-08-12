@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // coreTools are always kept regardless of budget — the minimal file/exec
@@ -18,11 +18,16 @@ var coreTools = map[string]bool{
 	"Glob": true, "Grep": true, "LS": true, "Git": true,
 }
 
-// ToolBudget returns the configured maximum tool count from ANICLEW_MAX_TOOLS.
+// ToolBudget returns the configured maximum tool count from CORELAY_MAX_TOOLS.
+// ANICLEW_MAX_TOOLS remains a compatibility fallback.
 // Returns 0 (disabled) when unset, invalid, or <= 0 — so the feature is opt-in
 // and never alters the toolset unless explicitly enabled.
 func ToolBudget() int {
-	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("ANICLEW_MAX_TOOLS")))
+	value := strings.TrimSpace(os.Getenv("CORELAY_MAX_TOOLS"))
+	if value == "" {
+		value = strings.TrimSpace(os.Getenv("ANICLEW_MAX_TOOLS"))
+	}
+	n, err := strconv.Atoi(value)
 	if err != nil || n <= 0 {
 		return 0
 	}

@@ -31,7 +31,7 @@ export interface NavItem {
   shortLabel: string;
 }
 
-export const PORTED_SECTIONS: NavItem[] = [
+const PORTED_SECTIONS: NavItem[] = [
   { id: 'overview', label: 'Overview', shortLabel: 'Overview' },
   { id: 'scheduler', label: 'Scheduler', shortLabel: 'Scheduler' },
   { id: 'accounts', label: 'Accounts', shortLabel: 'Accounts' },

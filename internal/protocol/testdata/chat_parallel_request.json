@@ -1,0 +1,25 @@
+{
+  "model": "gpt-test",
+  "max_completion_tokens": 128,
+  "stream": true,
+  "stream_options": {"include_usage": true},
+  "messages": [
+    {"role": "developer", "content": "Use tools when needed."},
+    {"role": "user", "content": "Compare Seoul and Busan."},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {"id": "call_seoul", "type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"Seoul\"}"}},
+        {"id": "call_busan", "type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"Busan\"}"}}
+      ]
+    },
+    {"role": "tool", "tool_call_id": "call_seoul", "content": "18 C"},
+    {"role": "tool", "tool_call_id": "call_busan", "content": "21 C"},
+    {"role": "user", "content": "Summarize."}
+  ],
+  "tools": [
+    {"type": "function", "function": {"name": "weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+  ],
+  "tool_choice": "auto"
+}

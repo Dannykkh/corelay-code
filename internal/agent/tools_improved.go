@@ -1,20 +1,32 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
-// ── Improved Bash: configurable timeout, env vars, background ──
-
-func executeBashV2(input json.RawMessage, workDir string) (string, bool) {
-	result := ExecuteBashDeep(input, workDir, nil)
+func executeBashV2WithOptions(
+	input json.RawMessage,
+	workDir string,
+	ctx context.Context,
+	runner sandbox.Runner,
+	policy sandbox.Policy,
+	observeReport func(sandbox.Report),
+) (string, bool) {
+	result := ExecuteBashDeepWithOptions(input, workDir, BashExecOptions{
+		Context:       ctx,
+		Runner:        runner,
+		Policy:        policy,
+		ObserveReport: observeReport,
+	})
 	return result.Output, result.IsError
 }
 
@@ -57,14 +69,22 @@ func executeReadV2(input json.RawMessage, workDir string) (string, bool) {
 
 	// Default: read up to 2000 lines
 	start := args.Offset
-	if start < 0 { start = 0 }
-	if start > totalLines { start = totalLines }
+	if start < 0 {
+		start = 0
+	}
+	if start > totalLines {
+		start = totalLines
+	}
 
 	limit := args.Limit
-	if limit <= 0 { limit = 2000 }
+	if limit <= 0 {
+		limit = 2000
+	}
 
 	end := start + limit
-	if end > totalLines { end = totalLines }
+	if end > totalLines {
+		end = totalLines
+	}
 
 	var result strings.Builder
 	maxLineWidth := len(fmt.Sprintf("%d", end))
@@ -169,13 +189,17 @@ func executeGlobV2(input json.RawMessage, workDir string) (string, bool) {
 // ── Improved Grep: context lines, file type filter, count mode ──
 
 func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
+	return executeGrepV2WithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeGrepV2WithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	var args struct {
 		Pattern    string `json:"pattern"`
 		Path       string `json:"path"`
 		Glob       string `json:"glob"`
-		Context    int    `json:"context"`      // lines of context (-C)
-		IgnoreCase bool   `json:"ignore_case"`  // -i
-		FilesOnly  bool   `json:"files_only"`   // only show file names
+		Context    int    `json:"context"`     // lines of context (-C)
+		IgnoreCase bool   `json:"ignore_case"` // -i
+		FilesOnly  bool   `json:"files_only"`  // only show file names
 		MaxResults int    `json:"max_results"`
 	}
 	json.Unmarshal(input, &args)
@@ -185,8 +209,8 @@ func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
 		dir = resolvePath(args.Path, workDir)
 	}
 
-	// Try ripgrep first, fall back to grep
-	cmdName := "rg"
+	// Try ripgrep first, and only fall back when the executable cannot start.
+	// A real rg exit 1 is the documented "no matches" outcome.
 	cmdArgs := []string{"--no-heading", "--line-number", "--color=never"}
 
 	if args.IgnoreCase {
@@ -203,10 +227,11 @@ func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
 	}
 	cmdArgs = append(cmdArgs, args.Pattern, dir)
 
-	cmd := exec.Command(cmdName, cmdArgs...)
-	out, err := cmd.CombinedOutput()
-
-	if err != nil && len(out) == 0 {
+	process := runToolProcess(opts, "Grep", workDir, "rg", cmdArgs, defaultToolProcessTimeout)
+	if process.policyOrContextFailure() {
+		return "Grep failed: " + process.setupOrExecutionError("sandbox execution failed"), true
+	}
+	if !process.Started {
 		// Fallback to grep
 		grepArgs := []string{"-rn", "--color=never"}
 		if args.IgnoreCase {
@@ -223,11 +248,16 @@ func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
 		}
 		grepArgs = append(grepArgs, args.Pattern, dir)
 
-		cmd = exec.Command("grep", grepArgs...)
-		out, _ = cmd.CombinedOutput()
+		process = runToolProcess(opts, "Grep fallback", workDir, "grep", grepArgs, defaultToolProcessTimeout)
+		if process.policyOrContextFailure() || !process.Started {
+			return "Grep failed: " + process.setupOrExecutionError("neither rg nor grep could start"), true
+		}
+	}
+	if process.ExitCode > 1 || (process.Err != nil && process.ExitCode == 0) {
+		return "Grep failed: " + process.setupOrExecutionError("search command failed"), true
 	}
 
-	result := strings.TrimSpace(string(out))
+	result := process.combinedOutput()
 
 	// Relativize paths
 	result = strings.ReplaceAll(result, dir+"/", "")
@@ -241,7 +271,9 @@ func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
 	}
 
 	maxResults := args.MaxResults
-	if maxResults <= 0 { maxResults = 250 }
+	if maxResults <= 0 {
+		maxResults = 250
+	}
 	if matchCount > maxResults {
 		lines = lines[:maxResults]
 		result = strings.Join(lines, "\n") + fmt.Sprintf("\n... (%d more results)", matchCount-maxResults)
@@ -258,78 +290,55 @@ func executeGrepV2(input json.RawMessage, workDir string) (string, bool) {
 // ── Improved Edit: multi-replace, regex replace ──
 
 func executeEditV2(input json.RawMessage, workDir string) (string, bool) {
-	var args struct {
-		FilePath   string `json:"file_path"`
-		OldString  string `json:"old_string"`
-		NewString  string `json:"new_string"`
-		ReplaceAll bool   `json:"replace_all"`
-		Regex      bool   `json:"regex"`
-	}
-	json.Unmarshal(input, &args)
+	runner, policy := DefaultSandboxExecution(workDir)
+	return executeEditV2WithOptions(input, workDir, ToolExecutionOptions{
+		SandboxRunner: runner,
+		SandboxPolicy: policy,
+	})
+}
 
-	path := resolvePath(args.FilePath, workDir)
+func executeEditV2WithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
+	var args editPolicyInput
+	if err := json.Unmarshal(input, &args); err != nil {
+		return fmt.Sprintf("Invalid Edit input: %v", err), true
+	}
+
+	path, err := mutationExecutionPath(args.FilePath, workDir, "Edit", opts.fileMutation)
+	if err != nil {
+		return fileMutationBlocked("edit", err)
+	}
+	unlock := lockArtifactMutation(path)
+	defer unlock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("Error reading %s: %v", args.FilePath, err), true
 	}
+	if err := validateArtifactBytesPrecondition(data, opts.fileMutation); err != nil {
+		return fileMutationBlocked("edit", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = fmt.Errorf("target is not a regular file")
+		}
+		return fmt.Sprintf("Error inspecting %s: %v", args.FilePath, err), true
+	}
 
 	content := string(data)
-	var newContent string
-	var count int
-
-	if args.Regex {
-		re, err := regexp.Compile(args.OldString)
-		if err != nil {
-			return fmt.Sprintf("Invalid regex: %v", err), true
+	newContent, count, err := applyEditPolicy(content, args, opts.EditPolicy)
+	if err != nil {
+		hint := ""
+		if args.OldString != "" {
+			hint = closestLinesHint(content, args.OldString)
 		}
-		matches := re.FindAllString(content, -1)
-		count = len(matches)
-		if count == 0 {
-			return "Error: regex pattern not found in file", true
-		}
-		if args.ReplaceAll {
-			newContent = re.ReplaceAllString(content, args.NewString)
-		} else {
-			newContent = re.ReplaceAllStringFunc(content, func(match string) string {
-				if count > 0 {
-					count--
-					if count == len(matches)-1 {
-						return re.ReplaceAllString(match, args.NewString)
-					}
-				}
-				return match
-			})
-			// Simpler: just replace first
-			loc := re.FindStringIndex(content)
-			if loc != nil {
-				newContent = content[:loc[0]] + re.ReplaceAllString(content[loc[0]:loc[1]], args.NewString) + content[loc[1]:]
-			}
-			count = 1
-		}
-	} else {
-		switch {
-		case strings.Contains(content, args.OldString):
-			if args.ReplaceAll {
-				count = strings.Count(content, args.OldString)
-				newContent = strings.ReplaceAll(content, args.OldString, args.NewString)
-			} else {
-				count = 1
-				newContent = strings.Replace(content, args.OldString, args.NewString, 1)
-			}
-		default:
-			// Exact match failed — try a whitespace-insensitive (fuzzy) match
-			// so small indentation/trailing-space differences in the model's
-			// quoted text don't block the edit (Aider-style input tolerance).
-			if result, ok := fuzzyReplace(content, args.OldString, args.NewString); ok {
-				count = 1
-				newContent = result
-			} else {
-				return fmt.Sprintf(
-					"Error: old_string not found in %s (exact and whitespace-insensitive "+
-						"match both failed).%s\nRe-read the file and copy the exact text to replace.",
-					args.FilePath, closestLinesHint(content, args.OldString)), true
-			}
-		}
+		return fmt.Sprintf(
+			"Error: edit policy %s could not apply to %s: %v.%s\nRe-read the file and retry with the required edit format.",
+			normalizeEditPolicy(opts.EditPolicy),
+			args.FilePath,
+			err,
+			hint,
+		), true
 	}
 
 	// ── Lint gate ──
@@ -337,21 +346,39 @@ func executeEditV2(input json.RawMessage, workDir string) (string, bool) {
 	// didn't break it. A new syntax error rolls back the write and reports
 	// the error, which flows back to the model via the tool_result and the
 	// reflection loop in RunLoop, prompting a self-correcting retry.
-	preLintOK := lintFile(path) == "" // path still holds the original bytes
-
-	err = os.WriteFile(path, []byte(newContent), 0644)
-	if err != nil {
-		return fmt.Sprintf("Error writing %s: %v", args.FilePath, err), true
+	baselineRevision := artifactBytesRevision(data)
+	baselineLint := lintFileWithOptions(path, baselineRevision, opts)
+	if baselineLint.failedInfrastructure() {
+		return fmt.Sprintf(
+			"Edit was not started because the original file could not be linted safely:\n%s",
+			strings.TrimSpace(baselineLint.Message),
+		), true
 	}
+	preLintOK := baselineLint.Valid || !baselineLint.Checked
 
+	stage, err := stageArtifact(path, []byte(newContent), info.Mode())
+	if err != nil {
+		return fmt.Sprintf("Error staging %s: %v", args.FilePath, err), true
+	}
+	defer stage.cleanup()
 	if preLintOK {
-		if lintErr := lintFile(path); lintErr != "" {
-			os.WriteFile(path, data, 0644) // roll back to original
-			return fmt.Sprintf(
-				"Your edit introduced a syntax error and was NOT applied:\n%s\n\n"+
-					"The file is unchanged. Fix your edit and try again. "+
-					"Do NOT repeat the same failed edit.", strings.TrimSpace(lintErr)), true
+		lintResult := lintFileWithOptions(stage.temporary, stage.revision, opts)
+		if !lintResult.Valid {
+			if stateErr := validateExpectedArtifactState(path, baselineRevision, false); stateErr != nil {
+				current, revisionErr := readLedgerFileRevision(path)
+				return concurrentMutationFailure("edit", baselineRevision, current, revisionErr), true
+			}
+			return stagedLintFailure("edit", lintResult)
 		}
+	}
+	if err := validateArtifactPrecondition(path, opts.fileMutation); err != nil {
+		return fileMutationBlocked("edit", err)
+	}
+	if err := stage.commit(baselineRevision, false); err != nil {
+		return fileMutationBlocked("edit", err)
+	}
+	if current, revisionErr := readLedgerFileRevision(path); revisionErr != nil || current != stage.revision {
+		return concurrentMutationFailure("edit", stage.revision, current, revisionErr), true
 	}
 
 	if count == 1 {
@@ -363,44 +390,111 @@ func executeEditV2(input json.RawMessage, workDir string) (string, bool) {
 // ── Improved Write: diff preview, backup ──
 
 func executeWriteV2(input json.RawMessage, workDir string) (string, bool) {
+	runner, policy := DefaultSandboxExecution(workDir)
+	return executeWriteV2WithOptions(input, workDir, ToolExecutionOptions{
+		SandboxRunner: runner,
+		SandboxPolicy: policy,
+	})
+}
+
+func executeWriteV2WithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	var args struct {
 		FilePath string `json:"file_path"`
 		Content  string `json:"content"`
 	}
-	json.Unmarshal(input, &args)
+	if err := json.Unmarshal(input, &args); err != nil {
+		return fmt.Sprintf("Invalid Write input: %v", err), true
+	}
 
-	path := resolvePath(args.FilePath, workDir)
+	path, err := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation)
+	if err != nil {
+		return fileMutationBlocked("write", err)
+	}
+	unlock := lockArtifactMutation(path)
+	defer unlock()
+
 	dir := filepath.Dir(path)
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Sprintf("Error creating directory for %s: %v", args.FilePath, err), true
+	}
+	if opts.fileMutation != nil {
+		canonical, pathErr := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation)
+		if pathErr != nil || !sameArtifactMutationPath(canonical, path) {
+			if pathErr == nil {
+				pathErr = errors.New("mutation directory changed after creation")
+			}
+			return fileMutationBlocked("write", pathErr)
+		}
+	}
 
 	// Check if file exists; keep a backup for the lint-gate rollback.
 	existed := false
 	var backup []byte
-	if d, err := os.ReadFile(path); err == nil {
+	if d, readErr := os.ReadFile(path); readErr == nil {
 		existed = true
 		backup = d
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Sprintf("Error reading %s: %v", args.FilePath, readErr), true
+	}
+	if existed {
+		if err := validateArtifactBytesPrecondition(backup, opts.fileMutation); err != nil {
+			return fileMutationBlocked("write", err)
+		}
+	} else if err := validateArtifactPrecondition(path, opts.fileMutation); err != nil {
+		return fileMutationBlocked("write", err)
 	}
 	// Gate only when we have a clean baseline: a brand-new file, or an
 	// existing file that was already syntactically valid.
-	preLintOK := !existed || lintFile(path) == ""
-
-	err := os.WriteFile(path, []byte(args.Content), 0644)
-	if err != nil {
-		return fmt.Sprintf("Error writing %s: %v", args.FilePath, err), true
+	preLintOK := true
+	if existed {
+		baselineLint := lintFileWithOptions(path, artifactBytesRevision(backup), opts)
+		if baselineLint.failedInfrastructure() {
+			return fmt.Sprintf(
+				"Write was not started because the original file could not be linted safely:\n%s",
+				strings.TrimSpace(baselineLint.Message),
+			), true
+		}
+		preLintOK = baselineLint.Valid || !baselineLint.Checked
 	}
 
-	if preLintOK {
-		if lintErr := lintFile(path); lintErr != "" {
-			if existed {
-				os.WriteFile(path, backup, 0644) // roll back to original
-			} else {
-				os.Remove(path) // remove the newly-created broken file
+	mode := os.FileMode(0o644)
+	if existed {
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() {
+			if statErr == nil {
+				statErr = fmt.Errorf("target is not a regular file")
 			}
-			return fmt.Sprintf(
-				"Your write introduced a syntax error and was NOT applied:\n%s\n\n"+
-					"Fix the content and try again. "+
-					"Do NOT repeat the same failed write.", strings.TrimSpace(lintErr)), true
+			return fmt.Sprintf("Error inspecting %s: %v", args.FilePath, statErr), true
 		}
+		mode = info.Mode()
+	}
+	baselineRevision := ""
+	if existed {
+		baselineRevision = artifactBytesRevision(backup)
+	}
+	stage, err := stageArtifact(path, []byte(args.Content), mode)
+	if err != nil {
+		return fmt.Sprintf("Error staging %s: %v", args.FilePath, err), true
+	}
+	defer stage.cleanup()
+	if preLintOK {
+		lintResult := lintFileWithOptions(stage.temporary, stage.revision, opts)
+		if !lintResult.Valid {
+			if stateErr := validateExpectedArtifactState(path, baselineRevision, !existed); stateErr != nil {
+				current, revisionErr := readLedgerFileRevision(path)
+				return concurrentMutationFailure("write", baselineRevision, current, revisionErr), true
+			}
+			return stagedLintFailure("write", lintResult)
+		}
+	}
+	if err := validateArtifactPrecondition(path, opts.fileMutation); err != nil {
+		return fileMutationBlocked("write", err)
+	}
+	if err := stage.commit(baselineRevision, !existed); err != nil {
+		return fileMutationBlocked("write", err)
+	}
+	if current, revisionErr := readLedgerFileRevision(path); revisionErr != nil || current != stage.revision {
+		return concurrentMutationFailure("write", stage.revision, current, revisionErr), true
 	}
 
 	lines := len(strings.Split(args.Content, "\n"))
@@ -409,4 +503,60 @@ func executeWriteV2(input json.RawMessage, workDir string) (string, bool) {
 		action = "Updated"
 	}
 	return fmt.Sprintf("%s %s (%d lines, %s)", action, args.FilePath, lines, formatSize(int64(len(args.Content)))), false
+}
+
+func concurrentMutationFailure(operation, expected, actual string, revisionErr error) string {
+	detail := "artifact revision became unavailable"
+	if revisionErr != nil {
+		detail += ": " + revisionErr.Error()
+	} else {
+		detail = fmt.Sprintf("expected %s, found %s", expected, actual)
+	}
+	return fmt.Sprintf(
+		"The %s could not be validated because the file changed concurrently (%s). Rollback was skipped so another writer's content was not overwritten.",
+		operation,
+		detail,
+	)
+}
+
+func rollbackLintFailure(
+	operation string,
+	path string,
+	writtenRevision string,
+	existed bool,
+	backup []byte,
+	lintResult LintResult,
+) (string, bool) {
+	if lintResult.Failure == LintFailureRevisionMismatch || lintResult.Failure == LintFailureArtifact {
+		return concurrentMutationFailure(operation, writtenRevision, lintResult.ArtifactRevision, nil), true
+	}
+	rolledBack, rollbackErr := rollbackArtifactIfRevision(path, writtenRevision, existed, backup)
+	if rollbackErr != nil || !rolledBack {
+		detail := "rollback did not complete"
+		if rollbackErr != nil {
+			detail = rollbackErr.Error()
+		}
+		return fmt.Sprintf(
+			"The %s failed lint validation: %s\n%s. Another writer's content was not overwritten.",
+			operation,
+			strings.TrimSpace(lintResult.Message),
+			detail,
+		), true
+	}
+
+	if lintResult.Failure == LintFailureSyntax {
+		return fmt.Sprintf(
+			"Your %s introduced a syntax error and was NOT applied:\n%s\n\n"+
+				"The file is unchanged. Fix the content and try again. "+
+				"Do NOT repeat the same failed %s.",
+			operation,
+			strings.TrimSpace(lintResult.Message),
+			operation,
+		), true
+	}
+	return fmt.Sprintf(
+		"The %s was rolled back because syntax validation could not complete safely:\n%s\n\nThe file is unchanged.",
+		operation,
+		strings.TrimSpace(lintResult.Message),
+	), true
 }

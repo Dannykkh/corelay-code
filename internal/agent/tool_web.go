@@ -266,7 +266,7 @@ func ollamaWebSearch(ctx context.Context, query string, maxResults int) ([]webSe
 	if key == "" {
 		return nil, fmt.Errorf("OLLAMA_API_KEY is not set")
 	}
-	base := strings.TrimRight(coalesceString(os.Getenv("ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
+	base := strings.TrimRight(coalesceString(renamedAgentEnv("CORELAY_OLLAMA_WEB_BASE_URL", "ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
 	body, _ := json.Marshal(map[string]any{
 		"query":       query,
 		"max_results": maxResults,
@@ -277,7 +277,7 @@ func ollamaWebSearch(ctx context.Context, query string, maxResults int) ([]webSe
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "AniClew/1.0 (Ollama WebSearch)")
+	req.Header.Set("User-Agent", "CorelayCode/1.0 (Ollama WebSearch)")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -319,7 +319,7 @@ func ollamaWebFetch(ctx context.Context, targetURL string) (webFetchResult, erro
 	if key == "" {
 		return webFetchResult{}, fmt.Errorf("OLLAMA_API_KEY is not set")
 	}
-	base := strings.TrimRight(coalesceString(os.Getenv("ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
+	base := strings.TrimRight(coalesceString(renamedAgentEnv("CORELAY_OLLAMA_WEB_BASE_URL", "ANICLEW_OLLAMA_WEB_BASE_URL"), "https://ollama.com"), "/")
 	body, _ := json.Marshal(map[string]any{"url": targetURL})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/web_fetch", bytes.NewReader(body))
 	if err != nil {
@@ -327,7 +327,7 @@ func ollamaWebFetch(ctx context.Context, targetURL string) (webFetchResult, erro
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "AniClew/1.0 (Ollama WebFetch)")
+	req.Header.Set("User-Agent", "CorelayCode/1.0 (Ollama WebFetch)")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1076,7 +1076,7 @@ func appendUniqueStrings(base []string, values ...string) []string {
 }
 
 func browserUserAgent() string {
-	return "Mozilla/5.0 (compatible; AniClew/1.0; +https://github.com/aniclew/aniclew)"
+	return "Mozilla/5.0 (compatible; CorelayCode/1.0; +https://github.com/Dannykkh/corelay-code)"
 }
 
 func coalesceString(values ...string) string {

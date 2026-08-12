@@ -19,7 +19,7 @@ import (
 //	...managed content...
 //	<!-- auto-memory:end -->
 //
-// These markers follow the convention used elsewhere in AniClew for
+// These markers follow the convention used elsewhere in Corelay Code for
 // sections written by tools (see e.g. CLAUDE.md's code map section).
 
 const (
@@ -85,7 +85,7 @@ func defaultScaffold() string {
 	b.WriteString("# MEMORY.md\n\n")
 	b.WriteString("Long-term memory index for this workspace. Hand-edit the\n")
 	b.WriteString("sections you own; the block between the markers below is\n")
-	b.WriteString("managed by the AniClew memory service and will be rewritten.\n\n")
+	b.WriteString("managed by the Corelay Code memory service and will be rewritten.\n\n")
 	b.WriteString(autoStartMarker)
 	b.WriteByte('\n')
 	b.WriteString(autoEndMarker)
@@ -219,4 +219,3 @@ func ensureTrailingNewline(s string) string {
 	s = strings.TrimRight(s, "\n")
 	return s + "\n"
 }
-

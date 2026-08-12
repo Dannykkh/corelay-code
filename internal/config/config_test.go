@@ -7,6 +7,7 @@ import (
 
 func TestConfigDirEnvOverride(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", "")
 	t.Setenv("ANICLEW_CONFIG_DIR", dir)
 
 	want := filepath.Join(dir, "config.json")
@@ -15,8 +16,21 @@ func TestConfigDirEnvOverride(t *testing.T) {
 	}
 }
 
+func TestConfigDirCorelayEnvOverrideTakesPriority(t *testing.T) {
+	current := t.TempDir()
+	legacy := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", current)
+	t.Setenv("ANICLEW_CONFIG_DIR", legacy)
+
+	want := filepath.Join(current, "config.json")
+	if got := ConfigPath(); got != want {
+		t.Fatalf("ConfigPath() = %q, want %q", got, want)
+	}
+}
+
 func TestConfigSaveLoadEvidencePolicy(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", "")
 	t.Setenv("ANICLEW_CONFIG_DIR", dir)
 
 	cfg := DefaultConfig()

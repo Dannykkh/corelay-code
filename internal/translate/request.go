@@ -3,7 +3,7 @@ package translate
 import (
 	"log"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ToOpenAI converts an Anthropic Messages request to an OpenAI Chat Completions request.
@@ -31,7 +31,8 @@ func ToOpenAI(req *types.MessagesRequest, model string) types.OAIChatRequest {
 		result.Temperature = req.Temperature
 	}
 
-	// Tools — optionally pruned to a budget (ANICLEW_MAX_TOOLS) so a weak local
+	// Tools — optionally pruned to a budget (CORELAY_MAX_TOOLS; legacy
+	// ANICLEW_MAX_TOOLS) so a weak local
 	// model is not overwhelmed by a huge tool list (e.g. an MCP-inflated CLI
 	// sending 90 tools). Opt-in; no-op when unset or when under budget.
 	reqTools := req.Tools

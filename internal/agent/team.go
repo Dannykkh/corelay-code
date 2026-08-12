@@ -12,23 +12,165 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ── Team: Lead/Worker orchestration with Wave execution ──
 
 // TeamConfig holds team-level settings.
 type TeamConfig struct {
-	Name              string          `json:"name"`
-	MaxWaveSize       int             `json:"maxWaveSize"`   // max agents per wave (default 5)
-	CycleTimeout      time.Duration   `json:"cycleTimeout"`  // per-wave timeout
-	VerifyCommand     string          `json:"verifyCommand"` // verification command
-	Capacity          CapacityConfig  `json:"capacity,omitempty"`
-	WorkstreamContext string          `json:"-"`
-	ProviderFactory   ProviderFactory `json:"-"`
+	Name              string                  `json:"name"`
+	MaxWaveSize       int                     `json:"maxWaveSize"`   // max agents per wave (default 5)
+	CycleTimeout      time.Duration           `json:"cycleTimeout"`  // per-wave timeout
+	VerifyCommand     string                  `json:"verifyCommand"` // verification command
+	Capacity          CapacityConfig          `json:"capacity,omitempty"`
+	WorkstreamContext string                  `json:"-"`
+	ProviderFactory   ProviderFactory         `json:"-"`
+	SessionID         string                  `json:"-"`
+	ApprovalRequester approval.Requester      `json:"-"`
+	SandboxRunner     sandbox.Runner          `json:"-"`
+	SandboxPolicy     sandbox.Policy          `json:"-"`
+	PluginDirs        []string                `json:"-"`
+	PluginExecution   *PluginExecutionOptions `json:"-"`
+	DisablePlugins    bool                    `json:"-"`
+	Recorder          RunRecorder             `json:"-"`
 }
 
 type ProviderFactory func(name string) (types.Provider, error)
+
+const (
+	teamTaskResultPrefixLimit = 500
+	teamRunFailureLimit       = 1000
+)
+
+// teamRunTerminalReducer owns only the Team worker's task-local outcome. The
+// Agent Kernel remains the sole owner of recording, hooks, receipts, and the
+// durable transcript.
+type teamRunTerminalReducer struct {
+	terminalSeen bool
+	failure      string
+}
+
+func (r *teamRunTerminalReducer) Observe(event Event, contextErr error) {
+	if r.terminalSeen {
+		return
+	}
+	// The kernel's terminal frame is the ordering authority. Inspect it before
+	// the consumer's context snapshot so a frame already queued by the kernel is
+	// not retroactively failed by a deadline that fires while it is in transit.
+	if event.Type == "done" {
+		r.terminalSeen = true
+		if terminal, ok := DecodeDurableRunTerminalMetadata(event.Data); ok && terminal.BlocksSuccess() {
+			r.fail(fmt.Sprintf(
+				"worker terminal blocks task success (terminalState=%q, completionStatus=%q, completionBlocked=%d)",
+				terminal.TerminalState,
+				terminal.CompletionStatus,
+				terminal.CompletionBlocked,
+			))
+		}
+		return
+	}
+
+	switch event.Type {
+	case "error", "context_blocked", "blocked", "incomplete",
+		"canceled", "cancelled", "context_canceled", "context_cancelled",
+		"deadline", "deadline_exceeded":
+		r.fail(teamRunEventFailure(event))
+	}
+	if contextErr != nil {
+		r.fail(contextErr.Error())
+	}
+}
+
+func (r *teamRunTerminalReducer) Result(contextErr error) (bool, string) {
+	// A normal terminal event is the linearization point. Cancellation after it
+	// must not retroactively turn a completed task into a failed task.
+	if r.terminalSeen {
+		return r.failure == "", r.failure
+	}
+	if contextErr != nil {
+		r.fail(contextErr.Error())
+	}
+	if r.failure == "" {
+		r.fail("worker event stream closed without a terminal event")
+	}
+	return false, r.failure
+}
+
+func (r *teamRunTerminalReducer) fail(message string) {
+	if r.failure != "" {
+		return
+	}
+	r.failure = teamBoundedText(message, teamRunFailureLimit)
+	if r.failure == "" {
+		r.failure = "worker run failed"
+	}
+}
+
+func teamRunEventFailure(event Event) string {
+	var detail string
+	switch data := event.Data.(type) {
+	case nil:
+	case string:
+		detail = data
+	case ContextBlockedEvent:
+		detail = data.Message
+	case *ContextBlockedEvent:
+		if data != nil {
+			detail = data.Message
+		}
+	case map[string]interface{}:
+		if message, ok := data["message"].(string); ok {
+			detail = message
+		}
+	default:
+		detail = fmt.Sprint(data)
+	}
+	if strings.TrimSpace(detail) == "" {
+		return "worker run reported " + event.Type
+	}
+	return detail
+}
+
+func teamBoundedText(value string, limit int) string {
+	value = strings.TrimSpace(strings.ToValidUTF8(value, "\uFFFD"))
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return contextUTF8Prefix(value, limit)
+	}
+	return contextUTF8Prefix(value, limit-3) + "..."
+}
+
+type teamPartialResult struct {
+	text    string
+	clipped bool
+}
+
+func (r *teamPartialResult) Append(value string) {
+	if value == "" || r.clipped {
+		return
+	}
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	remaining := teamTaskResultPrefixLimit - len(r.text)
+	if remaining <= 0 {
+		r.clipped = true
+		return
+	}
+	prefix := contextUTF8Prefix(value, remaining)
+	r.text += prefix
+	r.clipped = len(prefix) < len(value)
+}
+
+func (r teamPartialResult) Summary(outputPath string) string {
+	if !r.clipped {
+		return r.text
+	}
+	return r.text + "... (full output: " + outputPath + ")"
+}
 
 // TeamTask represents a task with dependencies.
 type TeamTask struct {
@@ -92,6 +234,15 @@ func NewTeam(provider types.Provider, model, workDir, baseDir string, cfg TeamCo
 		localProvider = isLocalProvider(provider.Name())
 	}
 	cfg.Capacity = cfg.Capacity.Normalized(localProvider)
+	if cfg.PluginDirs != nil {
+		pluginDirs := make([]string, len(cfg.PluginDirs))
+		copy(pluginDirs, cfg.PluginDirs)
+		cfg.PluginDirs = pluginDirs
+	}
+	if cfg.PluginExecution != nil {
+		copy := *cfg.PluginExecution
+		cfg.PluginExecution = &copy
+	}
 	return &Team{
 		config:   cfg,
 		tasks:    make([]*TeamTask, 0),
@@ -101,6 +252,48 @@ func NewTeam(provider types.Provider, model, workDir, baseDir string, cfg TeamCo
 		model:    model,
 		workDir:  workDir,
 		baseDir:  baseDir,
+	}
+}
+
+// CreateWorktree composes TeamConfig's immutable sandbox pair into the common
+// worktree process boundary. Missing or Disabled configuration remains
+// fail-closed through configuredSandboxExecution.
+func (t *Team) CreateWorktree(ctx context.Context, name string) (*Worktree, error) {
+	return CreateWorktreeWithOptions(t.workDir, name, t.worktreeToolOptions(ctx, "team-worktree-create"))
+}
+
+func (t *Team) RemoveWorktree(ctx context.Context, worktreePath string) error {
+	return RemoveWorktreeWithOptions(t.workDir, worktreePath, t.worktreeToolOptions(ctx, "team-worktree-remove"))
+}
+
+func (t *Team) ListWorktrees(ctx context.Context) ([]Worktree, error) {
+	return ListWorktreesWithOptions(t.workDir, t.worktreeToolOptions(ctx, "team-worktree-list"))
+}
+
+func (t *Team) worktreeToolOptions(ctx context.Context, toolID string) ToolExecutionOptions {
+	runner, policy := configuredSandboxExecution(
+		t.config.SandboxRunner,
+		t.config.SandboxPolicy,
+		"team worktree",
+	)
+	return ToolExecutionOptions{
+		Context:       ctx,
+		SandboxRunner: runner,
+		SandboxPolicy: policy,
+		ObserveSandbox: func(report sandbox.Report) {
+			recordSandboxExecution(t.config.Recorder, SandboxExecutionRecord{
+				ToolID:   toolID,
+				ToolName: "Git",
+				Report:   report,
+			})
+			t.emitEvent(Event{Type: "tool_result", Data: map[string]interface{}{
+				"id":      toolID,
+				"name":    "Git",
+				"result":  report.Detail,
+				"isError": report.Failure != sandbox.FailureNone,
+				"sandbox": report,
+			}})
+		},
 	}
 }
 
@@ -438,11 +631,24 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	}
 
 	innerEventCh := make(chan Event, 100)
+	sandboxRunner, sandboxPolicy := configuredSandboxExecution(
+		t.config.SandboxRunner,
+		t.config.SandboxPolicy,
+		"team worker",
+	)
 	go RunLoopWithOptions(workerCtx, provider, model, messages, t.workDir, RunOptions{
+		SessionID:         t.config.SessionID,
+		ApprovalRequester: t.config.ApprovalRequester,
 		ResponseLang:      "auto",
 		WorkstreamContext: t.config.WorkstreamContext,
 		WorkerID:          workerID,
 		OwnershipChecker:  t.CheckFileOwnership,
+		Recorder:          t.config.Recorder,
+		SandboxRunner:     sandboxRunner,
+		SandboxPolicy:     sandboxPolicy,
+		PluginDirs:        t.config.PluginDirs,
+		PluginExecution:   t.config.PluginExecution,
+		DisablePlugins:    t.config.DisablePlugins,
 	}, innerEventCh)
 
 	// Disk-based output: write to file instead of accumulating in memory
@@ -454,13 +660,15 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	t.mu.Unlock()
 	outputFile, _ := os.Create(outputPath)
 
-	var result string
+	var partialResult teamPartialResult
+	var terminal teamRunTerminalReducer
 	toolCalls := 0
 	for event := range innerEventCh {
+		terminal.Observe(event, workerCtx.Err())
 		switch event.Type {
 		case "text":
 			if text, ok := event.Data.(string); ok {
-				result += text
+				partialResult.Append(text)
 				if outputFile != nil {
 					outputFile.WriteString(text)
 				}
@@ -472,6 +680,13 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 					fmt.Fprintf(outputFile, "\n[tool:%s] %v\n", data["name"], truncateStr(fmt.Sprint(data["result"]), 500))
 				}
 			}
+			if data, ok := event.Data.(map[string]interface{}); ok && data["sandbox"] != nil {
+				t.emitEvent(event)
+			}
+		case "approval_required":
+			t.emitEvent(event)
+		case "error", "context_blocked":
+			t.emitEvent(event)
 		}
 
 		// Check mailbox for shutdown requests
@@ -487,17 +702,19 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 		outputFile.Close()
 	}
 
-	// Keep only summary in memory (not full output)
-	if len(result) > 500 {
-		result = result[:500] + "... (full output: " + outputPath + ")"
-	}
+	// Keep only a bounded prefix in memory; the complete text remains on disk.
+	result := partialResult.Summary(outputPath)
+	success, runFailure := terminal.Result(workerCtx.Err())
 
 	// Update task status
 	t.mu.Lock()
+	if result == "" && runFailure != "" {
+		result = runFailure
+	}
 	task.Result = result
 	task.ToolCalls = toolCalls
 	task.FinishedAt = time.Now()
-	if workerCtx.Err() != nil {
+	if !success {
 		task.Status = "failed"
 	} else {
 		task.Status = "completed"
@@ -623,7 +840,7 @@ func (t *Team) Verify(ctx context.Context) (bool, string) {
 		t.report(fmt.Sprintf("Verification attempt %d/%d: %s", attempt, maxRetries, t.config.VerifyCommand))
 
 		input, _ := json.Marshal(map[string]string{"command": t.config.VerifyCommand})
-		result := ExecuteBashDeep(input, t.workDir, nil)
+		result := t.executeVerificationBash(ctx, input, fmt.Sprintf("team-verify-%d", attempt))
 
 		if !result.IsError {
 			return true, fmt.Sprintf("Verification PASSED (attempt %d):\n%s", attempt, truncateStr(result.Output, 500))
@@ -643,8 +860,39 @@ func (t *Team) Verify(ctx context.Context) (bool, string) {
 	}
 
 	input, _ := json.Marshal(map[string]string{"command": t.config.VerifyCommand})
-	result := ExecuteBashDeep(input, t.workDir, nil)
+	result := t.executeVerificationBash(ctx, input, "team-verify-final")
 	return false, fmt.Sprintf("Verification FAILED after %d attempts:\n%s", maxRetries, truncateStr(result.Output, 2000))
+}
+
+func (t *Team) executeVerificationBash(ctx context.Context, input json.RawMessage, toolID string) BashExecResult {
+	runner, policy := configuredSandboxExecution(
+		t.config.SandboxRunner,
+		t.config.SandboxPolicy,
+		"team verification",
+	)
+	var observed sandbox.Report
+	var hasReport bool
+	result := ExecuteBashDeepWithOptions(input, t.workDir, BashExecOptions{
+		Context: ctx,
+		Runner:  runner,
+		Policy:  policy,
+		ObserveReport: func(report sandbox.Report) {
+			observed = report
+			hasReport = true
+		},
+	})
+	if hasReport {
+		record := SandboxExecutionRecord{ToolID: toolID, ToolName: "Bash", Report: observed}
+		recordSandboxExecution(t.config.Recorder, record)
+		t.emitEvent(Event{Type: "tool_result", Data: map[string]interface{}{
+			"id":      toolID,
+			"name":    "Bash",
+			"result":  truncateStr(result.Output, 1000),
+			"isError": result.IsError,
+			"sandbox": observed,
+		}})
+	}
+	return result
 }
 
 // ── Team Cleanup ──
@@ -761,5 +1009,11 @@ func (t *Team) report(msg string) {
 	log.Printf("[Team/%s] %s", t.config.Name, msg)
 	if t.eventCh != nil {
 		t.eventCh <- Event{Type: "status", Data: msg}
+	}
+}
+
+func (t *Team) emitEvent(event Event) {
+	if t.eventCh != nil {
+		t.eventCh <- event
 	}
 }

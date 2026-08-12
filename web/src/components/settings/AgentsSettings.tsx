@@ -58,10 +58,10 @@ const CONTRACTS = [
 ];
 
 const CORE_AGENT_CARD = {
-  name: "aniclew-runtime",
+  name: "corelaycode-runtime",
   status: "draft",
-  path: "docs/agent-cards/aniclew-runtime.agent.md",
-  preload: ["docs/llms.txt", "aniclew-runtime.agent.md"],
+  path: "docs/agent-cards/corelaycode-runtime.agent.md",
+  preload: ["docs/llms.txt", "corelaycode-runtime.agent.md"],
   gate: ["docs:check", "proxy-go tests", "targeted eslint"],
 };
 

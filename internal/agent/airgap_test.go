@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func TestOfflineMode(t *testing.T) {
@@ -21,7 +21,7 @@ func TestOfflineMode(t *testing.T) {
 		" 1 ":   true,
 	}
 	for val, want := range cases {
-		t.Setenv("ANICLEW_OFFLINE", val)
+		t.Setenv("CORELAY_OFFLINE", val)
 		if got := OfflineMode(); got != want {
 			t.Errorf("OfflineMode() with %q = %v, want %v", val, got, want)
 		}
@@ -36,13 +36,13 @@ func TestFilterEgressTools(t *testing.T) {
 	}
 
 	// Online: untouched.
-	t.Setenv("ANICLEW_OFFLINE", "0")
+	t.Setenv("CORELAY_OFFLINE", "0")
 	if got := filterEgressTools(defs); len(got) != len(defs) {
 		t.Fatalf("online: expected %d tools, got %d", len(defs), len(got))
 	}
 
 	// Offline: egress tools removed, local tools kept.
-	t.Setenv("ANICLEW_OFFLINE", "1")
+	t.Setenv("CORELAY_OFFLINE", "1")
 	got := filterEgressTools(defs)
 	names := map[string]bool{}
 	for _, d := range got {
@@ -65,7 +65,7 @@ func TestFilterEgressTools(t *testing.T) {
 }
 
 func TestExecuteToolBlocksEgressOffline(t *testing.T) {
-	t.Setenv("ANICLEW_OFFLINE", "1")
+	t.Setenv("CORELAY_OFFLINE", "1")
 	for _, name := range []string{"WebSearch", "WebFetch", "WebResearch", "HTTPRequest"} {
 		input := json.RawMessage(`{"url":"https://example.com","query":"x"}`)
 		out, isErr := ExecuteTool(name, input, t.TempDir())

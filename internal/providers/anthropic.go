@@ -10,18 +10,27 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 type AnthropicProvider struct {
-	apiKey  string
-	baseURL string
+	apiKey   string
+	baseURL  string
+	httpDoer HTTPDoer
 }
 
 func NewAnthropic(cfg *types.ProviderConfig) types.Provider {
+	return NewAnthropicWithOptions(cfg, CreateOptions{})
+}
+
+func NewAnthropicWithOptions(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	return &AnthropicProvider{
-		apiKey:  coalesce(cfg.APIKey, os.Getenv("ANTHROPIC_API_KEY")),
-		baseURL: coalesce(cfg.BaseURL, "https://api.anthropic.com"),
+		apiKey:   coalesce(cfg.APIKey, os.Getenv("ANTHROPIC_API_KEY")),
+		baseURL:  coalesce(cfg.BaseURL, "https://api.anthropic.com"),
+		httpDoer: httpDoerOrDefault(opts.HTTPDoer),
 	}
 }
 
@@ -56,7 +65,7 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, req *types.Messag
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic request construction failed")
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -86,7 +95,7 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, req *types.Messag
 		httpReq.Header.Set("anthropic-beta", strings.Join(betas, ","))
 	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := httpDoerOrDefault(p.httpDoer).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic connection failed: %w", err)
 	}

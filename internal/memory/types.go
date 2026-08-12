@@ -1,5 +1,5 @@
 // Package memory implements long-term memory storage and retrieval for the
-// AniClew agent loop, inspired by Claude Code's memdir + extractMemories +
+// Corelay Code agent loop, inspired by Claude Code's memdir + extractMemories +
 // autoDream pattern.
 //
 // This is distinct from agent.SessionMemory: that one offloads large tool
@@ -10,7 +10,7 @@
 //
 // Storage layout (per workspace, hashed):
 //
-//	~/.aniclew/projects/<key>/memory/
+//	~/.corelay/projects/<key>/memory/
 //	├── MEMORY.md       (index, capped at 200 lines / 25KB)
 //	├── user_*.md
 //	├── feedback_*.md

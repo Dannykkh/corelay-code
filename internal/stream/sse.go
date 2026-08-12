@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // WriteSSEEvent writes a single Anthropic SSE event to an http.ResponseWriter.

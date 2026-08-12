@@ -1,0 +1,29 @@
+{
+  "upstream": {
+    "repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+    "snapshotCommit": "af41b25f57a79c5629b3164e23fb4e8650badeeb",
+    "schemaV1Sha256": "dce90564fc0d87e16cd9645fa5faba1cb5fb7adac2608bb0b98f6fbda8e951f9",
+    "metaV1Sha256": "e94998dd88acca9e53d5a0d7c89587b9b4e6fec4c1d925519da04e70917f797b",
+    "releaseCommit": "5e89c71497fe07dd4ae633c181a17224f4a8956d"
+  },
+  "protocolVersion": 1,
+  "advertised": {
+    "loadSession": true,
+    "sessionList": true,
+    "sessionDelete": true,
+    "sessionResume": true,
+    "sessionClose": true,
+    "additionalDirectories": false,
+    "promptImage": false,
+    "promptAudio": false,
+    "promptEmbeddedContext": false,
+    "mcpHttp": false,
+    "mcpSse": false,
+    "authLogout": false
+  },
+  "unadvertisedMethods": [
+    "authenticate",
+    "logout",
+    "session/set_mode"
+  ]
+}

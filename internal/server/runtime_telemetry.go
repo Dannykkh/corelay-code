@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/runtimeplane"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func runtimeTargetForProviderModel(providerName, model string) runtimeplane.RuntimeTarget {

@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"os"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -23,7 +26,62 @@ const (
 	EvidenceGateWarn       = "warn"
 	EvidenceGateWouldBlock = "would-block"
 	EvidenceGateBlock      = "block"
+
+	EvidenceTerminalVerified          = "verified"
+	EvidenceTerminalPartiallyVerified = "partially-verified"
+	EvidenceTerminalUnverified        = "unverified"
+	EvidenceTerminalBlocked           = "blocked"
+
+	maxCompletionEvidenceRefs        = 256
+	maxCompletionEvidenceToolNameLen = 128
+	maxCompletionEvidenceInputBytes  = 1 << 20
+	maxCompletionEvidenceResultBytes = 4 << 20
 )
+
+var (
+	errCompletionEvidenceInvalidRunID = errors.New("completion evidence run ID is invalid")
+	errCompletionEvidenceRunBound     = errors.New("completion evidence ledger is already bound to another run")
+	errCompletionEvidenceNotBound     = errors.New("completion evidence ledger is not bound to a run")
+	errCompletionEvidenceLimit        = errors.New("completion evidence reference limit reached")
+	errCompletionEvidenceInvalidTool  = errors.New("completion evidence tool name is invalid")
+	errCompletionEvidenceFieldLarge   = errors.New("completion evidence field exceeds its bound")
+	errCompletionEvidenceCollision    = errors.New("completion evidence digest collision")
+)
+
+type CompletionEvidenceSource string
+
+const (
+	CompletionEvidenceSourceTool       CompletionEvidenceSource = "tool"
+	CompletionEvidenceSourceAutoVerify CompletionEvidenceSource = "auto-verify"
+)
+
+// CompletionToolOutcome is the execution-bound input for completion evidence.
+// Denied, synthetic, or not-executed outcomes are deliberately ignored.
+type CompletionToolOutcome struct {
+	ToolName  string
+	Input     json.RawMessage
+	Result    string
+	IsError   bool
+	Executed  bool
+	Synthetic bool
+	Denied    bool
+}
+
+// CompletionEvidenceRef contains only bounded metadata and a canonical
+// digest. Raw tool input, result, command, and preview content are never kept.
+type CompletionEvidenceRef struct {
+	Digest    string                   `json:"digest"`
+	Sequence  uint64                   `json:"sequence"`
+	Source    CompletionEvidenceSource `json:"source"`
+	ToolName  string                   `json:"toolName"`
+	Succeeded bool                     `json:"succeeded"`
+}
+
+// CompletionEvidenceSnapshot is append ordered and receipt/prompt safe.
+type CompletionEvidenceSnapshot struct {
+	RunID string                  `json:"runId"`
+	Refs  []CompletionEvidenceRef `json:"refs"`
+}
 
 type EvidencePolicyConfig struct {
 	Policy        string `json:"policy"`
@@ -40,11 +98,12 @@ type EvidenceRecord struct {
 }
 
 type EvidenceGateResult struct {
-	Decision string   `json:"decision"`
-	Mode     string   `json:"mode"`
-	Policy   string   `json:"policy"`
-	Summary  string   `json:"summary"`
-	Risks    []string `json:"risks,omitempty"`
+	Decision      string   `json:"decision"`
+	TerminalState string   `json:"terminalState"`
+	Mode          string   `json:"mode"`
+	Policy        string   `json:"policy"`
+	Summary       string   `json:"summary"`
+	Risks         []string `json:"risks,omitempty"`
 }
 
 type EvidenceLedger struct {
@@ -57,6 +116,10 @@ type EvidenceLedger struct {
 	Risks         []string
 	ChangedFiles  []string
 	Records       []EvidenceRecord
+
+	completionRunID           string
+	completionRefs            []CompletionEvidenceRef
+	completionSuccessByDigest map[string]bool
 }
 
 func DefaultEvidencePolicyConfig() EvidencePolicyConfig {
@@ -104,6 +167,73 @@ func ClassifyEvidenceMode(prompt string) (string, []string) {
 		return EvidenceModeNormal, risks
 	}
 	return EvidenceModeQuick, risks
+}
+
+// BindCompletionRun binds this run-owned ledger to exactly one completion
+// contract run. Repeating the same binding is idempotent; rebinding is denied.
+func (l *EvidenceLedger) BindCompletionRun(runID string) error {
+	if l == nil || !validCompletionEvidenceRunID(runID) {
+		return errCompletionEvidenceInvalidRunID
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.completionRunID != "" {
+		if l.completionRunID == runID {
+			return nil
+		}
+		return errCompletionEvidenceRunBound
+	}
+	l.completionRunID = runID
+	l.completionRefs = make([]CompletionEvidenceRef, 0, maxCompletionEvidenceRefs)
+	l.completionSuccessByDigest = make(map[string]bool, maxCompletionEvidenceRefs)
+	return nil
+}
+
+// ObserveCompletionToolOutcome appends evidence only after a real executor
+// outcome. ReportCompletion is a claim transport and can never prove itself.
+func (l *EvidenceLedger) ObserveCompletionToolOutcome(outcome CompletionToolOutcome) (CompletionEvidenceRef, error) {
+	if !outcome.Executed || outcome.Synthetic || outcome.Denied || strings.EqualFold(strings.TrimSpace(outcome.ToolName), "ReportCompletion") {
+		return CompletionEvidenceRef{}, nil
+	}
+	toolName, err := safeCompletionEvidenceToolName(outcome.ToolName)
+	if err != nil {
+		return CompletionEvidenceRef{}, err
+	}
+	return l.appendCompletionEvidence(
+		CompletionEvidenceSourceTool,
+		toolName,
+		[]byte(outcome.Input),
+		[]byte(outcome.Result),
+		!outcome.IsError,
+	)
+}
+
+// CompletionEvidenceSnapshot returns a defensive, bounded append-order copy.
+func (l *EvidenceLedger) CompletionEvidenceSnapshot() CompletionEvidenceSnapshot {
+	if l == nil {
+		return CompletionEvidenceSnapshot{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return CompletionEvidenceSnapshot{
+		RunID: completionReceiptText(l.completionRunID, maxCompletionRunIDBytes),
+		Refs:  append([]CompletionEvidenceRef(nil), l.completionRefs...),
+	}
+}
+
+// ResolveCompletionEvidence implements CompletionEvidenceResolver. Only a
+// successful ref from the exact bound run can satisfy a completion claim.
+func (l *EvidenceLedger) ResolveCompletionEvidence(runID, evidenceDigest string) (bool, error) {
+	if l == nil {
+		return false, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if runID == "" || runID != l.completionRunID {
+		return false, nil
+	}
+	succeeded, found := l.completionSuccessByDigest[evidenceDigest]
+	return found && succeeded, nil
 }
 
 func (l *EvidenceLedger) ObserveToolResult(toolName string, input json.RawMessage, output string, isError bool) {
@@ -164,11 +294,24 @@ func (l *EvidenceLedger) ObserveAutoVerify(output string, failed bool, ran bool)
 		Summary: truncateStr(strings.TrimSpace(output), 600),
 		At:      time.Now().UTC().Format(time.RFC3339Nano),
 	})
+	_, _ = l.appendCompletionEvidence(
+		CompletionEvidenceSourceAutoVerify,
+		string(CompletionEvidenceSourceAutoVerify),
+		nil,
+		[]byte(output),
+		!failed,
+	)
 }
 
 func (l *EvidenceLedger) Evaluate() EvidenceGateResult {
 	if l == nil {
-		return EvidenceGateResult{Decision: EvidenceGateAllow, Mode: EvidenceModeQuick, Policy: EvidencePolicyOff, Summary: "no evidence ledger"}
+		return EvidenceGateResult{
+			Decision:      EvidenceGateAllow,
+			TerminalState: EvidenceTerminalUnverified,
+			Mode:          EvidenceModeQuick,
+			Policy:        EvidencePolicyOff,
+			Summary:       "no evidence ledger",
+		}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -234,6 +377,7 @@ func (l *EvidenceLedger) ApplyToReceipt(v ReceiptVerification) ReceiptVerificati
 	}
 	v.Gate = gate.Decision
 	v.Mode = gate.Mode
+	v.TerminalState = evidenceTerminalState(gate.Decision, v.Status, records)
 	if v.Summary == "" {
 		v.Summary = gate.Summary
 	}
@@ -258,18 +402,142 @@ func bestEvidenceRecordLocked(records []EvidenceRecord) EvidenceRecord {
 
 func (l *EvidenceLedger) gateLocked(decision, summary string) EvidenceGateResult {
 	return EvidenceGateResult{
-		Decision: decision,
-		Mode:     l.Mode,
-		Policy:   l.Policy,
-		Summary:  summary,
-		Risks:    append([]string(nil), l.Risks...),
+		Decision:      decision,
+		TerminalState: evidenceTerminalState(decision, "", l.Records),
+		Mode:          l.Mode,
+		Policy:        l.Policy,
+		Summary:       summary,
+		Risks:         append([]string(nil), l.Risks...),
 	}
+}
+
+// evidenceTerminalState deliberately separates policy disposition from
+// completion confidence. An advisory policy may allow a run to finish while
+// its evidence remains unverified, and a mixed pass/fail history is never
+// promoted to fully verified.
+func evidenceTerminalState(decision, status string, records []EvidenceRecord) string {
+	if decision == EvidenceGateBlock {
+		return EvidenceTerminalBlocked
+	}
+
+	hasPassed := status == "passed"
+	hasFailed := status == "failed"
+	for _, record := range records {
+		switch record.Status {
+		case "passed":
+			hasPassed = true
+		case "failed":
+			hasFailed = true
+		}
+	}
+
+	if (decision == "" || decision == EvidenceGateAllow) && hasPassed && !hasFailed {
+		return EvidenceTerminalVerified
+	}
+	if hasPassed {
+		return EvidenceTerminalPartiallyVerified
+	}
+	return EvidenceTerminalUnverified
 }
 
 func (l *EvidenceLedger) addRecord(record EvidenceRecord) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.Records = append(l.Records, record)
+}
+
+func (l *EvidenceLedger) appendCompletionEvidence(
+	source CompletionEvidenceSource,
+	toolName string,
+	input []byte,
+	result []byte,
+	succeeded bool,
+) (CompletionEvidenceRef, error) {
+	if l == nil {
+		return CompletionEvidenceRef{}, errCompletionEvidenceNotBound
+	}
+	if len(input) > maxCompletionEvidenceInputBytes || len(result) > maxCompletionEvidenceResultBytes {
+		return CompletionEvidenceRef{}, errCompletionEvidenceFieldLarge
+	}
+	inputDigest := completionEvidenceSHA256(input)
+	resultDigest := completionEvidenceSHA256(result)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.completionRunID == "" {
+		return CompletionEvidenceRef{}, errCompletionEvidenceNotBound
+	}
+	if len(l.completionRefs) >= maxCompletionEvidenceRefs {
+		return CompletionEvidenceRef{}, errCompletionEvidenceLimit
+	}
+	sequence := uint64(len(l.completionRefs) + 1)
+	digest := canonicalCompletionEvidenceDigest(completionEvidenceDigestInput{
+		RunID:        l.completionRunID,
+		Sequence:     sequence,
+		Source:       source,
+		ToolName:     toolName,
+		InputSHA256:  inputDigest,
+		ResultSHA256: resultDigest,
+		Succeeded:    succeeded,
+	})
+	if _, exists := l.completionSuccessByDigest[digest]; exists {
+		return CompletionEvidenceRef{}, errCompletionEvidenceCollision
+	}
+	ref := CompletionEvidenceRef{
+		Digest:    digest,
+		Sequence:  sequence,
+		Source:    source,
+		ToolName:  toolName,
+		Succeeded: succeeded,
+	}
+	l.completionRefs = append(l.completionRefs, ref)
+	l.completionSuccessByDigest[digest] = succeeded
+	return ref, nil
+}
+
+type completionEvidenceDigestInput struct {
+	RunID        string                   `json:"runId"`
+	Sequence     uint64                   `json:"sequence"`
+	Source       CompletionEvidenceSource `json:"source"`
+	ToolName     string                   `json:"toolName"`
+	InputSHA256  string                   `json:"inputSha256"`
+	ResultSHA256 string                   `json:"resultSha256"`
+	Succeeded    bool                     `json:"succeeded"`
+}
+
+func canonicalCompletionEvidenceDigest(input completionEvidenceDigestInput) string {
+	encoded, _ := json.Marshal(input)
+	return completionEvidenceSHA256(encoded)
+}
+
+func completionEvidenceSHA256(value []byte) string {
+	digest := sha256.Sum256(value)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func validCompletionEvidenceRunID(runID string) bool {
+	return runID != "" &&
+		runID == strings.TrimSpace(runID) &&
+		len(runID) <= maxCompletionRunIDBytes &&
+		utf8.ValidString(runID) &&
+		!containsCompletionControl(runID)
+}
+
+func safeCompletionEvidenceToolName(toolName string) (string, error) {
+	if toolName == "" || toolName != strings.TrimSpace(toolName) || len(toolName) > maxCompletionEvidenceToolNameLen {
+		return "", errCompletionEvidenceInvalidTool
+	}
+	for index := 0; index < len(toolName); index++ {
+		value := toolName[index]
+		if (value >= 'a' && value <= 'z') ||
+			(value >= 'A' && value <= 'Z') ||
+			(value >= '0' && value <= '9') ||
+			strings.ContainsRune("_.:/-", rune(value)) {
+			continue
+		}
+		return "", errCompletionEvidenceInvalidTool
+	}
+	return toolName, nil
 }
 
 func (l *EvidenceLedger) hasSuccessfulVerificationLocked() bool {
@@ -302,7 +570,7 @@ func IsVerificationCommand(command string) bool {
 }
 
 func evidencePolicyFromEnv() string {
-	policy := strings.ToLower(strings.TrimSpace(os.Getenv("ANICLEW_EVIDENCE_POLICY")))
+	policy := strings.ToLower(renamedAgentEnv("CORELAY_EVIDENCE_POLICY", "ANICLEW_EVIDENCE_POLICY"))
 	switch policy {
 	case EvidencePolicyOff, EvidencePolicyMeasure, EvidencePolicyAdvisory, EvidencePolicyBlock:
 		return policy

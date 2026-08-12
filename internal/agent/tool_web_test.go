@@ -394,7 +394,7 @@ func TestOllamaWebSearchUsesConfiguredBase(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("OLLAMA_API_KEY", "test-key")
-	t.Setenv("ANICLEW_OLLAMA_WEB_BASE_URL", server.URL)
+	t.Setenv("CORELAY_OLLAMA_WEB_BASE_URL", server.URL)
 
 	input, _ := json.Marshal(map[string]any{
 		"query":       "ollama web search",
@@ -440,7 +440,7 @@ func TestExecuteWebResearchUsesSearchAndFetch(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("OLLAMA_API_KEY", "test-key")
-	t.Setenv("ANICLEW_OLLAMA_WEB_BASE_URL", server.URL)
+	t.Setenv("CORELAY_OLLAMA_WEB_BASE_URL", server.URL)
 
 	input, _ := json.Marshal(map[string]any{
 		"query":       "loop engineering local models",

@@ -221,7 +221,7 @@ export function SettingsPage() {
             {/* CLI Connection */}
             <div>
               <div className="text-xs text-[var(--color-text2)] uppercase mb-2">CLI Connection (optional)</div>
-              <div className="text-[10px] text-[var(--color-text2)] mb-2">CLI tools have their own login. These commands route them through AniClew for monitoring.</div>
+              <div className="text-[10px] text-[var(--color-text2)] mb-2">CLI tools have their own login. These commands route them through Corelay Code for monitoring.</div>
               {['Claude CLI: ANTHROPIC_BASE_URL=http://localhost:4000 claude',
                 'Codex CLI: OPENAI_BASE_URL=http://localhost:4000 codex',
                 'Gemini CLI: GEMINI_BASE_URL=http://localhost:4000 gemini',

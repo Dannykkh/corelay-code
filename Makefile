@@ -5,7 +5,9 @@ build: web deploy go
 
 # Build Go binary
 go:
-	go build -o aniclew ./cmd/proxy
+	go build -o corelaycode ./cmd/proxy
+	go build -o corelaycode-acp ./cmd/corelaycode-acp
+	go build -o corelaycode-profile ./cmd/corelaycode-profile
 
 # Build frontend
 web:
@@ -18,11 +20,11 @@ deploy:
 
 # Build + deploy in one step
 all: web deploy go
-	@echo "Build complete: ./aniclew"
+	@echo "Build complete: ./corelaycode"
 
 # Run with default settings
 run: all
-	./aniclew -provider ollama -model qwen3:14b
+	./corelaycode -provider ollama -model qwen3:14b
 
 # Run tests
 test:
@@ -47,6 +49,6 @@ loc:
 
 # Clean build artifacts
 clean:
-	rm -f aniclew aniclew.exe proxy-go.exe
+	rm -f corelaycode corelaycode.exe corelaycode-acp corelaycode-acp.exe corelaycode-profile corelaycode-profile.exe proxy-go.exe
 	rm -rf web/dist
 	rm -f internal/server/webdist/assets/index-*.js internal/server/webdist/assets/index-*.css

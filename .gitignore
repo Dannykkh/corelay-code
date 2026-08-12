@@ -1,8 +1,12 @@
 # Binaries
-# Leading slash anchors these to the repo root so the compiled `aniclew`/`proxy`
+# Leading slash anchors these to the repo root so the compiled `corelaycode`/`proxy`
 # binaries are ignored without also ignoring the cmd/proxy/ source directory.
 *.exe
 *.exe~
+/corelaycode
+/corelaycode-acp
+/corelaycode-profile
+# Legacy binary name retained so local pre-rename builds stay ignored.
 /aniclew
 /proxy
 dist/
@@ -24,6 +28,8 @@ config.json
 /memory/
 /conversations/
 /sessions/
+/.corelay/
+# Legacy state directory retained to avoid exposing local migration data.
 /.aniclew/
 
 # IDE

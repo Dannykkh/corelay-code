@@ -1,7 +1,16 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { t } from '../lib/i18n';
+import { CircleCheck, CircleX, LoaderCircle, ShieldAlert } from 'lucide-react';
 import { Markdown } from '../components/Markdown';
-import { listSessions, getSession, saveSession, type SessionSummary, type SessionMessage } from '../lib/sessions';
+import { HTTPError, resolveApproval, type ApprovalDecision } from '../lib/api';
+import {
+  getSession,
+  listSessions,
+  saveSession,
+  SessionConflictError,
+  type SessionMessage,
+  type SessionSummary,
+} from '../lib/sessions';
 import { createWorkstream, generateHandoff, listWorkstreams, type Workstream } from '../lib/workstreams';
 
 interface ChatMessage {
@@ -35,6 +44,38 @@ type AgentEventObject = {
   elapsedMs?: number;
   id?: string;
   planMode?: boolean;
+  sessionId?: string;
+  durableSessionId?: string;
+  durableRevision?: number;
+  revision?: number;
+  lifecycleStatus?: string;
+  reconcileRequired?: boolean;
+  code?: string;
+  message?: string;
+  toolName?: string;
+  redactedInput?: string;
+  dangerLevel?: string;
+  scope?: string;
+  expiresAt?: string;
+  terminalState?: string;
+  completionStatus?: string;
+  completionRevision?: number;
+  completionBlocked?: number;
+};
+
+type ApprovalState = 'pending' | 'submitting' | 'resolved' | 'expired' | 'error';
+
+type ActiveApproval = {
+  id: string;
+  runtimeSessionId: string;
+  toolName: string;
+  redactedInput: string;
+  dangerLevel?: string;
+  scope?: string;
+  expiresAt?: string;
+  state: ApprovalState;
+  decision?: ApprovalDecision;
+  error?: string;
 };
 
 type SpeechRecognitionLike = {
@@ -58,6 +99,13 @@ function eventObject(data: unknown): AgentEventObject {
   return data && typeof data === 'object' ? data as AgentEventObject : {};
 }
 
+function completionBlocksSuccess(data: AgentEventObject): boolean {
+  return data.terminalState === 'blocked' ||
+    data.completionStatus === 'incomplete' ||
+    data.completionStatus === 'blocked' ||
+    (typeof data.completionBlocked === 'number' && data.completionBlocked > 0);
+}
+
 function eventText(data: unknown): string {
   if (typeof data === 'string') return data;
   if (data == null) return '';
@@ -72,11 +120,12 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [planReady, setPlanReady] = useState(false); // a /plan run finished; offer Approve & Run
   const [attachedImage, setAttachedImage] = useState<string | null>(null); // base64
   const [isListening, setIsListening] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [, setSessions] = useState<SessionSummary[]>([]);
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState('');
   const [workstreamNotice, setWorkstreamNotice] = useState('');
+  const [sessionNotice, setSessionNotice] = useState('');
+  const [activeApproval, setActiveApproval] = useState<ActiveApproval | null>(null);
   // Liveness indicators for slow local models: elapsed seconds tick client-side
   // from the moment we send; genChars is the authoritative output size from the
   // backend heartbeat. Together they prove the model is alive, not hung —
@@ -85,8 +134,14 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [genChars, setGenChars] = useState(0);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const durableSessionIDRef = useRef<string | null>(null);
+  const durableSessionRevisionRef = useRef<number | null>(null);
+  const durableSessionEpochRef = useRef(0);
+  const durableSessionSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const runtimeSessionIdRef = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const denyApprovalRef = useRef<HTMLButtonElement>(null);
 
   // Load session list
   useEffect(() => {
@@ -123,14 +178,47 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, status]);
+  }, [messages, status, activeApproval]);
 
-  // Stop the liveness clock if the component unmounts mid-stream.
-  useEffect(() => () => { if (tickRef.current) clearInterval(tickRef.current); }, []);
+  // Stop the active stream and liveness clock if the component unmounts.
+  useEffect(() => () => {
+    abortRef.current?.abort();
+    durableSessionEpochRef.current += 1;
+    if (tickRef.current) clearInterval(tickRef.current);
+  }, []);
 
-  // Auto-save session after each message
-  const autoSave = useCallback(async (msgs: ChatMessage[], sid: string | null) => {
-    if (msgs.length === 0) return;
+  useEffect(() => {
+    if (activeApproval?.state === 'pending') {
+      denyApprovalRef.current?.focus();
+    }
+  }, [activeApproval?.id, activeApproval?.state]);
+
+  useEffect(() => {
+    if (!activeApproval?.expiresAt || activeApproval.state === 'resolved' || activeApproval.state === 'expired') {
+      return;
+    }
+    const expiresAt = Date.parse(activeApproval.expiresAt);
+    if (!Number.isFinite(expiresAt)) return;
+    const expire = () => setActiveApproval((current) => (
+      current?.id === activeApproval.id && current.state !== 'resolved'
+        ? { ...current, state: 'expired', error: 'This approval request expired. No action was allowed.' }
+        : current
+    ));
+    const delay = expiresAt - Date.now();
+    if (delay <= 0) {
+      expire();
+      return;
+    }
+    const timer = window.setTimeout(expire, delay);
+    return () => window.clearTimeout(timer);
+  }, [activeApproval?.expiresAt, activeApproval?.id, activeApproval?.state]);
+
+  // Persist one exact transcript revision before binding it to an agent run.
+  // The returned promise belongs to this save; the internal tail swallows the
+  // rejection only so a later save can still proceed after the caller handles
+  // the conflict.
+  const persistSession = useCallback((msgs: ChatMessage[]): Promise<void> => {
+    if (msgs.length === 0) return Promise.resolve();
     const sessionMsgs: SessionMessage[] = msgs.map((m) => ({
       role: m.role,
       content: m.content,
@@ -140,26 +228,76 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       isError: m.isError,
       timestamp: m.timestamp.toISOString(),
     }));
-    const result = await saveSession({ id: sid || undefined, messages: sessionMsgs });
-    if (result.id && !sid) {
-      setSessionId(result.id);
-    }
-    listSessions().then((s) => setSessions(s || [])).catch(() => setSessions([]));
+    const epoch = durableSessionEpochRef.current;
+
+    // Serialize saves for one durable chat so each request observes the
+    // revision returned by the previous request. A load/new-chat transition
+    // advances the epoch; late responses from the old chat are then ignored
+    // instead of rebinding the new chat to a stale session ID.
+    const operation = durableSessionSaveChainRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (durableSessionEpochRef.current !== epoch) return;
+        const sid = durableSessionIDRef.current;
+        const revision = durableSessionRevisionRef.current;
+        try {
+          const result = await saveSession(
+            { id: sid || undefined, messages: sessionMsgs },
+            sid ? revision ?? undefined : undefined,
+          );
+          if (durableSessionEpochRef.current !== epoch) return;
+          durableSessionIDRef.current = result.id;
+          durableSessionRevisionRef.current = result.revision;
+          setSessionNotice('');
+          listSessions().then((sessions) => {
+            if (durableSessionEpochRef.current === epoch) setSessions(sessions || []);
+          }).catch(() => {
+            if (durableSessionEpochRef.current === epoch) setSessions([]);
+          });
+        } catch (error) {
+          if (durableSessionEpochRef.current !== epoch) return;
+          if (error instanceof SessionConflictError) {
+            setSessionNotice(`Session save conflict: ${error.message}. Reload this session before saving again.`);
+          } else {
+            setSessionNotice(`Session save failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          throw error;
+        }
+      }
+    );
+    durableSessionSaveChainRef.current = operation.catch(() => undefined);
+    return operation;
   }, []);
 
   const loadSession = async (id: string) => {
+    abortRef.current?.abort();
+    runtimeSessionIdRef.current = null;
+    setActiveApproval(null);
+    const epoch = durableSessionEpochRef.current + 1;
+    durableSessionEpochRef.current = epoch;
+    durableSessionSaveChainRef.current = Promise.resolve();
     const sess = await getSession(id);
+    if (durableSessionEpochRef.current !== epoch) return;
     const msgs: ChatMessage[] = (sess.messages || []).map((m) => ({
       ...m,
       timestamp: new Date(m.timestamp),
     }));
     setMessages(msgs);
-    setSessionId(sess.id);
+    durableSessionIDRef.current = sess.id;
+    durableSessionRevisionRef.current = sess.revision ?? 0;
+    setSessionNotice('');
   };
 
   function newChat() {
+    abortRef.current?.abort();
+    runtimeSessionIdRef.current = null;
+    setActiveApproval(null);
+    durableSessionEpochRef.current += 1;
+    durableSessionSaveChainRef.current = Promise.resolve();
     setMessages([]);
-    setSessionId(null);
+    durableSessionIDRef.current = null;
+    durableSessionRevisionRef.current = null;
+    setSessionNotice('');
   }
 
   async function send(overrideText?: string) {
@@ -167,6 +305,8 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     if (!text && !attachedImage) return;
     if (streaming) return;
 
+    runtimeSessionIdRef.current = null;
+    setActiveApproval(null);
     setPlanReady(false); // any new turn clears the plan-approval prompt
     if (overrideText === undefined) setInput('');
     const displayText = attachedImage ? `${text} [📎 image attached]` : text;
@@ -203,14 +343,25 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     // stops the provider stream server-side.
     const controller = new AbortController();
     abortRef.current = controller;
+    let streamEnded = false;
+    let streamFailed = false;
+    let durableHandled = false;
 
     try {
+      await persistSession(newMsgs);
+      const durableSessionId = durableSessionIDRef.current;
+      const expectedRevision = durableSessionRevisionRef.current;
+      if (!durableSessionId || expectedRevision == null) {
+        throw new Error('Durable session binding is unavailable');
+      }
       const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: apiMessages,
           workstreamId: selectedWorkstreamId || undefined,
+          durableSessionId,
+          expectedRevision,
         }),
         signal: controller.signal,
       });
@@ -229,7 +380,12 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           const trimmed = line.trim();
           if (!trimmed.startsWith('data: ')) continue;
           try {
-            handleAgentEvent(JSON.parse(trimmed.slice(6)) as AgentEvent);
+            const event = JSON.parse(trimmed.slice(6)) as AgentEvent;
+            if (event.type === 'done' || event.type === 'stream_end') streamEnded = true;
+            if (event.type === 'done' && completionBlocksSuccess(eventObject(event.data))) streamFailed = true;
+            if (event.type === 'error') streamFailed = true;
+            if (event.type === 'durable_session' || event.type === 'durable_session_error') durableHandled = true;
+            handleAgentEvent(event);
           } catch { /* skip */ }
         }
       }
@@ -245,22 +401,131 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         return updated;
       });
     } finally {
+      runtimeSessionIdRef.current = null;
+      if (controller.signal.aborted || streamFailed || !streamEnded) {
+        setActiveApproval(null);
+      } else {
+        setActiveApproval((current) => (
+          current && (current.state === 'pending' || current.state === 'submitting' || current.state === 'error')
+            ? null
+            : current
+        ));
+      }
       setStreaming(false);
       setStatus('');
       abortRef.current = null;
       if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
       inputRef.current?.focus();
-      // Auto-save after response complete
-      setMessages((prev) => {
-        autoSave(prev, sessionId);
-        return prev;
+      // Compatibility fallback for an older backend that does not own the
+      // durable run checkpoint. Never overwrite an interrupted/conflicted run.
+      if (!controller.signal.aborted && !streamFailed && streamEnded && !durableHandled) {
+        setMessages((prev) => {
+          void persistSession(prev).catch(() => undefined);
+          return prev;
+        });
+      }
+    }
+  }
+
+  async function decideApproval(decision: ApprovalDecision) {
+    const approval = activeApproval;
+    if (!approval || approval.state === 'submitting' || approval.state === 'resolved' || approval.state === 'expired') {
+      return;
+    }
+    if (runtimeSessionIdRef.current !== approval.runtimeSessionId) {
+      setActiveApproval({
+        ...approval,
+        state: 'error',
+        error: 'The active run changed. This request was not approved.',
       });
+      abortRef.current?.abort();
+      return;
+    }
+
+    setActiveApproval({ ...approval, state: 'submitting', decision, error: undefined });
+    try {
+      await resolveApproval(approval.id, approval.runtimeSessionId, decision, abortRef.current?.signal);
+      setActiveApproval((current) => current?.id === approval.id
+        ? { ...current, state: 'resolved', decision, error: undefined }
+        : current);
+    } catch (err) {
+      if (abortRef.current?.signal.aborted) return;
+      const noLongerActionable = err instanceof HTTPError && (err.status === 404 || err.status === 409);
+      setActiveApproval((current) => current?.id === approval.id
+        ? {
+            ...current,
+            state: noLongerActionable ? 'expired' : 'error',
+            error: noLongerActionable
+              ? 'This request is no longer actionable. Nothing was approved.'
+              : 'Approval could not be recorded. Nothing was approved; retry or deny.',
+          }
+        : current);
     }
   }
 
   function handleAgentEvent(event: AgentEvent) {
     const data = eventObject(event.data);
     switch (event.type) {
+      case 'session':
+        if (typeof data.sessionId === 'string' && data.sessionId.trim()) {
+          runtimeSessionIdRef.current = data.sessionId;
+        }
+        if (typeof data.durableSessionId === 'string' && typeof data.durableRevision === 'number') {
+          durableSessionIDRef.current = data.durableSessionId;
+          durableSessionRevisionRef.current = data.durableRevision;
+        }
+        break;
+      case 'durable_session':
+        if (typeof data.sessionId === 'string' && typeof data.revision === 'number') {
+          durableSessionIDRef.current = data.sessionId;
+          durableSessionRevisionRef.current = data.revision;
+          setSessionNotice(data.reconcileRequired
+            ? 'This session was interrupted after a tool started. Reconcile it before resuming.'
+            : '');
+          listSessions().then((sessions) => setSessions(sessions || [])).catch(() => setSessions([]));
+        }
+        break;
+      case 'durable_session_error':
+        setSessionNotice(`Durable session checkpoint failed${data.code ? ` (${data.code})` : ''}: ${data.message || 'reload before continuing'}`);
+        break;
+      case 'approval_required': {
+        const runtimeSessionId = runtimeSessionIdRef.current;
+        const eventSessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+        if (!runtimeSessionId || !data.id || !data.toolName || (eventSessionId && eventSessionId !== runtimeSessionId)) {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: 'Error: approval request could not be bound to the active run; nothing was approved.',
+            timestamp: new Date(),
+          }]);
+          abortRef.current?.abort();
+          break;
+        }
+        setStatus('');
+        // tool_input precedes approval_required in the stream. Remove that raw
+        // payload from the live transcript before it can be persisted; the
+        // approval row below renders only the server-provided redacted view.
+        setMessages((prev) => {
+          const updated = [...prev];
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'tool' && updated[i].toolName === data.toolName && !updated[i].toolResult) {
+              updated[i] = { ...updated[i], toolInput: undefined };
+              break;
+            }
+          }
+          return updated;
+        });
+        setActiveApproval({
+          id: data.id,
+          runtimeSessionId,
+          toolName: data.toolName,
+          redactedInput: typeof data.redactedInput === 'string' ? data.redactedInput : 'Input details unavailable',
+          dangerLevel: data.dangerLevel,
+          scope: data.scope,
+          expiresAt: data.expiresAt,
+          state: 'pending',
+        });
+        break;
+      }
       case 'thinking':
         // Append thinking text to assistant message (wrapped in <think> tags for rendering)
         setMessages((prev) => {
@@ -337,7 +602,13 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         break;
       case 'done':
       case 'stream_end':
-        if (event.type === 'done' && data.planMode) setPlanReady(true);
+        if (event.type === 'done' && completionBlocksSuccess(data)) {
+          const status = data.completionStatus || data.terminalState || 'blocked';
+          const revision = typeof data.completionRevision === 'number' ? ` at revision ${data.completionRevision}` : '';
+          setSessionNotice(`Run ended without successful completion: ${status}${revision}. Continue or reconcile this session.`);
+        } else if (event.type === 'done' && data.planMode) {
+          setPlanReady(true);
+        }
         setStatus('');
         setMessages((prev) => {
           if (prev[prev.length - 1]?.role === 'assistant' && prev[prev.length - 1]?.content === '') {
@@ -355,6 +626,8 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
 
   // "Thinking… · 12s · 340 chars" — a moving clock + growing output size is the
   // canonical "it's alive" signal for a slow local model (Claude Code style).
+  const approvalNeedsAction = activeApproval != null &&
+    (activeApproval.state === 'pending' || activeApproval.state === 'submitting' || activeApproval.state === 'error');
   const liveLabel = streaming
     ? `${status || 'Thinking…'} · ${elapsed}s${genChars > 0 ? ` · ${genChars.toLocaleString()} chars` : ''}`
     : '';
@@ -398,7 +671,12 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       {/* Header */}
       <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] flex items-center justify-between">
         <div className="flex items-center gap-2">
-          {streaming ? (
+          {approvalNeedsAction ? (
+            <div className="flex items-center gap-1.5 text-[var(--color-yellow)] text-xs font-medium">
+              <ShieldAlert aria-hidden="true" className="w-3.5 h-3.5" />
+              Permission required
+            </div>
+          ) : streaming ? (
             <div className="flex items-center gap-1.5 text-[var(--color-accent)] text-xs">
               <div className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-pulse" />
               {liveLabel}
@@ -442,7 +720,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         </div>
       </div>
 
-      {(selectedWorkstream || workstreamNotice) && (
+      {(selectedWorkstream || workstreamNotice || sessionNotice) && (
         <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex items-center gap-3 text-xs min-h-10">
           {selectedWorkstream && (
             <>
@@ -459,6 +737,9 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           {workstreamNotice && (
             <span className="ml-auto text-[var(--color-text2)] truncate">{workstreamNotice}</span>
           )}
+          {sessionNotice && (
+            <span className="ml-auto text-[var(--color-text2)] truncate">{sessionNotice}</span>
+          )}
         </div>
       )}
 
@@ -466,7 +747,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
             {messages.length === 0 && (
               <div className="flex flex-col items-center justify-center h-full text-[var(--color-text2)] max-w-lg mx-auto">
-                <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-xl font-bold mb-5">A</div>
+                <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-xl font-bold mb-5">C</div>
                 <div className="text-xl font-semibold mb-2 text-[var(--color-text)]">What can I help you with?</div>
                 <div className="text-sm mb-8 text-center">I can read your code, write new files, run commands, search your project, and more.</div>
 
@@ -591,6 +872,77 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
                 </div>
               );
             })}
+            {activeApproval && (
+              <div
+                role="alert"
+                aria-live="assertive"
+                aria-busy={activeApproval.state === 'submitting'}
+                className="mx-0 sm:mx-4 border border-[var(--color-yellow)] bg-[var(--color-surface2)] rounded-lg px-3 py-3"
+              >
+                <div className="flex items-start gap-2.5">
+                  <ShieldAlert aria-hidden="true" className="w-4 h-4 mt-0.5 shrink-0 text-[var(--color-yellow)]" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="text-xs font-semibold text-[var(--color-text)]">Permission required</span>
+                      <span className="text-xs font-mono text-[var(--color-text)] break-all">{activeApproval.toolName}</span>
+                      {activeApproval.dangerLevel && (
+                        <span className="text-[10px] uppercase text-[var(--color-yellow)]">risk: {activeApproval.dangerLevel}</span>
+                      )}
+                      {activeApproval.scope && (
+                        <span className="text-[10px] text-[var(--color-text2)]">scope: {activeApproval.scope}</span>
+                      )}
+                    </div>
+                    <div className="mt-2 text-[10px] uppercase text-[var(--color-text2)]">Redacted input</div>
+                    <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-[var(--color-text)]">
+                      {activeApproval.redactedInput}
+                    </pre>
+                    {activeApproval.expiresAt && Number.isFinite(Date.parse(activeApproval.expiresAt)) && (
+                      <div className="mt-1 text-[10px] text-[var(--color-text2)]">
+                        Expires {new Date(activeApproval.expiresAt).toLocaleTimeString()}
+                      </div>
+                    )}
+                    <div className="mt-2 flex items-center gap-1.5 text-xs text-[var(--color-text2)]">
+                      {activeApproval.state === 'submitting' && (
+                        <><LoaderCircle aria-hidden="true" className="w-3.5 h-3.5 animate-spin motion-reduce:animate-none" /> Submitting decision</>
+                      )}
+                      {activeApproval.state === 'resolved' && activeApproval.decision === 'allow_once' && (
+                        <><CircleCheck aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-green)]" /> Allowed once</>
+                      )}
+                      {activeApproval.state === 'resolved' && activeApproval.decision === 'deny' && (
+                        <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> Denied</>
+                      )}
+                      {activeApproval.state === 'expired' && (
+                        <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> Expired; nothing was approved</>
+                      )}
+                      {activeApproval.state === 'error' && (
+                        <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> {activeApproval.error}</>
+                      )}
+                    </div>
+                    {(activeApproval.state === 'pending' || activeApproval.state === 'submitting' || activeApproval.state === 'error') && (
+                      <div className="mt-3 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+                        <button
+                          ref={denyApprovalRef}
+                          type="button"
+                          onClick={() => decideApproval('deny')}
+                          disabled={activeApproval.state === 'submitting'}
+                          className="min-h-10 w-full sm:w-auto px-3 py-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] text-xs font-medium text-[var(--color-text)] hover:border-[var(--color-red)] focus:outline-none focus:ring-2 focus:ring-[var(--color-red)] disabled:opacity-50"
+                        >
+                          Deny
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => decideApproval('allow_once')}
+                          disabled={activeApproval.state === 'submitting'}
+                          className="min-h-10 w-full sm:w-auto px-3 py-2 rounded-md bg-[var(--color-accent)] text-xs font-semibold text-white hover:bg-[var(--color-accent2)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
+                        >
+                          Allow once
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
             <div ref={bottomRef} />
           </div>
 

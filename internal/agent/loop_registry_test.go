@@ -284,3 +284,99 @@ func TestLoopRegistry_NonPositiveCap(t *testing.T) {
 	}
 	rel()
 }
+
+func TestLoopRegistry_RegistrationBarrierSerializesRegister(t *testing.T) {
+	r := NewLoopRegistry(1)
+	entered := make(chan struct{})
+	releaseBarrier := make(chan struct{})
+	barrierDone := make(chan error, 1)
+
+	go func() {
+		barrierDone <- r.WithRegistrationBarrier(func(active int) error {
+			if active != 0 {
+				t.Errorf("barrier active = %d, want 0", active)
+			}
+			close(entered)
+			<-releaseBarrier
+			return nil
+		})
+	}()
+	<-entered
+
+	type registerResult struct {
+		release func()
+		err     error
+	}
+	registered := make(chan registerResult, 1)
+	go func() {
+		_, _, release, err := r.Register(context.Background(), "/p")
+		registered <- registerResult{release: release, err: err}
+	}()
+
+	select {
+	case result := <-registered:
+		if result.release != nil {
+			result.release()
+		}
+		t.Fatal("Register completed while registration barrier was held")
+	case <-time.After(20 * time.Millisecond):
+		// Expected: Register is waiting to publish its loop.
+	}
+
+	close(releaseBarrier)
+	if err := <-barrierDone; err != nil {
+		t.Fatalf("WithRegistrationBarrier = %v", err)
+	}
+	result := <-registered
+	if result.err != nil {
+		t.Fatalf("Register after barrier = %v", result.err)
+	}
+	result.release()
+}
+
+func TestLoopRegistry_RegistrationBarrierReportsAllActiveLoops(t *testing.T) {
+	r := NewLoopRegistry(3)
+	_, _, releaseA, err := r.Register(context.Background(), "/workspace/a")
+	if err != nil {
+		t.Fatalf("Register A = %v", err)
+	}
+	defer releaseA()
+	_, _, releaseB, err := r.Register(context.Background(), "/workspace/b")
+	if err != nil {
+		t.Fatalf("Register B = %v", err)
+	}
+	defer releaseB()
+
+	if err := r.WithRegistrationBarrier(func(active int) error {
+		if active != 2 {
+			t.Fatalf("barrier active = %d, want 2", active)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithRegistrationBarrier = %v", err)
+	}
+}
+
+func TestLoopRegistry_RegistrationBarrierFailsClosedDuringShutdown(t *testing.T) {
+	r := NewLoopRegistry(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if ok := r.Shutdown(ctx); !ok {
+		t.Fatal("Shutdown of empty registry should drain instantly")
+	}
+
+	called := false
+	err := r.WithRegistrationBarrier(func(int) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("WithRegistrationBarrier after shutdown = %v, want ErrShuttingDown", err)
+	}
+	if called {
+		t.Fatal("registration barrier invoked callback during shutdown")
+	}
+	if err := r.WithRegistrationBarrier(nil); !errors.Is(err, ErrInvalidRegistryOperation) {
+		t.Fatalf("WithRegistrationBarrier(nil) = %v, want ErrInvalidRegistryOperation", err)
+	}
+}

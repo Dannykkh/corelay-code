@@ -1,54 +1,62 @@
 package agent
 
 import (
-	"encoding/json"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/config"
 )
 
 // AgentReceipt is the machine-readable proof that an agent run completed with
 // observable state, not just a prose claim.
 type AgentReceipt struct {
-	Version      int                 `json:"version"`
-	CreatedAt    string              `json:"createdAt"`
-	WorkDir      string              `json:"workDir"`
-	Provider     string              `json:"provider"`
-	Model        string              `json:"model"`
-	ProjectType  string              `json:"projectType"`
-	PlanMode     bool                `json:"planMode"`
-	Iterations   int                 `json:"iterations"`
-	EditedFiles  []string            `json:"editedFiles"`
-	Verification ReceiptVerification `json:"verification"`
+	Version      int                         `json:"version"`
+	CreatedAt    string                      `json:"createdAt"`
+	WorkDir      string                      `json:"workDir"`
+	Provider     string                      `json:"provider"`
+	Model        string                      `json:"model"`
+	ProjectType  string                      `json:"projectType"`
+	PlanMode     bool                        `json:"planMode"`
+	Iterations   int                         `json:"iterations"`
+	EditedFiles  []string                    `json:"editedFiles"`
+	Artifacts    []ReceiptArtifact           `json:"artifacts,omitempty"`
+	Verification ReceiptVerification         `json:"verification"`
+	Completion   *CompletionContractSnapshot `json:"completion,omitempty"`
+	Recovery     *RunGuardSnapshot           `json:"recovery,omitempty"`
 }
 
 // TeamRunReceipt is the durable state snapshot for a TeamPlan or worker run.
 // It stores compact summaries and file pointers, never raw prompts or full
 // model/tool output.
 type TeamRunReceipt struct {
-	Version       int                 `json:"version"`
-	Kind          string              `json:"kind"`
-	CreatedAt     string              `json:"createdAt"`
-	WorkDir       string              `json:"workDir"`
-	Status        string              `json:"status"` // completed, failed, cancelled
-	TeamName      string              `json:"teamName"`
-	PlanName      string              `json:"planName,omitempty"`
-	PlanVersion   int                 `json:"planVersion,omitempty"`
-	Objective     string              `json:"objective,omitempty"`
-	Provider      string              `json:"provider"`
-	Model         string              `json:"model"`
-	Capacity      CapacityConfig      `json:"capacity"`
-	VerifyCommand string              `json:"verifyCommand,omitempty"`
-	TaskCount     int                 `json:"taskCount"`
-	Completed     int                 `json:"completed"`
-	Failed        int                 `json:"failed"`
-	ToolCalls     int                 `json:"toolCalls"`
-	Verification  ReceiptVerification `json:"verification"`
-	Tasks         []TeamTaskReceipt   `json:"tasks"`
+	Version             int                 `json:"version"`
+	Kind                string              `json:"kind"`
+	CreatedAt           string              `json:"createdAt"`
+	WorkDir             string              `json:"workDir"`
+	Status              string              `json:"status"` // completed, failed, cancelled
+	TeamName            string              `json:"teamName"`
+	PlanName            string              `json:"planName,omitempty"`
+	PlanVersion         int                 `json:"planVersion,omitempty"`
+	Objective           string              `json:"objective,omitempty"`
+	Provider            string              `json:"provider"`
+	Model               string              `json:"model"`
+	Capacity            CapacityConfig      `json:"capacity"`
+	VerifyCommand       string              `json:"verifyCommand,omitempty"`
+	VerifyCommandDigest string              `json:"verifyCommandDigest,omitempty"` // digest of the pre-redaction command
+	TaskCount           int                 `json:"taskCount"`
+	Completed           int                 `json:"completed"`
+	Failed              int                 `json:"failed"`
+	ToolCalls           int                 `json:"toolCalls"`
+	Verification        ReceiptVerification `json:"verification"`
+	Tasks               []TeamTaskReceipt   `json:"tasks"`
 }
 
 type TeamTaskReceipt struct {
@@ -64,6 +72,7 @@ type TeamTaskReceipt struct {
 	Status        string             `json:"status"`
 	AssignedTo    string             `json:"assignedTo,omitempty"`
 	Files         []string           `json:"files,omitempty"`
+	Artifacts     []ReceiptArtifact  `json:"artifacts,omitempty"`
 	DependsOn     []string           `json:"dependsOn,omitempty"`
 	Wave          int                `json:"wave"`
 	ToolCalls     int                `json:"toolCalls"`
@@ -74,13 +83,15 @@ type TeamTaskReceipt struct {
 }
 
 type ReceiptVerification struct {
-	Status   string           `json:"status"` // passed, failed, not-run
-	Source   string           `json:"source"` // auto-verify, team-verify, none
-	Command  string           `json:"command,omitempty"`
-	Summary  string           `json:"summary,omitempty"`
-	Gate     string           `json:"gate,omitempty"`
-	Mode     string           `json:"mode,omitempty"`
-	Evidence []EvidenceRecord `json:"evidence,omitempty"`
+	Status        string           `json:"status"` // passed, failed, not-run
+	TerminalState string           `json:"terminalState"`
+	Source        string           `json:"source"` // auto-verify, team-verify, none
+	Command       string           `json:"command,omitempty"`
+	CommandDigest string           `json:"commandDigest,omitempty"` // digest of the pre-redaction command
+	Summary       string           `json:"summary,omitempty"`
+	Gate          string           `json:"gate,omitempty"`
+	Mode          string           `json:"mode,omitempty"`
+	Evidence      []EvidenceRecord `json:"evidence,omitempty"`
 }
 
 func writeAgentReceipt(workDir string, receipt AgentReceipt) (string, error) {
@@ -93,22 +104,16 @@ func writeAgentReceiptToDir(baseDir, workDir string, receipt AgentReceipt, now t
 	receipt.CreatedAt = now.Format(time.RFC3339Nano)
 	receipt.WorkDir = workDir
 
-	dir := filepath.Join(baseDir, safeReceiptDir(workDir))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
-	}
-
-	data, err := json.MarshalIndent(receipt, "", "  ")
+	dir, err := receiptWorkspaceDir(baseDir, workDir)
 	if err != nil {
 		return "", err
 	}
 
-	name := now.Format("20060102-150405.000000000") + ".json"
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	data, err := marshalSanitizedReceipt(workDir, receipt)
+	if err != nil {
 		return "", err
 	}
-	return path, nil
+	return writeReceiptAtomically(dir, "", now, data)
 }
 
 func WriteTeamRunReceipt(baseDir, workDir string, receipt TeamRunReceipt) (string, error) {
@@ -128,22 +133,16 @@ func writeTeamRunReceiptToDir(baseDir, workDir string, receipt TeamRunReceipt, n
 		receipt.Verification = ReceiptVerification{Status: "not-run", Source: "none"}
 	}
 
-	dir := filepath.Join(baseDir, safeReceiptDir(workDir))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
-	}
-
-	data, err := json.MarshalIndent(receipt, "", "  ")
+	dir, err := receiptWorkspaceDir(baseDir, workDir)
 	if err != nil {
 		return "", err
 	}
 
-	name := "team-" + now.Format("20060102-150405.000000000") + ".json"
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	data, err := marshalSanitizedReceipt(workDir, receipt)
+	if err != nil {
 		return "", err
 	}
-	return path, nil
+	return writeReceiptAtomically(dir, "team-", now, data)
 }
 
 func (t *Team) BuildRunReceipt(plan TeamPlan, status string, verification ReceiptVerification) TeamRunReceipt {
@@ -251,18 +250,95 @@ func receiptTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
 }
 
-var receiptDirUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
-
 func safeReceiptDir(workDir string) string {
-	clean := strings.TrimSpace(filepath.Clean(workDir))
-	clean = strings.Trim(clean, string(filepath.Separator))
-	clean = receiptDirUnsafe.ReplaceAllString(clean, "_")
-	clean = strings.Trim(clean, "._-")
-	if clean == "" {
-		return "workspace"
+	if key, _, err := workspaceStorageKey(workDir); err == nil {
+		return key
 	}
-	if len(clean) > 120 {
-		return clean[:120]
+	sum := sha256.Sum256([]byte(strings.TrimSpace(workDir)))
+	return "ws_" + hex.EncodeToString(sum[:])
+}
+
+func receiptWorkspaceDir(baseDir, workDir string) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return "", fmt.Errorf("receipt base directory is empty")
 	}
-	return clean
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
+		return "", fmt.Errorf("create receipt base directory: %w", err)
+	}
+	dir := filepath.Join(baseDir, safeReceiptDir(workDir))
+	if err := ensureLexicallyContained(baseDir, dir); err != nil {
+		return "", fmt.Errorf("receipt workspace directory: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create receipt workspace directory: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("inspect receipt workspace directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("receipt workspace path is not a regular directory")
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", fmt.Errorf("secure receipt workspace directory: %w", err)
+	}
+	return dir, nil
+}
+
+func writeReceiptAtomically(dir, prefix string, now time.Time, data []byte) (path string, err error) {
+	temp, err := os.CreateTemp(dir, ".receipt-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create receipt temp file: %w", err)
+	}
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}()
+	if err := temp.Chmod(0600); err != nil {
+		return "", fmt.Errorf("secure receipt temp file: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		return "", fmt.Errorf("write receipt temp file: %w", err)
+	}
+	if _, err := io.WriteString(temp, "\n"); err != nil {
+		return "", fmt.Errorf("terminate receipt temp file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return "", fmt.Errorf("sync receipt temp file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("close receipt temp file: %w", err)
+	}
+
+	for attempt := 0; attempt < 16; attempt++ {
+		suffix := make([]byte, 8)
+		if _, err := rand.Read(suffix); err != nil {
+			return "", fmt.Errorf("generate receipt filename: %w", err)
+		}
+		name := prefix + now.Format("20060102-150405.000000000") + "-" + hex.EncodeToString(suffix) + ".json"
+		path = filepath.Join(dir, name)
+		if _, statErr := os.Lstat(path); statErr == nil {
+			continue
+		} else if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("inspect receipt target: %w", statErr)
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			return "", fmt.Errorf("replace receipt atomically: %w", err)
+		}
+		dirFile, openErr := os.Open(dir)
+		if openErr != nil {
+			return "", fmt.Errorf("open receipt directory for sync: %w", openErr)
+		}
+		syncErr := dirFile.Sync()
+		closeErr := dirFile.Close()
+		if runtime.GOOS != "windows" && syncErr != nil {
+			return "", fmt.Errorf("sync receipt directory: %w", syncErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("close receipt directory: %w", closeErr)
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("could not allocate a unique receipt filename")
 }

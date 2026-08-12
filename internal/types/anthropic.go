@@ -19,15 +19,15 @@ type ToolUseBlock struct {
 // ── Content Block Params (user messages) ──
 
 type ContentBlockParam struct {
-	Type        string          `json:"type"`
-	Text        string          `json:"text,omitempty"`
-	Source      *MediaSource    `json:"source,omitempty"`
-	ToolUseID   string          `json:"tool_use_id,omitempty"`
-	Content     json.RawMessage `json:"content,omitempty"`
-	IsError     *bool           `json:"is_error,omitempty"`
-	ID          string          `json:"id,omitempty"`
-	Name        string          `json:"name,omitempty"`
-	Input       json.RawMessage `json:"input,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Source    *MediaSource    `json:"source,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   *bool           `json:"is_error,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
 }
 
 type MediaSource struct {
@@ -49,6 +49,10 @@ type ToolDef struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	// RuntimeBinding carries an in-process, provider-invisible execution
+	// binding for dynamically composed tools. The concrete value is owned by
+	// the composing package and is never serialized onto the model wire.
+	RuntimeBinding any `json:"-"`
 }
 
 // ── Request ──

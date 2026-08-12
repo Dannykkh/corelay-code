@@ -5,26 +5,35 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // Translator converts OpenAI stream chunks into Anthropic SSE events.
 type Translator struct {
-	model        string
-	messageID    string
-	blockIndex   int
-	textOpen     bool
-	thinkingOpen bool
-	toolCalls    map[int]string // index -> tool ID
-	outTokens    int
+	model          string
+	messageID      string
+	nextBlockIndex int
+	textIndex      int
+	thinkingIndex  int
+	textOpen       bool
+	thinkingOpen   bool
+	toolCalls      map[int]openToolCall // OpenAI index -> canonical block
+	inTokens       int
+	outTokens      int
+}
+
+type openToolCall struct {
+	BlockIndex int
+	ID         string
 }
 
 func NewTranslator(model string) *Translator {
 	return &Translator{
 		model:     model,
 		messageID: generateID("msg_proxy_"),
-		toolCalls: make(map[int]string),
+		toolCalls: make(map[int]openToolCall),
 	}
 }
 
@@ -48,6 +57,7 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 	var events []types.SSEEvent
 
 	if chunk.Usage != nil {
+		t.inTokens = chunk.Usage.PromptTokens
 		t.outTokens = chunk.Usage.CompletionTokens
 	}
 
@@ -64,7 +74,9 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 			if t.textOpen {
 				events = append(events, t.closeTextBlock()...)
 			}
-			idx := t.blockIndex
+			idx := t.nextBlockIndex
+			t.nextBlockIndex++
+			t.thinkingIndex = idx
 			events = append(events, types.SSEEvent{
 				Type:         "content_block_start",
 				Index:        &idx,
@@ -72,7 +84,7 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 			})
 			t.thinkingOpen = true
 		}
-		idx := t.blockIndex
+		idx := t.thinkingIndex
 		events = append(events, types.SSEEvent{
 			Type:  "content_block_delta",
 			Index: &idx,
@@ -84,13 +96,14 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 	if delta.Content != nil && *delta.Content != "" {
 		// Close thinking block if open (transition from thinking to answer)
 		if t.thinkingOpen {
-			idx := t.blockIndex
+			idx := t.thinkingIndex
 			events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
-			t.blockIndex++
 			t.thinkingOpen = false
 		}
 		if !t.textOpen {
-			idx := t.blockIndex
+			idx := t.nextBlockIndex
+			t.nextBlockIndex++
+			t.textIndex = idx
 			events = append(events, types.SSEEvent{
 				Type:         "content_block_start",
 				Index:        &idx,
@@ -98,7 +111,7 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 			})
 			t.textOpen = true
 		}
-		idx := t.blockIndex
+		idx := t.textIndex
 		events = append(events, types.SSEEvent{
 			Type:  "content_block_delta",
 			Index: &idx,
@@ -114,20 +127,27 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 
 		// New tool call
 		if tc.ID != "" && tc.Function != nil && tc.Function.Name != "" {
-			t.toolCalls[tc.Index] = tc.ID
-			idx := t.blockIndex
-			events = append(events, types.SSEEvent{
-				Type:  "content_block_start",
-				Index: &idx,
-				ContentBlock: mustMarshal(map[string]string{
-					"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": "",
-				}),
-			})
+			if _, exists := t.toolCalls[tc.Index]; !exists {
+				idx := t.nextBlockIndex
+				t.nextBlockIndex++
+				t.toolCalls[tc.Index] = openToolCall{BlockIndex: idx, ID: tc.ID}
+				events = append(events, types.SSEEvent{
+					Type:  "content_block_start",
+					Index: &idx,
+					ContentBlock: mustMarshal(map[string]string{
+						"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": "",
+					}),
+				})
+			}
 		}
 
 		// Argument delta
 		if tc.Function != nil && tc.Function.Arguments != "" {
-			idx := t.blockIndex
+			call, exists := t.toolCalls[tc.Index]
+			if !exists {
+				continue
+			}
+			idx := call.BlockIndex
 			events = append(events, types.SSEEvent{
 				Type:  "content_block_delta",
 				Index: &idx,
@@ -148,17 +168,20 @@ func (t *Translator) Translate(chunk types.OAIStreamChunk) []types.SSEEvent {
 
 // End produces final events if stream ended without explicit finish.
 func (t *Translator) End() []types.SSEEvent {
+	if len(t.toolCalls) > 0 {
+		return t.Finish("tool_calls")
+	}
 	var events []types.SSEEvent
 	if t.thinkingOpen {
-		idx := t.blockIndex
+		idx := t.thinkingIndex
 		events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
-		t.blockIndex++
 		t.thinkingOpen = false
 	}
 	// If only thinking happened with no text, emit empty text block
 	// (some thinking models produce reasoning but no content when max_tokens is low)
-	if !t.textOpen && t.blockIndex > 0 {
-		idx := t.blockIndex
+	if !t.textOpen && t.nextBlockIndex > 0 {
+		idx := t.nextBlockIndex
+		t.nextBlockIndex++
 		events = append(events, types.SSEEvent{
 			Type:         "content_block_start",
 			Index:        &idx,
@@ -170,7 +193,6 @@ func (t *Translator) End() []types.SSEEvent {
 			Delta: mustMarshal(map[string]string{"type": "text_delta", "text": "(No text output — only reasoning was produced)"}),
 		})
 		events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
-		t.blockIndex++
 	}
 	if t.textOpen {
 		events = append(events, t.closeTextBlock()...)
@@ -178,7 +200,7 @@ func (t *Translator) End() []types.SSEEvent {
 	events = append(events, types.SSEEvent{
 		Type:  "message_delta",
 		Delta: mustMarshal(map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}),
-		Usage: &types.SSEUsage{OutputTokens: t.outTokens},
+		Usage: &types.SSEUsage{InputTokens: t.inTokens, OutputTokens: t.outTokens},
 	})
 	events = append(events, types.SSEEvent{Type: "message_stop"})
 	return events
@@ -187,35 +209,37 @@ func (t *Translator) End() []types.SSEEvent {
 func (t *Translator) Finish(reason string) []types.SSEEvent {
 	var events []types.SSEEvent
 	if t.thinkingOpen {
-		idx := t.blockIndex
+		idx := t.thinkingIndex
 		events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
-		t.blockIndex++
 		t.thinkingOpen = false
 	}
 	if t.textOpen {
 		events = append(events, t.closeTextBlock()...)
 	}
 	// Close any open tool blocks
-	for range t.toolCalls {
-		idx := t.blockIndex
-		events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
-		t.blockIndex++
+	openCalls := make([]openToolCall, 0, len(t.toolCalls))
+	for _, call := range t.toolCalls {
+		openCalls = append(openCalls, call)
 	}
-	t.toolCalls = make(map[int]string)
+	sort.Slice(openCalls, func(i, j int) bool { return openCalls[i].BlockIndex < openCalls[j].BlockIndex })
+	for _, call := range openCalls {
+		idx := call.BlockIndex
+		events = append(events, types.SSEEvent{Type: "content_block_stop", Index: &idx})
+	}
+	t.toolCalls = make(map[int]openToolCall)
 
 	stopReason := mapFinishReason(reason)
 	events = append(events, types.SSEEvent{
 		Type:  "message_delta",
 		Delta: mustMarshal(map[string]any{"stop_reason": stopReason, "stop_sequence": nil}),
-		Usage: &types.SSEUsage{OutputTokens: t.outTokens},
+		Usage: &types.SSEUsage{InputTokens: t.inTokens, OutputTokens: t.outTokens},
 	})
 	events = append(events, types.SSEEvent{Type: "message_stop"})
 	return events
 }
 
 func (t *Translator) closeTextBlock() []types.SSEEvent {
-	idx := t.blockIndex
-	t.blockIndex++
+	idx := t.textIndex
 	t.textOpen = false
 	return []types.SSEEvent{{Type: "content_block_stop", Index: &idx}}
 }

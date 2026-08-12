@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/memory"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/memory"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // Memory hook — wires internal/memory into the agent loop.
@@ -35,12 +35,13 @@ import (
 //     the dream gate (time + entry-count + lock); if ready, kicks off
 //     a background consolidation that merges near-duplicates.
 //
-// All three respect the ANICLEW_MEMORY env var: set to "off", "0", or
-// "false" to disable the entire memory system at runtime. Default on.
+// All three respect CORELAY_MEMORY (with ANICLEW_MEMORY as a compatibility
+// fallback): set it to "off", "0", or "false" to disable the entire memory
+// system at runtime. Default on.
 
 // memoryEnabled reports whether long-term memory hooks are active.
 func memoryEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("ANICLEW_MEMORY")))
+	v := strings.ToLower(renamedAgentEnv("CORELAY_MEMORY", "ANICLEW_MEMORY"))
 	return v != "off" && v != "0" && v != "false"
 }
 
@@ -56,7 +57,7 @@ func MemoryHeadsUp(workDir string) string {
 	if _, err := os.Stat(memory.Entrypoint(workDir)); err == nil {
 		return ""
 	}
-	return "[Note] First run here — long-term memory (MEMORY.md, memory/) may be saved to this workspace when the session ends. Disable with ANICLEW_MEMORY=off."
+	return "[Note] First run here — long-term memory (MEMORY.md, memory/) may be saved to this workspace when the session ends. Disable with CORELAY_MEMORY=off."
 }
 
 // BuildMemoryContext returns the memory snippet to append to the system

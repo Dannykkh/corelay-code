@@ -50,6 +50,40 @@ func TestStoreCreateGetListRoundtrip(t *testing.T) {
 	}
 }
 
+func TestRootUsesCorelayStateAndFallsBackToLegacyState(t *testing.T) {
+	workspace := t.TempDir()
+	wantCurrent := filepath.Join(workspace, stateDirName, workstreamsDir)
+	if got := Root(workspace); got != wantCurrent {
+		t.Fatalf("Root() = %q, want new state root %q", got, wantCurrent)
+	}
+
+	legacy := filepath.Join(workspace, legacyStateDirName, workstreamsDir)
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := Root(workspace); got != legacy {
+		t.Fatalf("Root() = %q, want legacy state root %q", got, legacy)
+	}
+
+	if err := os.MkdirAll(wantCurrent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := Root(workspace); got != wantCurrent {
+		t.Fatalf("Root() = %q, want current state root %q", got, wantCurrent)
+	}
+}
+
+func TestRootFallsBackToClaudeProxyState(t *testing.T) {
+	workspace := t.TempDir()
+	legacy := filepath.Join(workspace, proxyStateDirName, workstreamsDir)
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := Root(workspace); got != legacy {
+		t.Fatalf("Root() = %q, want oldest legacy state root %q", got, legacy)
+	}
+}
+
 func TestPatchVerificationAppendsTimeline(t *testing.T) {
 	store := NewStore(t.TempDir())
 	if _, err := store.Create(CreateRequest{ID: "ws_patch", Title: "Patch test"}); err != nil {

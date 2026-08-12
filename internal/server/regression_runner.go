@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/types"
-	"github.com/aniclew/aniclew/internal/workstream"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 func (s *Server) handleRegressionRuns(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +186,10 @@ func (s *Server) handleRunRegressionCase(w http.ResponseWriter, r *http.Request)
 	})
 
 	eventCh := make(chan agent.Event, 64)
+	chronosSandboxRunner, chronosSandboxPolicy := agent.DefaultSandboxExecution(workDir)
+	cfg.SandboxRunner = chronosSandboxRunner
+	cfg.SandboxPolicy = chronosSandboxPolicy
+	cfg.CapabilityProfile = selectAutomaticCapabilityProfile(provider, model, time.Now())
 	go agent.RunChronos(r.Context(), provider, model, task, workDir, cfg, eventCh)
 
 	passed := false
@@ -269,6 +273,7 @@ func (s *Server) handleRunTeamRegressionCase(w http.ResponseWriter, r *http.Requ
 	}
 
 	baseDir := config.BaseDir()
+	teamSandboxRunner, teamSandboxPolicy := agent.DefaultSandboxExecution(workDir)
 	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
 		Name:              plan.Name,
 		VerifyCommand:     plan.VerifyCommand,
@@ -277,6 +282,8 @@ func (s *Server) handleRunTeamRegressionCase(w http.ResponseWriter, r *http.Requ
 		ProviderFactory: func(name string) (types.Provider, error) {
 			return providers.Create(name, &types.ProviderConfig{})
 		},
+		SandboxRunner: teamSandboxRunner,
+		SandboxPolicy: teamSandboxPolicy,
 	})
 	for _, task := range plan.ToTeamTasks() {
 		team.AddTask(task)

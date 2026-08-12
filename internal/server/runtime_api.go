@@ -6,10 +6,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/runtimeplane"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 type runtimeStatusResponse struct {

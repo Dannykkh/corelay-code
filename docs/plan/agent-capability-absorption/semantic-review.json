@@ -1,0 +1,1865 @@
+{
+  "schemaVersion": 1,
+  "reviewId": "CAP-045-INDEPENDENT-SEMANTIC-REVIEW-2026-08-12",
+  "reviewedAt": "2026-08-12",
+  "sourceMatrix": "docs/plan/agent-capability-absorption/capability-matrix.md",
+  "sourceLedger": "docs/plan/agent-capability-absorption/provenance-ledger.json",
+  "reviewer": {
+    "id": "codex-cap045-independent-auditor-20260812-071215-kst",
+    "role": "independent-semantic-auditor",
+    "taskPath": "/root/subagent_runmode_map",
+    "independenceStatement": "I did not copy matrix or ledger statuses into the semantic verdicts. I inspected repository implementation declarations and bodies, named positive and negative tests, runtime composition paths, source pins, non-copy constraints, and the historical prior-access disclosure.",
+    "priorAccessDisclosure": "docs/ip-provenance.md records prior access to a leaked proprietary source tree; this artifact is a behavior-level provenance review and is not a clean-room certification or legal opinion."
+  },
+  "scope": "Independent behavior-level review of CAP-001 through CAP-045 against actual repository implementation, tests, composition paths, and provenance metadata. This is not legal clean-room certification.",
+  "records": [
+    {
+      "capabilityId": "CAP-001",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/loop.go",
+        "internal/agent/run_mode.go",
+        "internal/agent/chronos_adapter.go",
+        "internal/agent/subagent.go",
+        "internal/agent/team.go",
+        "internal/agent/bridge.go",
+        "internal/acpbridge/backend.go",
+        "cmd/corelaycode-profile/agent_executor.go",
+        "internal/agent/run_terminal.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/chronos_mode_test.go",
+        "internal/agent/subagent_mode_test.go",
+        "internal/agent/team_terminal_test.go",
+        "internal/agent/bridge_terminal_test.go",
+        "internal/acpbridge/terminal_test.go",
+        "cmd/corelaycode-profile/agent_executor_test.go",
+        "internal/agent/run_terminal_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "RunMode exposes only bounded phase directives while RunLoopWithOptions retains provider, context, tool, evidence, hook, receipt, and terminal ownership."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Chronos, SubAgent, Team, Bridge, ACP, and profiler tests exercise normal single-kernel completion through their real adapters."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Reducer tables reject blocked/incomplete terminals, cancellation before done, and stream closure without a successful done frame."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "All reviewed own-agent ingress implementations call the common kernel; adapter-specific code only translates input, events, or mode directives."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-002",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/harness/profile.go",
+        "internal/agent/profiles.go",
+        "internal/agent/run_options.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/harness/profile_test.go",
+        "internal/agent/loop_policy_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "HarnessProfile is an unexported-field value created only through validated resolution and returns defensive copies for slice policy."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Profile tests cover defaults, explicit policy values, usable input calculations, and composition into the first provider request."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Invalid IDs, windows, reserves, policies, temperatures, and stop-policy bounds are rejected before run execution."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop resolves the profile once, and explicit RunOptions profile precedence is tested without model metadata reads."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-harness, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-003",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/harness/profile.go",
+        "internal/agent/loop.go",
+        "internal/agent/plan_anchor.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/loop_policy_test.go",
+        "internal/agent/plan_anchor_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "The system request composes the resolved prompt suffix and rendered PlanAnchor once from immutable run policy."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Loop policy tests inspect the actual first provider request for prompt suffix and anchor content."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Invalid anchor state, escaping boundaries, invalid model metadata, and precedence conflicts are rejected or normalized."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Prompt policy is composed inside the common kernel rather than in protocol or provider adapters."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-004",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/tool_schema.go",
+        "internal/agent/edit_policy.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/tool_schema_test.go",
+        "internal/agent/edit_policy_test.go",
+        "internal/agent/tool_dispatch_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Catalog-specific schema snapshots bind advertised names, schemas, executor provenance, edit policy, and dispatcher validation."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Schema and edit-policy tests cover supported catalog shapes and distinct patch, exact, and whole-file execution behavior."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Duplicate or reserved names, malformed schemas, invalid inputs, late MCP collision, and executor identity drift fail before execution."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The common dispatcher validates the same immutable catalog snapshot that was exposed to the provider."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-005",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/protocol/canonical.go",
+        "internal/protocol/canonical_request.go",
+        "internal/protocol/adapter.go",
+        "internal/protocol/anthropic.go",
+        "internal/protocol/openai_chat.go",
+        "internal/protocol/openai_responses.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/protocol/adapter_test.go",
+        "internal/protocol/egress_golden_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Canonical request and streamed response state preserve message roles, tool IDs, call/result ordering, usage, and stop semantics across three adapters."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Golden tests cover Anthropic, Chat Completions, Responses, parallel calls, and non-streaming egress."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Duplicate keys, oversize input, malformed history, invariant violations, cancellation, and unpreserved fields fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Server protocol routes decode to the canonical provider request and write canonical events rather than starting protocol-specific agent loops."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-006",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/toolrecover.go",
+        "internal/agent/loop.go",
+        "internal/agent/chronos.go",
+        "internal/agent/subagent.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/response_policy_integration_test.go",
+        "internal/agent/toolrecover_corpus_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "ResponsePolicy selects native, bounded legacy recovery, or multi-format cascade while keeping reasoning-only recovery out of visible and durable text."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Integration fixtures exercise native calls, legacy recovery, multi-format reasoning fallback, and alternate-mode parity."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Ambiguity, catalog/schema mismatch, oversized arguments, correction exhaustion, and unsupported policy produce bounded failures."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Main RunLoop, Chronos mode, and SubAgent all use the shared response-policy path after single-kernel convergence."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-harness, smallcode-extractor, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-007",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/protocol/adapter.go",
+        "internal/server/protocol_routes.go",
+        "internal/server/server.go",
+        "internal/protocol/canonical.go",
+        "internal/protocol/anthropic.go",
+        "internal/protocol/openai_chat.go",
+        "internal/protocol/openai_responses.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/protocol/adapter_test.go",
+        "internal/server/protocol_routes_test.go",
+        "internal/protocol/advertised_surface_conformance_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses routes use bounded protocol adapters and one canonical provider execution path."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Route tests cover real canonical provider invocation and adapter golden conversion for all three wire families."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Oversize requests, disconnect cancellation, malformed history, and write-error classification are tested."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The advertised-surface table enumerates exactly DefaultRegistry names and proves Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses converge to the same canonical request and terminal egress semantics. It also rejects malformed, duplicate-key, late-system, duplicate-tool-ID, oversize, and malformed-terminal cases without a success sentinel."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-008",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/types/provider.go",
+        "internal/providers/registry.go",
+        "internal/providers/http_client.go",
+        "internal/server/runtime_target.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/providers/registry_matrix_test.go",
+        "internal/providers/http_client_test.go",
+        "internal/server/runtime_target_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "One streaming types.Provider contract backs built-in and custom registry resolution with an injected HTTP transport seam."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Registry matrices and runtime-target tests cover built-ins, custom providers, configured accounts, model overrides, and actual server selection."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unknown providers, ineligible leases, opaque targets, and invalid selection fallbacks are exercised."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The selected provider/model pair is bound at the server runtime target before entering the common kernel."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-009",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/harness/composition.go",
+        "internal/capabilityprofile/selection.go",
+        "internal/agent/loop.go",
+        "internal/server/capability_profiles.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/capability_harness_test.go",
+        "internal/server/capability_profiles_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Provider metadata and exact-target empirical recommendations compose into one HarnessProfile under explicit precedence."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Capability harness and server tests cover eligible empirical selection and required PlanAnchor composition."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Expired, quarantined, inexact, opaque-endpoint, and explicit-override cases ignore empirical evidence or fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Server, Chronos, and SubAgent composition pass the selected immutable capability profile to the common kernel."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-010",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/context_plan.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/context_plan_test.go",
+        "internal/agent/context_plan_capability_test.go",
+        "internal/agent/loop_context_plan_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Context planning estimates system sections, messages, complete tool definitions, protocol overhead, output reserve, and safety margin."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Boundary fixtures exercise 16K, 32K, and 128K windows and every completed request surface."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Invalid reserves, estimators, required tools, and unresolved overflow are rejected before provider invocation."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop recalculates the completed request after each ordered reduction and emits typed context-blocked terminal data."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-011",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/compact.go",
+        "internal/agent/context_plan.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/compact_phase2_test.go",
+        "internal/agent/loop_context_plan_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Compaction is selected from the resolved request budget and falls back deterministically when semantic reduction fails or times out."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Phase-two tests cover deterministic fallback, deadline, hook execution, and recalculation with RAG."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Provider reduction failure, non-shrinking output, timeout, and still-oversized context cannot bypass the final budget gate."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The common loop owns compaction calls and post-compaction context recalculation."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-012",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/compact.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/compact_phase2_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Structured snapshots retain objective, accepted plan, bounded recent/orphan tool pairs, file edits, failures, and evidence without raw payloads."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Deterministic compaction tests verify retained plan and tool-pair state with stable rendering."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Raw store payloads, excess history, malformed pairings, and failed semantic summaries are bounded or replaced."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The snapshot feeds the same common-loop context plan rather than a separate summary session."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-013",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/tool_routing.go",
+        "internal/translate/toolrouter.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/tool_routing_test.go",
+        "internal/translate/toolrouter_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Deterministic local intent classification filters an immutable catalog and widens only after an executed dispatch result."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Routing tests cover direct, deterministic, fallback, and post-execution widening in the real RunLoop."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Ambiguous intent, unknown dynamic tools, selector misuse, and low confidence retain safe catalog behavior."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Translation classification and agent routing state are connected to the kernel catalog and dispatcher."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-014",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/harness/composition.go",
+        "internal/agent/tool_routing.go",
+        "internal/translate/toolrouter.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/harness/composition_test.go",
+        "internal/agent/capability_harness_test.go",
+        "internal/agent/tool_routing_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Effective usable input at or below 16K selects strict two-stage routing, with exact-target empirical evidence deterministically overriding the fallback."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Composition and routing fixtures exercise the threshold, selector-only first stage, round trip, and widening."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Ambiguous or reserved selectors and unreliable empirical recommendations are rejected or fall back safely."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Harness composition selects policy while RunLoop enforces selector isolation and execution widening."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-015",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/toolrecover.go",
+        "internal/agent/tool_schema.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/toolrecover_corpus_test.go",
+        "internal/agent/tool_schema_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Declared native structured calls take precedence and are validated against the active catalog schema before any text parser is considered."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Native corpus and schema fixtures cover supported calls and catalog-specific inputs."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unknown names, invalid schemas, malformed arguments, duplicates, and reserved executor names are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The response-policy path forwards validated native calls into the same common dispatcher as recovered calls."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs smallcode-extractor, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-016",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/toolrecover.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/toolrecover_corpus_test.go",
+        "internal/agent/toolrecover_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "The Hermes decoder accepts a bounded wrapper grammar, canonicalizes calls, and applies catalog/schema validation."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Positive corpus and legacy compatibility tests exercise Hermes envelopes and IDs."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Malformed wrappers, duplicate keys, ambiguous interpretations, unknown tools, and argument limits are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Hermes is one declared parser in the bounded multi-format cascade used by RunLoop."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs smallcode-extractor, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-017",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/toolrecover.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/toolrecover_corpus_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "The Liquid parser implements only the documented marker and a bounded safe literal subset."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Positive corpus fixtures cover Liquid calls through the common cascade."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Adversarial literals, excessive depth or size, ambiguity, and malformed markers are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Liquid results become canonical toolUseBlock values and must pass active catalog/schema validation before dispatch."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs smallcode-liquid, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-018",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/toolrecover.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/toolrecover_corpus_test.go",
+        "internal/agent/toolrecover_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Fenced JSON, whole-response bare JSON, and suffix-only truncation recovery are bounded and never invent middle tokens."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Corpus and legacy tests cover fenced, bare, closed-envelope, and deterministic truncated payload recovery."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unsafe candidates, duplicate keys, conflicting interpretations, unknown aliases, and repair-budget overflow fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Recovered calls enter the same catalog validation and dispatcher path as native structured calls."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs smallcode-extractor, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-019",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/plan_anchor.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/plan_anchor_test.go",
+        "internal/agent/loop_policy_test.go",
+        "internal/agent/plan_anchor_runloop_test.go",
+        "internal/agent/compact_phase2_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "PlanAnchor is immutable, revisioned, validated, escaped, and rendered according to compact or strict policy."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "RunLoop tests inspect five provider iterations and deterministic compaction preservation of one accepted revision."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Empty or oversized state, invalid modes, and invalid progress transitions are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The anchor is rendered inside the common kernel and survives tool iteration and compaction without a planner loop."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-020",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/completion_contract.go",
+        "internal/agent/completion_report_tool.go",
+        "internal/agent/completion_loop.go",
+        "internal/agent/evidence.go",
+        "internal/agent/loop.go",
+        "internal/agent/sessions.go",
+        "internal/server/agent_session.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/completion_contract_test.go",
+        "internal/agent/completion_report_tool_test.go",
+        "internal/agent/completion_evidence_test.go",
+        "internal/agent/loop_completion_contract_test.go",
+        "internal/agent/completion_metadata_test.go",
+        "internal/server/agent_session_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Strict Definition of Done criteria bind to a run-owned revision-CAS CompletionContract and ReportCompletion identity proof using indexed execution evidence."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Contract, report-tool, evidence, loop, receipt, and durable-session tests cover complete, blocked, and recovery paths."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "False prose completion, stale revisions, unknown or duplicate claims, mismatched evidence, routing collisions, and correction exhaustion fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Completion status is propagated consistently through kernel terminal metadata, receipt, recorder summary, and durable session CAS."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-021",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/read_ledger.go",
+        "internal/agent/tool_dispatch.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/read_ledger_test.go",
+        "internal/agent/tool_dispatch_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "A workspace-scoped digest ledger requires a fresh read revision before mutating an existing file."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Ledger and dispatcher tests cover fresh read, create, write refresh, and serial/parallel mutation paths."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Stale, missing, malformed, escaped, or never-read targets are denied before execution."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The common dispatcher owns the precondition and updates the same ledger after reads and successful mutations."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-022",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/edit_policy.go",
+        "internal/agent/tools_improved.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/edit_policy_test.go",
+        "internal/agent/tool_schema_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Patch-first, exact, whole-file, and waterfall policies advertise matching schemas and execute distinct edit behavior."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Edit-policy tests cover multiple unified hunks, exact replacements, whole-file behavior, and catalog/executor alignment."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Mismatched hunks, invalid limits, malformed schemas, and policy/input disagreement are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop applies the resolved edit policy to both advertised definitions and executor options."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-023",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/fuzzy.go",
+        "internal/agent/tools_improved.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/fuzzy_test.go",
+        "internal/agent/tools_improved_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Existing fuzzy replacement behavior produces deterministic whitespace-tolerant replacement and bounded candidate-line hints."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Fuzzy and improved-tool tests cover successful replacement and executor integration."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Empty input, no match, ambiguous candidates, and oversized hints do not silently mutate content."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The corelay-waterfall policy invokes fuzzy behavior only after stricter edit modes fail."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-024",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/lint.go",
+        "internal/agent/tools_improved.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/tools_improved_test.go",
+        "internal/agent/lint_sandbox_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Post-edit lint selects a bounded command, verifies artifact revision, and restores the original bytes on validation failure."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Improved-tool tests cover successful edit and rollback; sandbox tests cover secure lint execution."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Lint failure, sandbox unavailability, revision races, timeout, and infrastructure failure fail closed without retaining broken output."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Edit executors call lint and rollback through the resolved sandbox policy."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-025",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/run_guard.go",
+        "internal/agent/tool_dispatch.go",
+        "internal/agent/loop.go",
+        "internal/agent/run_options.go",
+        "internal/agent/run_terminal.go",
+        "internal/agent/receipt.go",
+        "internal/agent/receipt_redaction.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/run_guard_test.go",
+        "internal/agent/tool_dispatch_test.go",
+        "internal/agent/run_guard_receipt_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Canonical fingerprints include normalized tool name, arguments, target revision, failure class, and plan step."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "RunGuard tests cover equivalent-call identity, changed successful progress, resets, and concurrent observation."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Repeated no-progress calls stop at the bound, while automatic outcomes cannot manufacture an approval reset."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop composes the common-dispatcher guard snapshot into blocked terminal metadata, the durable receipt, RunSummary, and done event. Tests prove identical content-free audit values for failure and recovered-success terminals, preserve denial history across explicit resets, and sanitize forged audit fields."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-026",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/harness/profile.go",
+        "internal/agent/loop.go",
+        "internal/agent/run_guard.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/harness/profile_test.go",
+        "internal/agent/loop_completion_contract_test.go",
+        "internal/agent/run_guard_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "HarnessProfile resolves separate iteration, failed-round, and repeated-action ceilings."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Profile, completion-loop, and RunGuard tests exercise each configured bound in runtime behavior."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Invalid or excessive limits and exhausted iterations/error rounds terminate through typed failure paths."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop enforces iteration/error ceilings while the common dispatcher enforces canonical repeat limits."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-027",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/tool_dispatch.go",
+        "internal/agent/permission.go",
+        "internal/agent/concurrency.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/tool_dispatch_test.go",
+        "internal/agent/loop_policy_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Every call is normalized and checked for catalog, schema, executor identity, plan/offline/scope, permission, approval, context, and pre-hook before scheduling."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Dispatcher tests exercise allowed serial and parallel calls while preserving original result slots."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Denial, malformed input, stale identity, scope failure, cancellation after approval, and pre-hook block never reach execution."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Both concurrent-safe and serial queues are populated only after the same authorization boundary."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-028",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/approval/broker.go",
+        "internal/agent/tool_dispatch.go",
+        "internal/server/server.go",
+        "cmd/proxy/chat.go",
+        "web/src/pages/Chat.tsx"
+      ],
+      "reviewedTestPaths": [
+        "internal/approval/broker_test.go",
+        "internal/server/approval_api_test.go",
+        "cmd/proxy/chat_approval_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "The broker creates redacted session-bound requests and resolves one allow-once or deny outcome."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Broker, HTTP API, and CLI tests cover approval round trips and task cancellation integration."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Wrong session, expiry, duplicate/late resolution, disconnect, context cancellation, and missing requester fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Server and CLI are integration-tested; Chat.tsx was reviewed for the same event/decision mapping but has no repository browser automation."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [
+        "The web approval mapping was manually reviewed; no repository browser-automation test covers Chat.tsx."
+      ],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-029",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "connected",
+      "reviewedImplementationPaths": [
+        "internal/sandbox/adapter.go",
+        "internal/sandbox/bubblewrap.go",
+        "internal/sandbox/seatbelt.go",
+        "internal/sandbox/job_windows.go",
+        "internal/agent/sandbox_bridge.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/sandbox/adapter_test.go",
+        "internal/sandbox/job_windows_test.go",
+        "internal/agent/bash_exec_sandbox_test.go",
+        ".github/workflows/ci.yml"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "AutoRunner selects probed platform isolation and never falls back to unconfined execution unless enforcement is explicitly disabled."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Adapter and current-host Windows tests cover secure selection, process-tree termination, output bounds, and Bash integration."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unavailable capability, failed probe, workspace escape, sensitive environment, timeout, and termination-verification failure fail closed."
+        },
+        "composition": {
+          "verdict": "partial",
+          "evidence": "The contract is composed into Bash/process paths, but real-host Linux bubblewrap and macOS seatbelt conformance is not complete in this repository."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-sandbox, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [
+        "Real-host Linux bubblewrap and macOS seatbelt conformance remains incomplete."
+      ],
+      "overallVerdict": "pass-with-limitations"
+    },
+    {
+      "capabilityId": "CAP-030",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/mcp_runtime.go",
+        "internal/agent/mcp_client.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/loop_mcp_test.go",
+        "internal/agent/mcp_runtime_test.go",
+        "internal/agent/mcp_supervisor_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "A run-owned MCP generation connects before catalog snapshot and binds tool execution to that exact generation."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Loop and runtime tests verify first-request availability, generation isolation, executable resolution, and close behavior."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Duplicate/reserved collisions, missing secure adapter, hostile environment, malformed framing, cancellation, and shutdown bounds fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop constructs or borrows MCP authority before provider invocation and records generation/process evidence."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-031",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/plugin_execution.go",
+        "internal/agent/plugin_approval.go",
+        "internal/agent/tool_dispatch.go",
+        "internal/agent/loop.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/plugin_execution_test.go",
+        "internal/agent/plugin_runloop_test.go",
+        "internal/agent/plugin_alternate_loops_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Executable plugins are discovered before catalog snapshot and require identity-bound one-shot approval plus required sandbox execution."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Plugin execution and RunLoop tests cover approved execution and alternate ingress parity."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Escape, symlink, MCP collision, tamper after approval, forged/reused proof, missing broker, sandbox failure, timeout, and output limits fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Main, Chronos, SubAgent, and Team paths pass plugin configuration into the common dispatcher."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-032",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/sessions.go",
+        "internal/server/server.go",
+        "web/src/lib/sessions.ts",
+        "internal/acp/router.go",
+        "internal/acpbridge/backend.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/sessions_test.go",
+        "internal/server/session_api_test.go",
+        "internal/server/session_lifecycle_api_test.go",
+        "internal/acpbridge/session_surface_test.go",
+        "cmd/corelaycode-acp/conformance_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "SessionStore persists versioned workspace-owned transcripts under revision CAS and atomic replacement."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Store and HTTP lifecycle tests cover CRUD, migration, rename, list, save, and recovery behavior."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Traversal, stale revision, collision, workspace mismatch, invalid IDs, and malformed recovery metadata are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "SessionStore is the single durable CRUD/CAS owner for HTTP/Web and stable ACP ingress. ACP stdio advertises and exercises new, list, load/resume, close, and delete; stale loaded delete and concurrent external SaveExpected have exactly one winner without leaking storage paths."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-sessions, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-033",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/sessions.go",
+        "internal/agent/run_options.go",
+        "internal/agent/tool_dispatch.go",
+        "internal/server/server.go",
+        "web/src/lib/sessions.ts",
+        "internal/server/agent_session.go",
+        "internal/acpbridge/backend.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/session_lifecycle_test.go",
+        "internal/agent/tool_execution_journal_test.go",
+        "internal/agent/session_interrupted_commit_test.go",
+        "internal/server/session_lifecycle_api_test.go",
+        "internal/server/session_resume_continuation_test.go",
+        "internal/server/agent_session_journal_test.go",
+        "internal/server/session_hard_crash_test.go",
+        "internal/acpbridge/session_surface_test.go",
+        "internal/acpbridge/execution_journal_test.go",
+        "cmd/corelaycode-acp/conformance_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Resume state carries bounded interruption metadata and requires explicit reconciliation after ambiguous side effects."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "HTTP and ACP tests cover exact and aggregate write-ahead markers, atomic successful commit, interruption, explicit reconciliation, no-replay continuation, and fresh-process recovery after an actual child hard exit."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Resume before reconciliation, malformed or wrong markers, stale revisions, journal failure, non-success and durable-none terminals, and ambiguous started tools fail closed without leaking storage details."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The shared dispatcher invokes the synchronous journal after authorization and bound-input proof but before tool_execution_start and Execute. HTTP and ACP both persist the first exact marker, aggregate later same-run starts with exact-marker/revision CAS, and clear only that marker with CommitInterruptedRun on a successful terminal. Independent count=10 child-process tests prove a hard exit after a real side effect leaves a fresh process blocked before resume."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-sessions, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "reviewFindings": [
+        {
+          "id": "CAP-033-HARD-CRASH-MARKER-LOSS-001",
+          "observedAt": "2026-08-12T07:39:03+09:00",
+          "severity": "high",
+          "criterion": "composition",
+          "status": "resolved",
+          "evidence": "The original HTTP path retained tool_execution_start only in memory before the write-ahead journal work began, leaving a hard-exit window before SessionStore received a reconciliation marker.",
+          "resolutionEvidence": "RunLoop now calls the synchronous PreExecutionJournal before tool_execution_start and Execute; the HTTP durable run persists exact/aggregate markers and clears only the exact marker through CommitInterruptedRun. TestDurableSessionPreExecutionJournalSurvivesHardProcessExit and the related journal/commit tests passed count=10 on 2026-08-12."
+        },
+        {
+          "id": "CAP-033-ACP-HARD-CRASH-JOURNAL-002",
+          "observedAt": "2026-08-12T07:41:00+09:00",
+          "severity": "high",
+          "criterion": "composition",
+          "status": "resolved",
+          "evidence": "ACP Backend.Prompt originally supplied RunOptions without PreExecutionJournal and committed observer state only after terminal completion, leaving a hard-exit replay window at its advertised resume ingress.",
+          "resolutionEvidence": "ACP now injects a per-prompt synchronous journal, uses exact MarkInterrupted/UpdateInterruptedRun CAS, enriches failure markers, rejects guarded durable-none terminals, and uses exact CommitInterruptedRun only for success. TestACPExecutionJournalSurvivesHardProcessExit runs Backend through the actual AgentRunner and real Write in a child killed after the side effect; a fresh Store/Backend blocks load and resume. The full TestACPExecutionJournal prefix passed count=10 on 2026-08-12."
+        }
+      ],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-034",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/sessions.go",
+        "internal/server/server.go",
+        "web/src/lib/sessions.ts",
+        "internal/acp/router.go",
+        "internal/acpbridge/backend.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/session_lifecycle_test.go",
+        "internal/server/session_lifecycle_api_test.go",
+        "internal/acpbridge/session_surface_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Fork snapshots one expected immutable parent revision into an isolated child with lineage and copied history."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Store and HTTP tests cover isolated forks, concurrent allocation, lineage, and parent linearizability."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Stale revision, unsupported schema, interrupted parent, workspace mismatch, and mutation aliasing are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "HTTP and its Web helper expose the fork mutation over the single SessionStore contract. Stable ACP defines no fork method, so the adapter truthfully omits one; ACP resume nevertheless proves a fork child retains parent ID/revision lineage, replays committed history, remains isolated under child mutation, and cannot mutate its immutable parent."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs oi-sessions, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-035",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/sessions.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/sessions_test.go",
+        "internal/server/session_api_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Session persistence uses opaque crypto IDs, canonical workspace digests, containment checks, collision handling, fsync, and rename."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Store and API tests cover creation, save, load, migration, workspace isolation, and atomic replacement."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Traversal, symlink/non-regular paths, ID collision, stale revision, partial failure, and workspace mismatch fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The safety rules are inside SessionStore and therefore apply to server lifecycle consumers."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-036",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/session_memory.go",
+        "internal/agent/loop.go",
+        "internal/agent/sessions.go",
+        "internal/server/agent_session.go",
+        "internal/server/server.go",
+        "internal/acpbridge/backend.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/session_memory_composition_test.go",
+        "internal/server/tool_result_session_test.go",
+        "internal/acpbridge/tool_result_memory_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Large successful tool results are durably stored before event, observer, provider-history, or session publication and replaced by verified content-addressed references."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Agent, HTTP, and ACP tests cover offload, paging, committed inventory, fork/close retention, resume, and cleanup gates."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Store failure, digest mismatch, orphan reference, uncommitted inventory, recursive re-offload, and active delete fail closed without raw fallback."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop, durable HTTP sessions, and ACP session memory share the checked store/reference boundary."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-037",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/loop_registry.go",
+        "internal/server/server.go",
+        "internal/acpbridge/backend.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/loop_registry_test.go",
+        "internal/server/approval_api_test.go",
+        "internal/acpbridge/stdio_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "LoopRegistry binds active run lifetime to session, parent cancellation, explicit cancel, deterministic release, and bounded shutdown."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Registry, server, and ACP stdio tests cover registration, concurrency caps, cancel, drain, and stable protocol stop reasons."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unknown sessions, shutdown races, timeout, duplicate release, and parent cancellation are bounded."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "HTTP and ACP cancellation map to the same active run context and approval lifecycle."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-038",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/acp/types.go",
+        "internal/acp/methods.go",
+        "internal/acp/backend.go",
+        "internal/acp/jsonrpc.go",
+        "internal/acp/validation.go",
+        "internal/acp/connection.go",
+        "internal/acp/router.go",
+        "internal/acp/client.go",
+        "internal/acpbridge/backend.go",
+        "internal/agent/mcp_client.go",
+        "internal/agent/mcp_runtime.go",
+        "cmd/corelaycode-acp/main.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/acp/connection_test.go",
+        "internal/acpbridge/stdio_test.go",
+        "internal/acpbridge/mcp_runtime_test.go",
+        "internal/acpbridge/session_surface_test.go",
+        "internal/acpbridge/execution_journal_test.go",
+        "cmd/corelaycode-acp/conformance_test.go",
+        "cmd/corelaycode-acp/testdata/acp-v1-advertised-surface.json"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "ACP implements bounded newline JSON-RPC, stable v1 methods, truthful capabilities, typed sessions/prompts, cancellation isolation, permissions, and session-owned MCP."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Connection and stdio tests cover initialize, prompt streaming, permission, cancel, concurrent sessions, and first-request MCP."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Malformed/oversize/deep JSON, duplicate IDs, unknown responses, backpressure, unsupported MCP declarations, and initialization cancellation fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The commit- and SHA-256-pinned command subprocess suite closes the advertised stable-v1 methods, streaming, cancellation, permission, MCP, and credential boundaries. ACP session tests additionally prove CRUD/CAS and fork-child resume semantics, while the actual-AgentRunner child hard-exit test proves the ACP backend durably blocks fresh-process load/resume after a side effect until explicit reconciliation."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs acp-v1-meta, acp-v1-schema, acp-apache-license, acp-v1-release-1.20.0, acp-python-sdk-client, aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [
+        "The repository conformance fixture is not third-party interoperability certification; such external certification is outside the functional adapter contract."
+      ],
+      "reviewFindings": [
+        {
+          "id": "CAP-038-ACP-MCP-CATALOG-NIL-001",
+          "observedAt": "2026-08-12T07:23:07+09:00",
+          "severity": "high",
+          "criterion": "composition",
+          "status": "resolved",
+          "evidence": "go test ./... and a focused TestAdvertisedSurfaceConformanceThroughCommand reproduction failed; the focused subprocess panic dereferenced client.cmd in runMCPRuntime.buildCatalog at internal/agent/mcp_runtime.go:349.",
+          "resolutionEvidence": "MCPClient now retains a canonical executable identity separately from its optional processsupervisor compatibility command view, and runMCPRuntime.buildCatalog binds that identity without dereferencing client.cmd. go test ./cmd/corelaycode-acp -run '^TestAdvertisedSurfaceConformanceThroughCommand$' -count=5 passed 5/5 on 2026-08-12."
+        },
+        {
+          "id": "CAP-038-ACP-HARD-CRASH-JOURNAL-002",
+          "observedAt": "2026-08-12T07:41:00+09:00",
+          "severity": "high",
+          "criterion": "composition",
+          "status": "resolved",
+          "evidence": "ACP Backend.Prompt originally omitted RunOptions.PreExecutionJournal and committed DurableRunObserver state only after terminal completion, so its advertised resume surface lacked a synchronous durable boundary.",
+          "resolutionEvidence": "ACP now injects promptExecutionJournal.Record, aggregates same-run starts through exact revision/marker CAS, atomically commits only successful guarded runs, and leaves failure or durable-none runs reconciliable. The actual-AgentRunner hard-exit child and fresh Backend load/resume block passed as part of TestACPExecutionJournal count=10; full acpbridge, cmd/corelaycode-acp, and ACP vet also passed on 2026-08-12."
+        }
+      ],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-039",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/capabilityprofile/profiler.go",
+        "internal/capabilityprofile/runtime.go",
+        "internal/capabilityprofile/workspace_runtime.go",
+        "cmd/corelaycode-profile/agent_executor.go",
+        "cmd/corelaycode-profile/kernel_isolation.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/capabilityprofile/profiler_test.go",
+        "internal/capabilityprofile/runtime_test.go",
+        "internal/capabilityprofile/workspace_runtime_test.go",
+        "cmd/corelaycode-profile/agent_executor_test.go",
+        "cmd/corelaycode-profile/kernel_isolation_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Profiler probes run in disposable isolated workspaces and bind observations to exact target, plan, runtime transport, trace, and artifact evidence."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Profiler, runtime, workspace, executor, and kernel-isolation tests cover deterministic verified publication."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Unavailable isolation, invalid proof, target drift, schema mismatch, missing trace/artifact, cleanup failure, and raw-secret leakage quarantine."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "The CLI executor invokes the real Agent Kernel with a bounded probe harness and publishes through the profile store."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-040",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/capabilityprofile/scoring.go",
+        "internal/capabilityprofile/store.go",
+        "internal/capabilityprofile/selection.go",
+        "internal/server/capability_profiles.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/capabilityprofile/profiler_test.go",
+        "internal/capabilityprofile/store_test.go",
+        "internal/capabilityprofile/selection_test.go",
+        "internal/server/capability_profiles_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Confidence scoring uses calibration only while holdout and safety observations gate verification and automatic selection separately."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Profiler, store, selection, and server tests cover verified selection and exact-target application."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Low confidence, holdout/safety failure, stale/future/corrupt/quarantined/manual-only profiles, symlink roots, and parameter drift fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Server selection rechecks live provider/model/endpoint identity before composing recommendations into HarnessProfile."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-041",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/evidence.go",
+        "internal/agent/receipt.go",
+        "internal/agent/receipt_redaction.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/evidence_test.go",
+        "internal/agent/loop_evidence_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Evidence policy disposition is separate from completion confidence and maps to one bounded verified, partially-verified, unverified, or blocked terminal state."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Evidence tables and loop tests cover docs-only, deep change, observed verification, measure, and block modes."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Missing evidence, mixed evidence, blocked completion, and verification failure cannot be promoted to verified."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop applies the ledger to sanitized receipt verification and typed terminal metadata."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-042",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/receipt.go",
+        "internal/agent/receipt_redaction.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/receipt_redaction_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Receipt serialization deep-clones values and redacts credential, token, PEM, nested, and completion metadata before bytes are written."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Secret corpus and nested team receipt tests cover sanitized serialization without mutating caller state."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "False-positive corpus, malformed or oversized sensitive values, and atomic write failure are bounded and tested."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "All AgentReceipt and TeamRunReceipt JSON serialization crosses the same sanitizer boundary."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-043",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/receipt.go",
+        "internal/agent/receipt_redaction.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/receipt_redaction_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "Receipt artifacts and commands carry SHA-256 digests, relative paths, typed statuses, and atomic unique locations without raw command text."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Receipt boundary tests recompute digests and verify successful unique atomic writes."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Workspace escape, invalid artifact status, write failure, and temporary-file cleanup paths fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "Agent and Team receipt writers share the sanitized atomic persistence helper."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-044",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "verified",
+      "reviewedImplementationPaths": [
+        "internal/agent/loop.go",
+        "internal/agent/run_terminal.go",
+        "internal/hooks/hooks.go"
+      ],
+      "reviewedTestPaths": [
+        "internal/agent/run_terminal_test.go",
+        "internal/agent/loop_hooks_test.go",
+        "internal/hooks/hooks_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "One idempotent finalizer owns SessionEnd, recorder terminalization, typed done, and stream close ordering for every RunLoop exit."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Terminal tables exercise preflight, command, context block, provider/parser/selector failure, cancellation, normal/edit completion, max iteration, and no-terminal paths."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Repeated finalize calls, receipt duplication, hook failure, cancellation, and missing outcome remain exactly-once and fail closed."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "RunLoop delegates every return to the common finalizer; started hook sessions end before recorder terminal and done."
+        },
+        "provenance": {
+          "verdict": "pass",
+          "evidence": "Reviewed source IDs aniclew-spec, 2 non-copy constraints, and every listed repository path independently of ledger reviewer status."
+        }
+      },
+      "residualLimitations": [],
+      "overallVerdict": "pass"
+    },
+    {
+      "capabilityId": "CAP-045",
+      "reviewerId": "codex-cap045-independent-auditor-20260812-071215-kst",
+      "ledgerStatusAtReview": "connected",
+      "reviewedImplementationPaths": [
+        "docs/plan/agent-capability-absorption/capability-matrix.md",
+        "docs/plan/agent-capability-absorption/provenance-ledger.json",
+        "docs/plan/agent-capability-absorption/semantic-review.json",
+        "docs/ip-provenance.md"
+      ],
+      "reviewedTestPaths": [
+        "internal/provenance/ledger_test.go",
+        "internal/provenance/semantic_review_test.go"
+      ],
+      "criteria": {
+        "contract": {
+          "verdict": "pass",
+          "evidence": "The ledger has one behavior contract, pinned or repository source, non-copy constraints, implementation paths, and tests for each of 45 matrix IDs."
+        },
+        "happyPath": {
+          "verdict": "pass",
+          "evidence": "Repository provenance tests validate ledger structure, sources, path containment, matrix alignment, and full 45-record coverage."
+        },
+        "negativePath": {
+          "verdict": "pass",
+          "evidence": "Duplicate or missing IDs, unknown sources, unpinned GitHub URLs, missing/escaping paths, malformed dates, and status drift are rejected."
+        },
+        "composition": {
+          "verdict": "pass",
+          "evidence": "This independent review inspects repository-owned semantics, but historical prior access prevents a legal clean-room certification and the old source-string scan is not reproducible here."
+        },
+        "provenance": {
+          "verdict": "partial",
+          "evidence": "The 45-record behavior ledger and this independent semantic review are repository-verifiable, but documented prior access and a non-reproducible historical scan preclude legal clean-room certification."
+        }
+      },
+      "residualLimitations": [
+        "docs/ip-provenance.md records prior access to a leaked proprietary source tree, so this review cannot certify legal clean-room independence.",
+        "The historical string-comparison scan requires the unavailable reference tree and is not reproducible from this repository alone.",
+        "The matrix and ledger remain Connected with the generic historical reviewer until their owning documentation workflow is deliberately updated."
+      ],
+      "overallVerdict": "pass-with-limitations"
+    }
+  ],
+  "summary": {
+    "recordCount": 45,
+    "pass": 43,
+    "passWithLimitations": 2,
+    "fail": 0,
+    "verifiedLedgerRecordsReviewed": 43,
+    "connectedLedgerRecordsReviewed": 2
+  }
+}

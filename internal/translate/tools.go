@@ -3,7 +3,7 @@ package translate
 import (
 	"encoding/json"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ToolDefsToOAI converts Anthropic tool definitions to OpenAI format.

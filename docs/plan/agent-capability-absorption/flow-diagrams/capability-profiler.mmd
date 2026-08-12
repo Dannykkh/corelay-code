@@ -1,0 +1,26 @@
+flowchart TD
+    A([Provider and model registered]) --> B{Compatible fresh profile exists?}
+    B -->|Yes| Z([Select immutable capability profile])
+    B -->|No| C[Create disposable isolated probe workspace]
+    C --> D{Required isolation ready?}
+    D -->|No| X[Block profiling and use conservative fallback]
+    D -->|Yes| E[Run fixed repeated probe matrix]
+    E --> F{Probe transport succeeds?}
+    F -->|No| G{Retry budget remains?}
+    G -->|Yes| E
+    G -->|No| X
+    F -->|Yes| H[Collect raw traces and artifact digests]
+    H --> I[Score protocol tool context edit and repetition]
+    I --> J{Confidence threshold met?}
+    J -->|No| K{Repeat budget remains?}
+    K -->|Yes| E
+    K -->|No| L[Build provisional conservative profile]
+    J -->|Yes| M[Build empirical profile with provenance]
+    L --> N[Run holdout validation]
+    M --> N
+    N --> O{Holdout passes?}
+    O -->|No| P[Quarantine candidate and select fallback]
+    P --> Z
+    O -->|Yes| Q[Persist versioned profile and profiler receipt]
+    Q --> Z
+    X --> Z

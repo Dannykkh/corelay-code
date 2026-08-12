@@ -42,10 +42,10 @@ export function Sidebar({ active, onNavigate, onLangChange, onThemeToggle, theme
       <div className="p-4 border-b border-[var(--color-border)]">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-sm font-bold">
-            A
+            C
           </div>
           <div>
-            <div className="text-sm font-semibold text-[var(--color-text)]">AniClew</div>
+            <div className="text-sm font-semibold text-[var(--color-text)]">Corelay Code</div>
             <div className="text-[10px] text-[var(--color-text2)]">v1.0.0</div>
           </div>
         </div>

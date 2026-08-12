@@ -21,10 +21,10 @@ const translations = {
   // ── Chat ──
   'chat.title': { ko: '코딩 에이전트', en: 'Coding Agent' },
   'chat.turns': { ko: '턴', en: 'turns' },
-  'chat.welcome': { ko: 'AniClew 코딩 에이전트', en: 'AniClew Coding Agent' },
+  'chat.welcome': { ko: 'Corelay Code 코딩 에이전트', en: 'Corelay Code Coding Agent' },
   'chat.welcomeSub': { ko: '파일 읽기, 코드 작성, 명령 실행 — 코딩 에이전트.', en: 'Reads files, writes code, runs commands — your coding agent.' },
   'chat.tools': { ko: '도구: Bash, Read, Write, Edit, Glob, Grep', en: 'Tools: Bash, Read, Write, Edit, Glob, Grep' },
-  'chat.placeholder': { ko: 'AniClew에게 코딩 요청... (Enter로 전송)', en: 'Ask AniClew to code... (Enter to send)' },
+  'chat.placeholder': { ko: 'Corelay Code에 코딩 요청... (Enter로 전송)', en: 'Ask Corelay Code to code... (Enter to send)' },
   'chat.send': { ko: '전송', en: 'Send' },
   'chat.generating': { ko: '생성 중...', en: 'Generating...' },
   'chat.thinking': { ko: '생각 중...', en: 'Thinking...' },

@@ -13,6 +13,16 @@ function errorMessageFromBody(body: unknown): string | undefined {
   return undefined;
 }
 
+export class HTTPError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'HTTPError';
+    this.status = status;
+  }
+}
+
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, init);
   if (!res.ok) {
@@ -30,7 +40,7 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
         if (text) msg = text;
       } catch { /* keep msg */ }
     }
-    throw new Error(msg);
+    throw new HTTPError(res.status, msg);
   }
   return res.json();
 }
@@ -48,6 +58,32 @@ export async function putJSON<T>(url: string, body: unknown): Promise<T> {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+export type ApprovalDecision = 'allow_once' | 'deny';
+
+export interface ApprovalResolution {
+  id: string;
+  decision: ApprovalDecision;
+  reason?: string;
+  resolvedAt: string;
+}
+
+export async function resolveApproval(
+  approvalID: string,
+  sessionID: string,
+  decision: ApprovalDecision,
+  signal?: AbortSignal,
+): Promise<ApprovalResolution> {
+  if (!approvalID.trim() || !sessionID.trim()) {
+    throw new Error('Approval and runtime session IDs are required');
+  }
+  return fetchJSON(`/api/approvals/${encodeURIComponent(approvalID)}/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: sessionID, decision }),
+    signal,
   });
 }
 

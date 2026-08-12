@@ -1,65 +1,208 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
-// lintFile runs a fast syntax check on a file based on its extension.
-//
-// It returns "" when the file is syntactically OK — and also when no linter
-// is available for the language or the linter binary is not installed. We
-// never block on unknown languages or missing tools; this mirrors the
-// SWE-agent ACI philosophy ("only block on a syntax error we can prove").
-//
-// When a syntax error is found, it returns the linter's error text so the
-// caller can surface it to the model for self-correction (reflection).
-func lintFile(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
+type LintFailureCode string
 
-	// JSON: validate in-process, no external tool required.
+const (
+	LintFailureNone             LintFailureCode = ""
+	LintFailureSyntax           LintFailureCode = "syntax_error"
+	LintFailureSandbox          LintFailureCode = "sandbox_failure"
+	LintFailureRevisionMismatch LintFailureCode = "artifact_revision_mismatch"
+	LintFailureArtifact         LintFailureCode = "artifact_unavailable"
+)
+
+// LintResult keeps syntax failure distinct from sandbox and artifact failures.
+// Checked=false means the extension has no configured syntax checker.
+type LintResult struct {
+	Checked          bool
+	Valid            bool
+	Failure          LintFailureCode
+	Message          string
+	ArtifactRevision string
+	SandboxReport    sandbox.Report
+}
+
+func (r LintResult) failedInfrastructure() bool {
+	return r.Failure == LintFailureSandbox ||
+		r.Failure == LintFailureRevisionMismatch ||
+		r.Failure == LintFailureArtifact
+}
+
+// lintFile is the compatibility entry point used by focused syntax tests. It
+// composes the platform secure default explicitly; it never falls back to a
+// host exec path when the adapter or executable is unavailable.
+func lintFile(path string) string {
+	revision, err := readLedgerFileRevision(path)
+	if err != nil {
+		return err.Error()
+	}
+	runner, policy := DefaultSandboxExecution(filepath.Dir(path))
+	result := lintFileWithOptions(path, revision, ToolExecutionOptions{
+		SandboxRunner: runner,
+		SandboxPolicy: policy,
+	})
+	if result.Valid || !result.Checked {
+		return ""
+	}
+	return result.Message
+}
+
+// lintFileWithOptions verifies that the exact expected artifact revision is
+// checked. The revision is compared both before and after a child process so a
+// concurrent writer cannot make a lint result apply to different bytes.
+func lintFileWithOptions(path, expectedRevision string, opts ToolExecutionOptions) LintResult {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".json" && ext != ".go" && ext != ".py" &&
+		ext != ".js" && ext != ".mjs" && ext != ".cjs" && ext != ".jsx" {
+		return LintResult{Valid: true}
+	}
+
+	before, err := readLedgerFileRevision(path)
+	if err != nil {
+		return LintResult{
+			Checked: true,
+			Failure: LintFailureArtifact,
+			Message: "inspect lint artifact: " + err.Error(),
+		}
+	}
+	if before != expectedRevision {
+		return lintRevisionMismatch(expectedRevision, before)
+	}
+
 	if ext == ".json" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return ""
+			return LintResult{Checked: true, Failure: LintFailureArtifact, Message: "read lint artifact: " + err.Error()}
 		}
-		if !json.Valid(data) {
-			return "invalid JSON syntax"
+		result := LintResult{
+			Checked:          true,
+			Valid:            json.Valid(data),
+			ArtifactRevision: artifactBytesRevision(data),
 		}
-		return ""
+		if !result.Valid {
+			result.Failure = LintFailureSyntax
+			result.Message = "invalid JSON syntax"
+		}
+		return verifyLintArtifactUnchanged(path, expectedRevision, result)
 	}
 
-	var cmd *exec.Cmd
-	switch ext {
+	command, arguments := lintCommand(ext, path)
+	process := runToolProcess(
+		opts,
+		"syntax lint",
+		filepath.Dir(path),
+		command,
+		arguments,
+		defaultToolProcessTimeout,
+	)
+	result := LintResult{
+		Checked:          true,
+		ArtifactRevision: before,
+		SandboxReport:    process.Report,
+	}
+	result = verifyLintArtifactUnchanged(path, expectedRevision, result)
+	if result.Failure == LintFailureRevisionMismatch || result.Failure == LintFailureArtifact {
+		return result
+	}
+	if process.policyOrContextFailure() || !process.Started {
+		result.Failure = LintFailureSandbox
+		result.Message = process.setupOrExecutionError("syntax checker could not run")
+		return result
+	}
+	if process.ExitCode != 0 || process.Err != nil {
+		result.Failure = LintFailureSyntax
+		result.Message = process.setupOrExecutionError(
+			fmt.Sprintf("syntax checker exited with code %d", process.ExitCode),
+		)
+		return result
+	}
+	result.Valid = true
+	result.Failure = LintFailureNone
+	return result
+}
+
+func lintCommand(extension, path string) (string, []string) {
+	switch extension {
 	case ".go":
-		// gofmt -e exits non-zero and prints the parse error on bad syntax.
-		cmd = exec.Command("gofmt", "-e", path)
+		return "gofmt", []string{"-e", path}
 	case ".py":
-		// py_compile reports only syntax errors (no style noise).
-		cmd = exec.Command("python3", "-m", "py_compile", path)
-	case ".js", ".mjs", ".cjs", ".jsx":
-		cmd = exec.Command("node", "--check", path)
+		// ast.parse performs a syntax-only check without creating __pycache__.
+		const parsePython = "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'), filename=sys.argv[1])"
+		return "python3", []string{"-c", parsePython, path}
 	default:
-		return "" // no linter for this language — don't block the edit
+		return "node", []string{"--check", path}
 	}
+}
 
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return "" // exit 0 → syntactically valid
+func verifyLintArtifactUnchanged(path, expected string, result LintResult) LintResult {
+	after, err := readLedgerFileRevision(path)
+	if err != nil {
+		result.Valid = false
+		result.Failure = LintFailureArtifact
+		result.Message = "re-read lint artifact: " + err.Error()
+		return result
 	}
-	// If the linter binary itself is missing, skip the gate (best-effort).
-	var execErr *exec.Error
-	if errors.As(err, &execErr) {
-		return ""
+	result.ArtifactRevision = after
+	if after != expected {
+		mismatch := lintRevisionMismatch(expected, after)
+		mismatch.SandboxReport = result.SandboxReport
+		return mismatch
 	}
-	// Non-zero exit → syntax error. Return the tool's message.
-	msg := strings.TrimSpace(string(out))
-	if msg == "" {
-		msg = err.Error()
+	return result
+}
+
+func lintRevisionMismatch(expected, actual string) LintResult {
+	return LintResult{
+		Checked:          true,
+		Failure:          LintFailureRevisionMismatch,
+		Message:          fmt.Sprintf("lint artifact changed concurrently (expected %s, found %s)", expected, actual),
+		ArtifactRevision: actual,
 	}
-	return msg
+}
+
+func artifactBytesRevision(data []byte) string {
+	digest := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+// rollbackArtifactIfRevision restores only bytes still owned by this
+// mutation. A mismatched revision is never overwritten or removed.
+func rollbackArtifactIfRevision(
+	path string,
+	expectedRevision string,
+	existed bool,
+	backup []byte,
+) (bool, error) {
+	current, err := readLedgerFileRevision(path)
+	if err != nil {
+		return false, fmt.Errorf("inspect rollback artifact: %w", err)
+	}
+	if current != expectedRevision {
+		return false, fmt.Errorf(
+			"rollback skipped because artifact changed concurrently (expected %s, found %s)",
+			expectedRevision,
+			current,
+		)
+	}
+	if existed {
+		if err := os.WriteFile(path, backup, 0o644); err != nil {
+			return false, fmt.Errorf("restore rollback artifact: %w", err)
+		}
+		return true, nil
+	}
+	if err := os.Remove(path); err != nil {
+		return false, fmt.Errorf("remove rollback artifact: %w", err)
+	}
+	return true, nil
 }

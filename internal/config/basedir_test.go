@@ -10,6 +10,7 @@ import (
 func withHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", "")
 	t.Setenv("ANICLEW_CONFIG_DIR", "")
 	if os.PathSeparator == '\\' {
 		t.Setenv("USERPROFILE", home)
@@ -42,9 +43,21 @@ func TestBaseDirKeepsExistingLegacyDirectory(t *testing.T) {
 	}
 }
 
+func TestBaseDirKeepsExistingOldestLegacyDirectory(t *testing.T) {
+	home := withHome(t)
+	legacy := filepath.Join(home, LegacyProxyBaseDirName)
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := BaseDir(); got != legacy {
+		t.Fatalf("BaseDir() = %q, want the existing oldest legacy dir %q", got, legacy)
+	}
+}
+
 func TestBaseDirPrefersNewNameWhenBothExist(t *testing.T) {
 	home := withHome(t)
-	for _, name := range []string{BaseDirName, LegacyBaseDirName} {
+	for _, name := range []string{BaseDirName, LegacyBaseDirName, LegacyProxyBaseDirName} {
 		if err := os.MkdirAll(filepath.Join(home, name), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -69,12 +82,25 @@ func TestBaseDirHonoursExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestBaseDirPrefersCorelayOverrideToLegacyOverride(t *testing.T) {
+	withHome(t)
+	current := t.TempDir()
+	legacy := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", current)
+	t.Setenv("ANICLEW_CONFIG_DIR", legacy)
+
+	if got := BaseDir(); got != current {
+		t.Fatalf("BaseDir() = %q, want CORELAY_CONFIG_DIR %q", got, current)
+	}
+}
+
 func TestIsBaseDirPathMatchesBothNames(t *testing.T) {
 	cases := map[string]bool{
-		filepath.Join("home", "u", BaseDirName, "receipts", "x.json"):  true,
-		filepath.Join("home", "u", LegacyBaseDirName, "undo", "abc"):   true,
-		filepath.Join("home", "u", "projects", "somewhere", "file.go"): false,
-		filepath.Join("etc", "passwd"):                                 false,
+		filepath.Join("home", "u", BaseDirName, "receipts", "x.json"):     true,
+		filepath.Join("home", "u", LegacyBaseDirName, "undo", "abc"):      true,
+		filepath.Join("home", "u", LegacyProxyBaseDirName, "undo", "abc"): true,
+		filepath.Join("home", "u", "projects", "somewhere", "file.go"):    false,
+		filepath.Join("etc", "passwd"):                                    false,
 	}
 	for path, want := range cases {
 		if got := IsBaseDirPath(path); got != want {

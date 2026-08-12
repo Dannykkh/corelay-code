@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/config"
 )
 
 func TestEvidencePolicyHandlers(t *testing.T) {
-	t.Setenv("ANICLEW_CONFIG_DIR", t.TempDir())
-	t.Setenv("ANICLEW_EVIDENCE_POLICY", "advisory")
+	t.Setenv("CORELAY_CONFIG_DIR", t.TempDir())
+	t.Setenv("CORELAY_EVIDENCE_POLICY", "advisory")
 	s := New(nil, "", 0)
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/evidence/policy", nil)

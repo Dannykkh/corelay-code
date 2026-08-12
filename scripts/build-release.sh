@@ -1,11 +1,10 @@
 #!/bin/bash
-# Build AniClew binaries for all platforms
+# Build Corelay Code binaries for all platforms
 
 VERSION=${1:-"dev"}
 OUTPUT_DIR="dist"
-MODULE="github.com/aniclew/aniclew"
-
-echo "Building AniClew $VERSION..."
+BUILD_FAILED=0
+echo "Building Corelay Code $VERSION..."
 mkdir -p $OUTPUT_DIR
 
 # Build frontend first
@@ -27,22 +26,37 @@ for platform in "${platforms[@]}"; do
   IFS=':' read -r os_arch ext <<< "$platform"
   IFS='/' read -r os arch <<< "$os_arch"
 
-  output="$OUTPUT_DIR/aniclew-${VERSION}-${os}-${arch}${ext}"
-  echo "  Building $os/$arch → $output"
+  for target in \
+    "corelaycode:./cmd/proxy" \
+    "corelaycode-acp:./cmd/corelaycode-acp" \
+    "corelaycode-profile:./cmd/corelaycode-profile"
+  do
+    IFS=':' read -r name package <<< "$target"
+    output="$OUTPUT_DIR/${name}-${VERSION}-${os}-${arch}${ext}"
+    echo "  Building $name for $os/$arch → $output"
 
-  GOOS=$os GOARCH=$arch go build -ldflags "-s -w -X main.version=$VERSION" -o "$output" ./cmd/proxy
-
-  if [ $? -eq 0 ]; then
-    echo "    ✓ $(du -h "$output" | cut -f1)"
-  else
-    echo "    ✗ Failed"
-  fi
+    ldflags="-s -w"
+    if [ "$name" = "corelaycode-acp" ]; then
+      ldflags="$ldflags -X main.version=$VERSION"
+    fi
+    if GOOS=$os GOARCH=$arch go build -ldflags "$ldflags" -o "$output" "$package"; then
+      echo "    built $(du -h "$output" | cut -f1)"
+    else
+      echo "    failed"
+      BUILD_FAILED=1
+    fi
+  done
 done
+
+if [ "$BUILD_FAILED" -ne 0 ]; then
+  echo "One or more release builds failed." >&2
+  exit 1
+fi
 
 # Create checksums
 echo "Creating checksums..."
 cd $OUTPUT_DIR
-sha256sum aniclew-* > checksums.txt 2>/dev/null || shasum -a 256 aniclew-* > checksums.txt
+sha256sum corelaycode-* > checksums.txt 2>/dev/null || shasum -a 256 corelaycode-* > checksums.txt
 cd ..
 
 echo ""

@@ -11,7 +11,7 @@ import (
 )
 
 // Background consolidation ("autoDream") — mirror of Claude Code's
-// services/autoDream package, scaled down to what AniClew needs.
+// services/autoDream package, scaled down to what Corelay Code needs.
 //
 // The three gates run cheapest-first so a hot path never does a full
 // scan unless it already believes consolidation is due:
@@ -133,7 +133,7 @@ func CheckDreamGate(workDir string, cfg DreamConfig) (GateResult, error) {
 //
 // This is NOT a cross-host lock — it is cooperative within a single
 // filesystem. That is the same guarantee Claude Code's
-// consolidationLock.ts provides, and it is sufficient for AniClew's
+// consolidationLock.ts provides, and it is sufficient for Corelay Code's
 // single-user-per-machine model.
 func TryAcquireDreamLock(workDir string, cfg DreamConfig) (release func(), err error) {
 	if err := Ensure(workDir); err != nil {

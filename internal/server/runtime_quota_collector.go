@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
 )
 
 func (s *Server) StartRuntimeQuotaCollectors(sources []config.RuntimeQuotaSource) int {

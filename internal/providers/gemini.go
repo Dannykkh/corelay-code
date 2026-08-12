@@ -4,25 +4,38 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
-	"github.com/aniclew/aniclew/internal/translate"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/translate"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 type GeminiProvider struct {
-	apiKey  string
-	baseURL string
+	apiKey   string
+	baseURL  string
+	httpDoer HTTPDoer
 }
 
 func NewGemini(cfg *types.ProviderConfig) types.Provider {
+	return NewGeminiWithOptions(cfg, CreateOptions{})
+}
+
+func NewGeminiWithOptions(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	return &GeminiProvider{
-		apiKey:  coalesce(cfg.APIKey, os.Getenv("GEMINI_API_KEY")),
-		baseURL: coalesce(cfg.BaseURL, "https://generativelanguage.googleapis.com"),
+		apiKey:   coalesce(cfg.APIKey, os.Getenv("GEMINI_API_KEY")),
+		baseURL:  coalesce(cfg.BaseURL, "https://generativelanguage.googleapis.com"),
+		httpDoer: httpDoerOrDefault(opts.HTTPDoer),
 	}
 }
 
@@ -45,7 +58,10 @@ func (p *GeminiProvider) Validate() error {
 }
 
 func (p *GeminiProvider) StreamMessage(ctx context.Context, req *types.MessagesRequest, opts *types.StreamOptions) (<-chan types.SSEEvent, error) {
-	geminiReq := buildGeminiRequest(req)
+	geminiReq, err := buildGeminiRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(geminiReq)
 	if err != nil {
 		return nil, err
@@ -61,14 +77,19 @@ func (p *GeminiProvider) StreamMessage(ctx context.Context, req *types.MessagesR
 		}
 	}
 
-	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", p.baseURL, req.Model, apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", p.baseURL, req.Model)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gemini request construction failed")
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		// Official Gemini REST authentication uses x-goog-api-key. Keeping the
+		// credential out of the URL prevents proxy/error logs from capturing it.
+		httpReq.Header.Set("x-goog-api-key", apiKey)
+	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := httpDoerOrDefault(p.httpDoer).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("gemini connection failed: %w", err)
 	}
@@ -108,6 +129,7 @@ func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Respons
 	textOpen := false
 	outputTokens := 0
 	stopReason := "end_turn"
+	sawToolCall := false
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -145,6 +167,7 @@ func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Respons
 			}
 			var fnPart struct {
 				FunctionCall *struct {
+					ID   string          `json:"id"`
 					Name string          `json:"name"`
 					Args json.RawMessage `json:"args"`
 				} `json:"functionCall"`
@@ -178,17 +201,25 @@ func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Respons
 					textOpen = false
 				}
 				idx := blockIndex
+				callID := fnPart.FunctionCall.ID
+				if callID == "" {
+					callID = newGeminiToolCallID()
+				}
+				args := fnPart.FunctionCall.Args
+				if len(args) == 0 || string(args) == "null" {
+					args = json.RawMessage(`{}`)
+				}
 				if !sendSSEEvent(ctx, ch, types.SSEEvent{
 					Type: "content_block_start", Index: &idx,
 					ContentBlock: mustJSON(map[string]any{
-						"type": "tool_use", "id": "toolu_gemini", "name": fnPart.FunctionCall.Name, "input": "",
+						"type": "tool_use", "id": callID, "name": fnPart.FunctionCall.Name, "input": map[string]any{},
 					}),
 				}) {
 					return
 				}
 				if !sendSSEEvent(ctx, ch, types.SSEEvent{
 					Type: "content_block_delta", Index: &idx,
-					Delta: mustJSON(map[string]string{"type": "input_json_delta", "partial_json": string(fnPart.FunctionCall.Args)}),
+					Delta: mustJSON(map[string]string{"type": "input_json_delta", "partial_json": string(args)}),
 				}) {
 					return
 				}
@@ -197,10 +228,11 @@ func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Respons
 				}
 				blockIndex++
 				stopReason = "tool_use"
+				sawToolCall = true
 			}
 		}
 
-		if cand.FinishReason == "STOP" {
+		if cand.FinishReason == "STOP" && !sawToolCall {
 			stopReason = "end_turn"
 		}
 	}
@@ -222,7 +254,12 @@ func (p *GeminiProvider) translateStream(ctx context.Context, resp *http.Respons
 	sendSSEEvent(ctx, ch, types.SSEEvent{Type: "message_stop"})
 }
 
-func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
+// Gemini history shape follows the official GenerateContent Part contract.
+// In particular, a prior model functionCall must be paired with a later user
+// functionResponse rather than flattened into text.
+// https://ai.google.dev/api/generate-content
+// https://ai.google.dev/gemini-api/docs/function-calling
+func buildGeminiRequest(req *types.MessagesRequest) (map[string]any, error) {
 	result := map[string]any{}
 
 	// System
@@ -230,37 +267,31 @@ func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
 		sysMsg := translate.SystemToOAI(req.System)
 		if sysMsg != nil {
 			var text string
-			json.Unmarshal(sysMsg.Content, &text)
+			if err := json.Unmarshal(sysMsg.Content, &text); err != nil {
+				return nil, fmt.Errorf("gemini system instruction: %w", err)
+			}
 			result["systemInstruction"] = map[string]any{
 				"parts": []map[string]string{{"text": text}},
 			}
 		}
 	}
 
-	// Contents (simplified — text only for now)
+	// Build an ID-to-function map while walking history so function_result
+	// blocks can retain both the call ID and Gemini's required function name.
 	var contents []map[string]any
+	callNames := make(map[string]string)
 	for _, msg := range req.Messages {
 		role := "user"
 		if msg.Role == "assistant" {
 			role = "model"
 		}
 
-		var text string
-		json.Unmarshal(msg.Content, &text)
-		if text == "" {
-			// Try blocks
-			var blocks []struct{ Type, Text string }
-			json.Unmarshal(msg.Content, &blocks)
-			for _, b := range blocks {
-				if b.Text != "" {
-					text += b.Text
-				}
-			}
+		parts, err := geminiPartsForMessage(msg, callNames)
+		if err != nil {
+			return nil, err
 		}
-		if text != "" {
-			contents = append(contents, map[string]any{
-				"role": role, "parts": []map[string]string{{"text": text}},
-			})
+		if len(parts) > 0 {
+			contents = append(contents, map[string]any{"role": role, "parts": parts})
 		}
 	}
 	result["contents"] = contents
@@ -283,8 +314,90 @@ func buildGeminiRequest(req *types.MessagesRequest) map[string]any {
 	}
 	result["generationConfig"] = genCfg
 
-	return result
+	return result, nil
 }
+
+func geminiPartsForMessage(msg types.Message, callNames map[string]string) ([]map[string]any, error) {
+	var text string
+	if err := json.Unmarshal(msg.Content, &text); err == nil {
+		if text == "" {
+			return nil, nil
+		}
+		return []map[string]any{{"text": text}}, nil
+	}
+
+	var blocks []types.ContentBlockParam
+	if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+		return nil, fmt.Errorf("gemini message content: %w", err)
+	}
+	parts := make([]map[string]any, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, map[string]any{"text": block.Text})
+			}
+		case "tool_use":
+			if msg.Role != "assistant" || block.ID == "" || block.Name == "" {
+				return nil, fmt.Errorf("gemini function call requires assistant role, id, and name")
+			}
+			if _, duplicate := callNames[block.ID]; duplicate {
+				return nil, fmt.Errorf("gemini duplicate function call id")
+			}
+			var args map[string]any
+			if err := json.Unmarshal(block.Input, &args); err != nil || args == nil {
+				return nil, fmt.Errorf("gemini function call arguments must be a JSON object")
+			}
+			callNames[block.ID] = block.Name
+			parts = append(parts, map[string]any{"functionCall": map[string]any{"id": block.ID, "name": block.Name, "args": args}})
+		case "tool_result":
+			if msg.Role != "user" || block.ToolUseID == "" {
+				return nil, fmt.Errorf("gemini function response requires user role and tool_use_id")
+			}
+			name, ok := callNames[block.ToolUseID]
+			if !ok {
+				return nil, fmt.Errorf("gemini function response references an unknown call id")
+			}
+			response, err := geminiFunctionResponse(block.Content, block.IsError)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, map[string]any{"functionResponse": map[string]any{"id": block.ToolUseID, "name": name, "response": response}})
+		default:
+			return nil, fmt.Errorf("gemini unsupported history block type %q", block.Type)
+		}
+	}
+	return parts, nil
+}
+
+func geminiFunctionResponse(raw json.RawMessage, isError *bool) (map[string]any, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("gemini function response content is required")
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("gemini function response content: %w", err)
+	}
+	key := "output"
+	if isError != nil && *isError {
+		key = "error"
+	}
+	if object, ok := value.(map[string]any); ok && key == "output" {
+		return object, nil
+	}
+	return map[string]any{key: value}, nil
+}
+
+func newGeminiToolCallID() string {
+	b := make([]byte, 18)
+	if _, err := rand.Read(b); err != nil {
+		counter := geminiFallbackID.Add(1)
+		return fmt.Sprintf("toolu_gemini_%d_%d", time.Now().UTC().UnixNano(), counter)
+	}
+	return "toolu_gemini_" + base64.RawURLEncoding.EncodeToString(b)
+}
+
+var geminiFallbackID atomic.Uint64
 
 func mustJSON(v any) json.RawMessage {
 	data, _ := json.Marshal(v)

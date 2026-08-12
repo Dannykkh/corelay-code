@@ -33,11 +33,40 @@ interface FileResponse {
   content?: string;
 }
 
+type Theme = 'dark' | 'light';
+
+const THEME_STORAGE_KEY = 'corelay-theme';
+const LEGACY_THEME_STORAGE_KEY = 'aniclew-theme';
+
+function isTheme(value: string | null): value is Theme {
+  return value === 'dark' || value === 'light';
+}
+
+function loadTheme(): Theme {
+  if (typeof localStorage === 'undefined') return 'dark';
+  try {
+    const current = localStorage.getItem(THEME_STORAGE_KEY);
+    if (isTheme(current)) return current;
+
+    const legacy = localStorage.getItem(LEGACY_THEME_STORAGE_KEY);
+    if (isTheme(legacy)) {
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, legacy);
+        localStorage.removeItem(LEGACY_THEME_STORAGE_KEY);
+      } catch {
+        // The legacy value is still usable when migration cannot be persisted.
+      }
+      return legacy;
+    }
+  } catch {
+    // Storage can be unavailable in privacy-restricted browser contexts.
+  }
+  return 'dark';
+}
+
 function App() {
   const [page, setPage] = useState('chat');
-  const [theme, setTheme] = useState<'dark' | 'light'>(() =>
-    (localStorage.getItem('aniclew-theme') as 'dark' | 'light') || 'dark'
-  );
+  const [theme, setTheme] = useState<Theme>(loadTheme);
   const [status, setStatus] = useState<AppConfig | null>(null);
   const [loadSessionId, setLoadSessionId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -78,7 +107,12 @@ function App() {
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('aniclew-theme', theme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+      localStorage.removeItem(LEGACY_THEME_STORAGE_KEY);
+    } catch {
+      // Keep the selected theme active even if persistence is unavailable.
+    }
   }, [theme]);
 
   // Side panel visible for chat and files mode
@@ -256,7 +290,7 @@ function App() {
           )}
         </div>
 
-        <div className="ml-auto">AniClew v1.0</div>
+        <div className="ml-auto">Corelay Code v1.0</div>
       </div>
     </div>
   );

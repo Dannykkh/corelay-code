@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // egressTools are the built-in agent tools that reach the public internet.
@@ -22,15 +22,25 @@ var egressTools = map[string]bool{
 	"HTTPRequest": true,
 }
 
-// OfflineMode reports whether AniClew is running air-gapped / offline. Enabled
-// by setting ANICLEW_OFFLINE to a truthy value (1, true, yes, on). In this mode
-// the agent must make no outbound internet calls.
+// OfflineMode reports whether Corelay Code is running air-gapped / offline.
+// CORELAY_OFFLINE is canonical; ANICLEW_OFFLINE remains a compatibility
+// fallback. In this mode the agent must make no outbound internet calls.
 func OfflineMode() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ANICLEW_OFFLINE"))) {
+	switch strings.ToLower(renamedAgentEnv("CORELAY_OFFLINE", "ANICLEW_OFFLINE")) {
 	case "1", "true", "yes", "on":
 		return true
 	}
 	return false
+}
+
+// renamedAgentEnv returns the canonical environment value when it is
+// non-empty, otherwise the legacy value. Keeping this in the agent package
+// gives every runtime toggle identical rename precedence.
+func renamedAgentEnv(primary, legacy string) string {
+	if value := strings.TrimSpace(os.Getenv(primary)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(legacy))
 }
 
 // IsEgressTool reports whether a tool reaches the public internet.

@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/types"
-	"github.com/aniclew/aniclew/internal/workstream"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 func TestWorkstreamAPI_CreateListGetHandoff(t *testing.T) {
@@ -308,8 +308,8 @@ func TestRunRegressionRecordsUnsupportedWithoutProvider(t *testing.T) {
 }
 
 func TestRunRegressionTeamAPI(t *testing.T) {
-	t.Setenv("ANICLEW_MEMORY", "off")
-	t.Setenv("ANICLEW_AUTOSKILL", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
 
 	workDir := t.TempDir()
 	tracker := observability.NewTracker(t.TempDir())
@@ -410,8 +410,8 @@ func TestRunRegressionTeamAPI(t *testing.T) {
 }
 
 func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
-	t.Setenv("ANICLEW_MEMORY", "off")
-	t.Setenv("ANICLEW_AUTOSKILL", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
 
 	workDir := t.TempDir()
 	provider := &agentLoopFakeProvider{text: "agent ok"}
@@ -498,8 +498,8 @@ func TestAgentLoopRecordsWorkstreamRun(t *testing.T) {
 }
 
 func TestChronosRecordsWorkstreamRun(t *testing.T) {
-	t.Setenv("ANICLEW_MEMORY", "off")
-	t.Setenv("ANICLEW_AUTOSKILL", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
 
 	workDir := t.TempDir()
 	provider := &agentLoopFakeProvider{text: "[COMPLETE]"}

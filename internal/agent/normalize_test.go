@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func makeMsg(role, text string) types.Message {

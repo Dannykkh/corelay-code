@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 var ProviderOrder = []string{
@@ -20,7 +20,9 @@ func RegisterCustomProvider(name string, cfg *types.ProviderConfig) {
 	customProviders[name] = cfg
 	// Add to provider order if not already there
 	for _, p := range ProviderOrder {
-		if p == name { return }
+		if p == name {
+			return
+		}
 	}
 	ProviderOrder = append(ProviderOrder, name)
 }
@@ -31,6 +33,12 @@ func ListCustomProviders() map[string]*types.ProviderConfig {
 }
 
 func Create(name string, cfg *types.ProviderConfig) (types.Provider, error) {
+	return CreateWithOptions(name, cfg, CreateOptions{})
+}
+
+// CreateWithOptions creates a provider with instance-scoped dependencies.
+// Create remains the compatibility entry point for existing callers.
+func CreateWithOptions(name string, cfg *types.ProviderConfig, opts CreateOptions) (types.Provider, error) {
 	if cfg == nil {
 		cfg = &types.ProviderConfig{}
 	}
@@ -43,10 +51,10 @@ func Create(name string, cfg *types.ProviderConfig) (types.Provider, error) {
 		}
 		// Determine base type from name prefix
 		if strings.HasPrefix(name, "ollama") {
-			return NewOllama(merged), nil
+			return newOllama(merged, opts), nil
 		}
 		if strings.HasPrefix(name, "openai") {
-			return NewOpenAI(merged), nil
+			return newOpenAI(merged, opts), nil
 		}
 		// Default to OpenAI-compatible
 		return &OpenAICompat{
@@ -54,6 +62,7 @@ func Create(name string, cfg *types.ProviderConfig) (types.Provider, error) {
 			ProviderDisp: name + " (custom)",
 			BaseURL:      merged.BaseURL,
 			AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + merged.APIKey },
+			HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 			ModelList: []types.ModelInfo{
 				{ID: "default", DisplayName: "Default Model"},
 			},
@@ -62,21 +71,21 @@ func Create(name string, cfg *types.ProviderConfig) (types.Provider, error) {
 
 	switch name {
 	case "anthropic":
-		return NewAnthropic(cfg), nil
+		return NewAnthropicWithOptions(cfg, opts), nil
 	case "openai":
-		return NewOpenAI(cfg), nil
+		return newOpenAI(cfg, opts), nil
 	case "gemini":
-		return NewGemini(cfg), nil
+		return NewGeminiWithOptions(cfg, opts), nil
 	case "groq":
-		return NewGroq(cfg), nil
+		return newGroq(cfg, opts), nil
 	case "ollama":
-		return NewOllama(cfg), nil
+		return newOllama(cfg, opts), nil
 	case "sglang":
-		return NewSGLang(cfg), nil
+		return newSGLang(cfg, opts), nil
 	case "github-copilot":
-		return NewGitHubCopilot(cfg), nil
+		return newGitHubCopilot(cfg, opts), nil
 	case "zai":
-		return NewZai(cfg), nil
+		return newZai(cfg, opts), nil
 	default:
 		return nil, fmt.Errorf("unknown provider: %s. Register custom providers via /api/providers/register", name)
 	}
@@ -85,13 +94,23 @@ func Create(name string, cfg *types.ProviderConfig) (types.Provider, error) {
 // ── Concrete providers ──
 
 func NewOpenAI(cfg *types.ProviderConfig) types.Provider {
+	return newOpenAI(cfg, CreateOptions{})
+}
+
+func newOpenAI(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	key := cfg.APIKey
-	if key == "" { key = os.Getenv("OPENAI_API_KEY") }
+	if key == "" {
+		key = os.Getenv("OPENAI_API_KEY")
+	}
 	return &OpenAICompat{
 		ProviderName: "openai",
 		ProviderDisp: "OpenAI",
 		BaseURL:      coalesce(cfg.BaseURL, "https://api.openai.com"),
 		AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + key },
+		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
 			{ID: "gpt-5.5", DisplayName: "GPT-5.5 (최신 플래그십)", ContextWindow: 1000000},
 			{ID: "gpt-5.5-mini", DisplayName: "GPT-5.5 Mini", ContextWindow: 1000000},
@@ -109,12 +128,20 @@ func NewOpenAI(cfg *types.ProviderConfig) types.Provider {
 }
 
 func NewOllama(cfg *types.ProviderConfig) types.Provider {
+	return newOllama(cfg, CreateOptions{})
+}
+
+func newOllama(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	base := coalesce(cfg.BaseURL, os.Getenv("OLLAMA_BASE_URL"), "http://localhost:11434")
 	return &OpenAICompat{
 		ProviderName: "ollama",
 		ProviderDisp: "Ollama (local)",
 		BaseURL:      base,
 		AuthHeader:   func() (string, string) { return "", "" },
+		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
 			{ID: "qwen3:8b", DisplayName: "Qwen3 8B (가벼움)"},
 			{ID: "qwen3:14b", DisplayName: "Qwen3 14B (균형)"},
@@ -135,6 +162,13 @@ func NewOllama(cfg *types.ProviderConfig) types.Provider {
 // configured server-side (--tool-call-parser / --reasoning-parser), so this
 // provider just forwards the OpenAI-compatible request like Ollama does.
 func NewSGLang(cfg *types.ProviderConfig) types.Provider {
+	return newSGLang(cfg, CreateOptions{})
+}
+
+func newSGLang(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	base := coalesce(cfg.BaseURL, os.Getenv("SGLANG_BASE_URL"), "http://localhost:30000")
 	key := coalesce(cfg.APIKey, os.Getenv("SGLANG_API_KEY"))
 	return &OpenAICompat{
@@ -147,6 +181,7 @@ func NewSGLang(cfg *types.ProviderConfig) types.Provider {
 			}
 			return "Authorization", "Bearer " + key
 		},
+		HTTPDoer: httpDoerOrDefault(opts.HTTPDoer),
 		// Examples that fit a 16GB GPU (quantized). Set ID to match the
 		// --model-path / --served-model-name you actually launched.
 		ModelList: []types.ModelInfo{
@@ -159,13 +194,23 @@ func NewSGLang(cfg *types.ProviderConfig) types.Provider {
 }
 
 func NewGroq(cfg *types.ProviderConfig) types.Provider {
+	return newGroq(cfg, CreateOptions{})
+}
+
+func newGroq(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	key := cfg.APIKey
-	if key == "" { key = os.Getenv("GROQ_API_KEY") }
+	if key == "" {
+		key = os.Getenv("GROQ_API_KEY")
+	}
 	return &OpenAICompat{
 		ProviderName: "groq",
 		ProviderDisp: "Groq",
 		BaseURL:      coalesce(cfg.BaseURL, "https://api.groq.com/openai"),
 		AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + key },
+		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
 			{ID: "openai/gpt-oss-120b", DisplayName: "GPT-OSS 120B (최신)"},
 			{ID: "qwen/qwen3-32b", DisplayName: "Qwen3 32B"},
@@ -178,13 +223,23 @@ func NewGroq(cfg *types.ProviderConfig) types.Provider {
 }
 
 func NewGitHubCopilot(cfg *types.ProviderConfig) types.Provider {
+	return newGitHubCopilot(cfg, CreateOptions{})
+}
+
+func newGitHubCopilot(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	token := cfg.APIKey
-	if token == "" { token = os.Getenv("GITHUB_TOKEN") }
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
 	return &OpenAICompat{
 		ProviderName: "github-copilot",
 		ProviderDisp: "GitHub Copilot Models",
 		BaseURL:      coalesce(cfg.BaseURL, "https://models.inference.ai.azure.com"),
 		AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + token },
+		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
 			{ID: "gpt-4o", DisplayName: "GPT-4o"},
 			{ID: "gpt-4o-mini", DisplayName: "GPT-4o Mini"},
@@ -196,13 +251,23 @@ func NewGitHubCopilot(cfg *types.ProviderConfig) types.Provider {
 }
 
 func NewZai(cfg *types.ProviderConfig) types.Provider {
+	return newZai(cfg, CreateOptions{})
+}
+
+func newZai(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
+	if cfg == nil {
+		cfg = &types.ProviderConfig{}
+	}
 	key := cfg.APIKey
-	if key == "" { key = os.Getenv("XAI_API_KEY") }
+	if key == "" {
+		key = os.Getenv("XAI_API_KEY")
+	}
 	return &OpenAICompat{
 		ProviderName: "zai",
 		ProviderDisp: "z.ai (Grok)",
 		BaseURL:      coalesce(cfg.BaseURL, "https://api.x.ai"),
 		AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + key },
+		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
 			{ID: "grok-4", DisplayName: "Grok 4 (최신 플래그십)"},
 			{ID: "grok-4.1", DisplayName: "Grok 4.1 (저가)"},
@@ -214,7 +279,9 @@ func NewZai(cfg *types.ProviderConfig) types.Provider {
 
 func coalesce(vals ...string) string {
 	for _, v := range vals {
-		if v != "" { return v }
+		if v != "" {
+			return v
+		}
 	}
 	return ""
 }

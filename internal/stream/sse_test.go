@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func TestReadOpenAISSEReturnsWhenContextCanceledAndReceiverBlocked(t *testing.T) {

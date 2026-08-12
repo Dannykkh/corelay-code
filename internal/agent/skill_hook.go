@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/skills"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/skills"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // Auto-skill creation hook — wires internal/skills into the agent loop,
@@ -20,14 +19,15 @@ import (
 // goroutine asks the model to author a reusable SKILL.md and writes it under
 // the project skills dir (workDir/.claude/skills).
 //
-// Opt-in: set ANICLEW_AUTOSKILL to "1", "on", "true", or "yes" to enable.
-// Default OFF — unlike memory, this writes new skill files into the user's
-// project, so it should be a deliberate choice. Failures are logged, never
-// surfaced — a user's turn must not hinge on a best-effort background task.
+// Opt-in: set CORELAY_AUTOSKILL to "1", "on", "true", or "yes" to enable.
+// ANICLEW_AUTOSKILL remains a compatibility fallback. Default OFF — unlike
+// memory, this writes new skill files into the user's project, so it should be
+// a deliberate choice. Failures are logged, never surfaced — a user's turn
+// must not hinge on a best-effort background task.
 
 // autoSkillEnabled reports whether the auto-skill hook is active.
 func autoSkillEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("ANICLEW_AUTOSKILL")))
+	v := strings.ToLower(renamedAgentEnv("CORELAY_AUTOSKILL", "ANICLEW_AUTOSKILL"))
 	return v == "1" || v == "on" || v == "true" || v == "yes"
 }
 

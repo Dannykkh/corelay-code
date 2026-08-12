@@ -5,43 +5,124 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/capabilityprofile"
+	"github.com/Dannykkh/corelay-code/internal/harness"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
+	"github.com/Dannykkh/corelay-code/internal/types"
+)
+
+const (
+	subAgentIterationLimit = 10
+	subAgentTimeout        = 5 * time.Minute
 )
 
 // SubAgentTask represents a task assigned to a sub-agent.
 type SubAgentTask struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Instruction string    `json:"instruction"`
-	Files       []string  `json:"files"`       // files this agent owns
-	Status      string    `json:"status"`       // "pending", "running", "completed", "failed"
-	Result      string    `json:"result"`
-	StartedAt   time.Time `json:"startedAt,omitempty"`
-	FinishedAt  time.Time `json:"finishedAt,omitempty"`
-	ToolCalls   int       `json:"toolCalls"`
+	ID          string                   `json:"id"`
+	Name        string                   `json:"name"`
+	Instruction string                   `json:"instruction"`
+	Files       []string                 `json:"files"`  // files this agent owns
+	Status      string                   `json:"status"` // "pending", "running", "completed", "failed"
+	Result      string                   `json:"result"`
+	StartedAt   time.Time                `json:"startedAt,omitempty"`
+	FinishedAt  time.Time                `json:"finishedAt,omitempty"`
+	ToolCalls   int                      `json:"toolCalls"`
+	Sandbox     []SandboxExecutionRecord `json:"sandbox,omitempty"`
+}
+
+type SubAgentManagerOptions struct {
+	Context           context.Context
+	SessionID         string
+	ApprovalRequester approval.Requester
+	SandboxRunner     sandbox.Runner
+	SandboxPolicy     sandbox.Policy
+	PluginDirs        []string
+	PluginExecution   *PluginExecutionOptions
+	DisablePlugins    bool
+	Recorder          RunRecorder
+	HarnessProfile    *harness.HarnessProfile
+	CapabilityProfile *capabilityprofile.AutomaticSelection
 }
 
 // SubAgentManager manages parallel sub-agents.
 type SubAgentManager struct {
-	mu       sync.RWMutex
-	tasks    map[string]*SubAgentTask
-	provider types.Provider
-	model    string
-	workDir  string
-	counter  int
+	mu                sync.RWMutex
+	tasks             map[string]*SubAgentTask
+	provider          types.Provider
+	model             string
+	workDir           string
+	counter           int
+	context           context.Context
+	sessionID         string
+	approvalRequester approval.Requester
+	sandboxRunner     sandbox.Runner
+	sandboxPolicy     sandbox.Policy
+	pluginDirs        []string
+	pluginExecution   *PluginExecutionOptions
+	disablePlugins    bool
+	recorder          RunRecorder
+	harnessProfile    *harness.HarnessProfile
+	capabilityProfile *capabilityprofile.AutomaticSelection
 }
 
 func NewSubAgentManager(provider types.Provider, model, workDir string) *SubAgentManager {
-	return &SubAgentManager{
-		tasks:    make(map[string]*SubAgentTask),
-		provider: provider,
-		model:    model,
-		workDir:  workDir,
+	return NewSubAgentManagerWithOptions(provider, model, workDir, SubAgentManagerOptions{})
+}
+
+func NewSubAgentManagerWithOptions(
+	provider types.Provider,
+	model string,
+	workDir string,
+	opts SubAgentManagerOptions,
+) *SubAgentManager {
+	sandboxRunner, sandboxPolicy := configuredSandboxExecution(
+		opts.SandboxRunner,
+		opts.SandboxPolicy,
+		"sub-agent",
+	)
+	var pluginDirs []string
+	if opts.PluginDirs != nil {
+		pluginDirs = make([]string, len(opts.PluginDirs))
+		copy(pluginDirs, opts.PluginDirs)
 	}
+	var pluginExecution *PluginExecutionOptions
+	if opts.PluginExecution != nil {
+		copy := *opts.PluginExecution
+		pluginExecution = &copy
+	}
+	return &SubAgentManager{
+		tasks:             make(map[string]*SubAgentTask),
+		provider:          provider,
+		model:             model,
+		workDir:           workDir,
+		context:           opts.Context,
+		sessionID:         opts.SessionID,
+		approvalRequester: opts.ApprovalRequester,
+		sandboxRunner:     sandboxRunner,
+		sandboxPolicy:     sandboxPolicy,
+		pluginDirs:        pluginDirs,
+		pluginExecution:   pluginExecution,
+		disablePlugins:    opts.DisablePlugins,
+		recorder:          opts.Recorder,
+		harnessProfile:    opts.HarnessProfile,
+		capabilityProfile: opts.CapabilityProfile,
+	}
+}
+
+// SessionID returns the immutable approval namespace shared by this manager's
+// tasks. Individual tool calls remain independently bound to their run and
+// tool-call identities.
+func (m *SubAgentManager) SessionID() string {
+	if m == nil {
+		return ""
+	}
+	return m.sessionID
 }
 
 // Spawn creates and starts a sub-agent in a separate goroutine.
@@ -53,7 +134,7 @@ func (m *SubAgentManager) Spawn(name, instruction string, files []string) *SubAg
 		ID:          id,
 		Name:        name,
 		Instruction: instruction,
-		Files:       files,
+		Files:       append([]string(nil), files...),
 		Status:      "pending",
 	}
 	m.tasks[id] = task
@@ -125,134 +206,138 @@ func (m *SubAgentManager) GetTask(id string) *SubAgentTask {
 	return m.tasks[id]
 }
 
-// run executes a sub-agent's task using its own agent loop.
+// run adapts one sub-agent task to the common Agent Kernel. The run mode owns
+// only the task-local terminal decision; RunLoopWithOptions remains the sole
+// owner of provider calls, parsing, tools, safety, evidence, and recording.
 func (m *SubAgentManager) run(task *SubAgentTask) {
+	if task == nil {
+		return
+	}
+
+	startedAt := time.Now()
 	m.mu.Lock()
 	task.Status = "running"
-	task.StartedAt = time.Now()
+	task.StartedAt = startedAt
 	m.mu.Unlock()
 
 	log.Printf("[SubAgent] %s started: %s", task.ID, task.Name)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	parentContext := m.context
+	if parentContext == nil {
+		parentContext = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentContext, subAgentTimeout)
 	defer cancel()
 
-	// Build sub-agent system prompt
-	// Note: /no_think disables qwen3's reasoning mode for direct output
-	sysPrompt := fmt.Sprintf(`/no_think
-You are a sub-agent named "%s" working on a specific task.
-You have access to tools: Bash, Read, Write, Edit, Glob, Grep, Git, LS.
-You ONLY work on these files: %s
-Do NOT modify files outside your assigned scope.
-
-Your task: %s
-
-Be efficient. Complete the task and report what you did.`,
-		task.Name, strings.Join(task.Files, ", "), task.Instruction)
-
-	req := &types.MessagesRequest{
-		Model:     m.model,
-		System:    mustJSON([]map[string]string{{"type": "text", "text": sysPrompt}}),
-		Messages:  []types.Message{{Role: "user", Content: mustJSON(task.Instruction)}},
-		Tools:     AllToolDefs(m.workDir),
-		MaxTokens: 8192,
+	mode := newSubAgentRunMode(task)
+	anchor := defaultSubAgentPlanAnchor(task)
+	reducer := newSubAgentEventReducer(task.ID, mode)
+	events := make(chan Event, 64)
+	go RunLoopWithOptions(
+		ctx,
+		m.provider,
+		m.model,
+		[]types.Message{{Role: "user", Content: mustJSON(task.Instruction)}},
+		m.workDir,
+		RunOptions{
+			SessionID:         m.sessionID,
+			ApprovalRequester: m.approvalRequester,
+			Recorder:          m.recorder,
+			WorkerID:          task.ID,
+			OwnershipChecker:  m.ownershipChecker(task),
+			RunMode:           mode,
+			IterationLimit:    subAgentIterationLimit,
+			HarnessProfile:    m.harnessProfile,
+			CapabilityProfile: m.capabilityProfile,
+			PlanAnchor:        anchor,
+			SandboxRunner:     m.sandboxRunner,
+			SandboxPolicy:     m.sandboxPolicy,
+			PluginDirs:        cloneStringsPreserveNil(m.pluginDirs),
+			PluginExecution:   clonePluginExecutionOptions(m.pluginExecution),
+			DisablePlugins:    m.disablePlugins,
+		},
+		events,
+	)
+	for event := range events {
+		reducer.Observe(event)
 	}
 
-	// Mini agent loop (max 10 iterations)
-	var finalResponse string
-	toolCalls := 0
-
-	for i := 0; i < 10; i++ {
-		ch, err := m.provider.StreamMessage(ctx, req, nil)
-		if err != nil {
-			m.mu.Lock()
-			task.Status = "failed"
-			task.Result = fmt.Sprintf("Error: %v", err)
-			task.FinishedAt = time.Now()
-			m.mu.Unlock()
-			log.Printf("[SubAgent] %s failed: %v", task.ID, err)
-			return
-		}
-
-		var textContent string
-		var toolUses []toolUseBlock
-
-		for event := range ch {
-			switch event.Type {
-			case "content_block_delta":
-				var delta struct {
-					Type        string `json:"type"`
-					Text        string `json:"text"`
-					PartialJSON string `json:"partial_json"`
-				}
-				json.Unmarshal(event.Delta, &delta)
-				if delta.Type == "text_delta" {
-					textContent += delta.Text
-				}
-			case "content_block_start":
-				var block struct {
-					Type string `json:"type"`
-					ID   string `json:"id"`
-					Name string `json:"name"`
-				}
-				json.Unmarshal(event.ContentBlock, &block)
-				if block.Type == "tool_use" {
-					toolUses = append(toolUses, toolUseBlock{ID: block.ID, Name: block.Name})
-				}
-			}
-		}
-
-		// No tool calls → done
-		if len(toolUses) == 0 {
-			finalResponse = textContent
-			break
-		}
-
-		// Execute tools
-		var assistantContent []map[string]interface{}
-		if textContent != "" {
-			assistantContent = append(assistantContent, map[string]interface{}{"type": "text", "text": textContent})
-		}
-
-		var toolResults []map[string]interface{}
-		for _, tu := range toolUses {
-			toolCalls++
-
-			// File ownership check
-			if !m.isAllowedFile(task, tu.Name, tu.Input) {
-				toolResults = append(toolResults, map[string]interface{}{
-					"type": "tool_result", "tool_use_id": tu.ID,
-					"content": "Permission denied: file outside your scope", "is_error": true,
-				})
-				continue
-			}
-
-			result, isError := ExecuteTool(tu.Name, tu.Input, m.workDir)
-			assistantContent = append(assistantContent, map[string]interface{}{
-				"type": "tool_use", "id": tu.ID, "name": tu.Name, "input": json.RawMessage(tu.InputRaw),
-			})
-			toolResults = append(toolResults, map[string]interface{}{
-				"type": "tool_result", "tool_use_id": tu.ID,
-				"content": result, "is_error": isError,
-			})
-		}
-
-		// Update messages for next iteration
-		req.Messages = append(req.Messages,
-			types.Message{Role: "assistant", Content: mustJSON(assistantContent)},
-			types.Message{Role: "user", Content: mustJSON(toolResults)},
-		)
-	}
-
+	result := reducer.Result(ctx.Err())
+	finishedAt := time.Now()
 	m.mu.Lock()
-	task.Status = "completed"
-	task.Result = finalResponse
-	task.ToolCalls = toolCalls
-	task.FinishedAt = time.Now()
+	if result.Success {
+		task.Status = "completed"
+	} else {
+		task.Status = "failed"
+	}
+	task.Result = result.Text
+	task.ToolCalls = result.ToolCalls
+	task.Sandbox = append([]SandboxExecutionRecord(nil), result.Sandbox...)
+	task.FinishedAt = finishedAt
 	m.mu.Unlock()
 
-	log.Printf("[SubAgent] %s completed: %d tool calls, %.1fs",
-		task.ID, toolCalls, time.Since(task.StartedAt).Seconds())
+	if result.Success {
+		log.Printf("[SubAgent] %s completed: %d tool calls, %.1fs",
+			task.ID, result.ToolCalls, finishedAt.Sub(startedAt).Seconds())
+		return
+	}
+	log.Printf("[SubAgent] %s failed after %d tool calls: %s",
+		task.ID, result.ToolCalls, result.Text)
+}
+
+func defaultSubAgentPlanAnchor(task *SubAgentTask) *PlanAnchor {
+	if task == nil {
+		return nil
+	}
+	objective := strings.TrimSpace(task.Instruction)
+	if objective == "" {
+		objective = strings.TrimSpace(task.Name)
+	}
+	if objective == "" {
+		objective = strings.TrimSpace(task.ID)
+	}
+	if objective == "" {
+		objective = "Complete the assigned sub-agent task."
+	}
+	currentStep := strings.TrimSpace(task.ID)
+	if currentStep == "" {
+		currentStep = "sub-agent task"
+	}
+	anchor, err := NewPlanAnchor(PlanAnchorSpec{
+		Objective:   objective,
+		CurrentStep: currentStep,
+		DefinitionOfDone: []string{
+			"The assigned task is completed within its ownership scope and the final response reports the outcome or a blocking condition.",
+		},
+	})
+	if err != nil {
+		return nil
+	}
+	return &anchor
+}
+
+func (m *SubAgentManager) ownershipChecker(task *SubAgentTask) func(workerID, filePath string) (bool, string) {
+	taskID := ""
+	var files []string
+	if task != nil {
+		taskID = task.ID
+		files = append([]string(nil), task.Files...)
+	}
+	workDir := m.workDir
+	return func(workerID, filePath string) (bool, string) {
+		if workerID != taskID || taskID == "" {
+			return false, "Sub-agent worker identity does not match the assigned task"
+		}
+		if len(files) == 0 {
+			return true, ""
+		}
+		for _, allowed := range files {
+			if matchesOwnedPath(filePath, allowed, workDir) {
+				return true, ""
+			}
+		}
+		return false, "File target is outside the sub-agent's assigned scope"
+	}
 }
 
 // isAllowedFile checks if a tool call targets files within the agent's scope.
@@ -266,15 +351,19 @@ func (m *SubAgentManager) isAllowedFile(task *SubAgentTask, toolName string, inp
 		return true
 	}
 
-	var args struct{ FilePath string `json:"file_path"` }
-	json.Unmarshal(input, &args)
+	var args struct {
+		FilePath string `json:"file_path"`
+	}
+	if json.Unmarshal(input, &args) != nil {
+		return false
+	}
 	if args.FilePath == "" {
-		return true
+		return false
 	}
 
 	// Check if file matches any allowed pattern
 	for _, allowed := range task.Files {
-		if strings.Contains(args.FilePath, allowed) || matchGlob(args.FilePath, allowed) {
+		if matchesOwnedPath(args.FilePath, allowed, m.workDir) {
 			return true
 		}
 	}
@@ -282,15 +371,82 @@ func (m *SubAgentManager) isAllowedFile(task *SubAgentTask, toolName string, inp
 	return false
 }
 
-func matchGlob(path, pattern string) bool {
-	// Simple glob: "src/**" matches "src/foo/bar.go"
-	if strings.HasSuffix(pattern, "**") {
-		prefix := strings.TrimSuffix(pattern, "**")
-		return strings.HasPrefix(path, prefix)
+func matchesOwnedPath(target, allowed, workDir string) bool {
+	target = strings.TrimSpace(target)
+	allowed = strings.TrimSpace(allowed)
+	if target == "" || allowed == "" {
+		return false
 	}
-	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.TrimSuffix(pattern, "*")
-		return strings.HasPrefix(path, prefix)
+
+	workspace, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return false
 	}
-	return path == pattern
+	targetPath, err := canonicalPathWithinWorkspace(
+		target,
+		workDir,
+		workspace,
+		PermissionConfig{},
+	)
+	if err != nil {
+		return false
+	}
+
+	allowedSlash := filepath.ToSlash(allowed)
+	doubleStar := strings.HasSuffix(allowedSlash, "**")
+	singleStar := !doubleStar && strings.HasSuffix(allowedSlash, "*")
+	if doubleStar {
+		baseRaw := strings.TrimRight(strings.TrimSuffix(allowedSlash, "**"), "/")
+		if baseRaw == "" {
+			baseRaw = "."
+		}
+		base, baseErr := canonicalPathWithinWorkspace(
+			filepath.FromSlash(baseRaw),
+			workDir,
+			workspace,
+			PermissionConfig{},
+		)
+		if baseErr != nil {
+			return false
+		}
+		return pathWithin(targetPath, base)
+	}
+	if singleStar {
+		prefixRaw := strings.TrimSuffix(allowedSlash, "*")
+		directoryPattern := strings.HasSuffix(prefixRaw, "/")
+		prefixPath := filepath.FromSlash(strings.TrimRight(prefixRaw, "/"))
+		directoryRaw := filepath.Dir(prefixPath)
+		namePrefix := filepath.Base(prefixPath)
+		if directoryPattern {
+			directoryRaw = prefixPath
+			namePrefix = ""
+		}
+		if prefixPath == "" || prefixPath == "." {
+			directoryRaw = "."
+			namePrefix = ""
+		}
+		directory, directoryErr := canonicalPathWithinWorkspace(
+			directoryRaw,
+			workDir,
+			workspace,
+			PermissionConfig{},
+		)
+		if directoryErr != nil {
+			return false
+		}
+		relative, relErr := filepath.Rel(directory, targetPath)
+		return relErr == nil && relative != "." && filepath.Dir(relative) == "." &&
+			strings.HasPrefix(filepath.Base(relative), namePrefix)
+	}
+	ownedPath, ownedErr := canonicalPathWithinWorkspace(
+		allowed,
+		workDir,
+		workspace,
+		PermissionConfig{},
+	)
+	if ownedErr != nil {
+		return false
+	}
+	relative, relErr := filepath.Rel(ownedPath, targetPath)
+	return relErr == nil && relative == "."
 }

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func runTeam(args []string) {
@@ -45,7 +45,7 @@ func runTeamRun(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: plan, saved config, or ollama)")
 	model := fs.String("model", "", "Model ID (default: plan, saved config, or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
-	baseDir := fs.String("base-dir", "", "State directory (default: ~/.aniclew)")
+	baseDir := fs.String("base-dir", "", "State directory (default: ~/.corelay)")
 	verifyCommand := fs.String("verify", "", "Override or set plan verification command")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "team: %v\n", err)
@@ -109,11 +109,14 @@ func runTeamRun(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(*workDir)
 	runner := agent.NewTeam(provider, *model, *workDir, *baseDir, agent.TeamConfig{
 		Name:            plan.Name,
 		VerifyCommand:   plan.VerifyCommand,
 		Capacity:        plan.Capacity,
 		ProviderFactory: createProviderByName,
+		SandboxRunner:   sandboxRunner,
+		SandboxPolicy:   sandboxPolicy,
 	})
 	for _, task := range plan.ToTeamTasks() {
 		runner.AddTask(task)

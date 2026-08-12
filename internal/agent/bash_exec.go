@@ -1,20 +1,19 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 const (
@@ -30,21 +29,32 @@ const (
 // BashExecResult holds the complete result of a bash execution.
 type BashExecResult struct {
 	Output        string               `json:"output"`
+	Stdout        string               `json:"stdout,omitempty"`
+	Stderr        string               `json:"stderr,omitempty"`
 	ExitCode      int                  `json:"exitCode"`
 	IsError       bool                 `json:"isError"`
 	Duration      time.Duration        `json:"duration"`
 	Truncated     bool                 `json:"truncated"`
 	TimedOut      bool                 `json:"timedOut"`
+	Canceled      bool                 `json:"canceled"`
 	Backgrounded  bool                 `json:"backgrounded"`
 	SecurityBlock *SecurityCheckResult `json:"securityBlock,omitempty"`
+	SandboxReport sandbox.Report       `json:"sandbox"`
 }
 
-// BashProgressCallback receives streaming output updates.
+// BashProgressCallback receives the bounded captured output and original byte
+// count. Runner implementations retain ownership of process I/O collection.
 type BashProgressCallback func(output string, totalBytes int)
 
 // ExecuteBashDeep is the deep implementation of bash execution.
-// Includes: security validation, streaming output, timeout, auto-background, exit code semantics.
+// Includes: security validation, bounded output, timeout, auto-background, exit code semantics.
 func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgressCallback) BashExecResult {
+	return ExecuteBashDeepWithOptions(input, workDir, legacyUnconfinedBashOptions(progressCb))
+}
+
+// ExecuteBashDeepWithOptions executes Bash through the configured sandbox
+// Runner. Unlike the legacy wrapper, its zero value fails before process start.
+func ExecuteBashDeepWithOptions(input json.RawMessage, workDir string, opts BashExecOptions) BashExecResult {
 	var args struct {
 		Command     string            `json:"command"`
 		Timeout     int               `json:"timeout"`
@@ -52,11 +62,13 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 		Description string            `json:"description"`
 		Background  bool              `json:"run_in_background"`
 	}
-	json.Unmarshal(input, &args)
+	if err := json.Unmarshal(input, &args); err != nil {
+		return bashSetupFailure(opts, sandbox.FailureCommandInvalid, "Invalid Bash input: "+err.Error())
+	}
 
 	command := strings.TrimSpace(args.Command)
 	if command == "" {
-		return BashExecResult{Output: "Empty command", IsError: true}
+		return bashSetupFailure(opts, sandbox.FailureCommandInvalid, "Empty command")
 	}
 
 	// ── Phase 1: Security validation ──
@@ -68,19 +80,33 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 	}
 	if secResult != nil {
 		log.Printf("[Bash] BLOCKED: %s — %s", secResult.Pattern, secResult.Reason)
-		return BashExecResult{
-			Output:        fmt.Sprintf("[SECURITY] %s", secResult.Reason),
-			IsError:       true,
-			SecurityBlock: secResult,
-		}
+		result := bashSetupFailure(opts, sandbox.FailureCommandInvalid, secResult.Reason)
+		result.Output = fmt.Sprintf("[SECURITY] %s", secResult.Reason)
+		result.SecurityBlock = secResult
+		return result
 	}
 
 	// ── Phase 2: Sleep detection ──
 	if blocked := detectBlockedSleep(command); blocked != "" {
-		return BashExecResult{
-			Output:  blocked,
-			IsError: true,
+		result := bashSetupFailure(opts, sandbox.FailureCommandInvalid, blocked)
+		result.Output = blocked
+		return result
+	}
+
+	if opts.Runner == nil {
+		return bashSetupFailure(opts, sandbox.FailureRunnerUnavailable, "sandbox runner is not configured")
+	}
+	if err := sandbox.ValidatePolicy(opts.Policy, opts.Runner.Capabilities()); err != nil {
+		failure := sandbox.FailurePolicyInvalid
+		var policyError *sandbox.PolicyError
+		if errors.As(err, &policyError) {
+			failure = policyError.Code
 		}
+		return bashSetupFailure(opts, failure, err.Error())
+	}
+	environment, err := bashEnvironmentSpec(args.Env)
+	if err != nil {
+		return bashSetupFailure(opts, sandbox.FailureCommandInvalid, err.Error())
 	}
 
 	// ── Phase 3: Timeout setup ──
@@ -92,135 +118,84 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	parentContext := opts.Context
+	if parentContext == nil {
+		parentContext = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentContext, timeout)
 	defer cancel()
 
-	// ── Phase 4: Execute with streaming ──
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = workDir
-	cmd.Env = os.Environ()
-	for k, v := range args.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-
+	// ── Phase 4: Execute through the selected Runner ──
 	start := time.Now()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return BashExecResult{Output: err.Error(), IsError: true, Duration: time.Since(start)}
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return BashExecResult{Output: err.Error(), IsError: true, Duration: time.Since(start)}
-	}
-
-	if err := cmd.Start(); err != nil {
-		return BashExecResult{Output: err.Error(), IsError: true, Duration: time.Since(start)}
-	}
-
-	// Auto-background timer
 	var backgrounded atomic.Bool
-	bgTimer := time.NewTimer(autoBackgroundAfter)
-	bgDone := make(chan struct{})
-	defer func() {
-		if !bgTimer.Stop() {
-			select {
-			case <-bgTimer.C:
-			default:
-			}
-		}
-		close(bgDone)
-	}()
-
-	go func() {
-		select {
-		case <-bgTimer.C:
-			if cmd.Process != nil && cmd.ProcessState == nil {
-				backgrounded.Store(true)
-				log.Printf("[Bash] Auto-backgrounded after %v: %s", autoBackgroundAfter, truncateForDisplay(command, 80))
-			}
-		case <-bgDone:
-		}
-	}()
-
-	// Stream output
-	var outputBuf strings.Builder
-	var totalBytes int
-	var mu sync.Mutex
-	truncated := false
-
-	streamReader := func(r io.Reader, prefix string) {
-		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			mu.Lock()
-			if totalBytes < maxOutputBytes {
-				if prefix != "" {
-					outputBuf.WriteString(prefix)
-				}
-				outputBuf.WriteString(line)
-				outputBuf.WriteString("\n")
-			} else if !truncated {
-				truncated = true
-				outputBuf.WriteString("\n... (output truncated) ...\n")
-			}
-			totalBytes += len(line) + 1
-			currentOutput := outputBuf.String()
-			currentTotal := totalBytes
-			mu.Unlock()
-
-			if progressCb != nil {
-				progressCb(currentOutput, currentTotal)
-			}
-		}
+	bgTimer := time.AfterFunc(autoBackgroundAfter, func() {
+		backgrounded.Store(true)
+		log.Printf("[Bash] Auto-backgrounded after %v: %s", autoBackgroundAfter, truncateForDisplay(command, 80))
+	})
+	runnerResult, report := opts.Runner.Run(ctx, opts.Policy, sandbox.CommandSpec{
+		Path:        "bash",
+		Args:        []string{"-c", command},
+		Dir:         workDir,
+		Environment: environment,
+		Timeout:     timeout,
+	})
+	bgTimer.Stop()
+	if opts.ObserveReport != nil {
+		opts.ObserveReport(report)
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); streamReader(stdout, "") }()
-	go func() { defer wg.Done(); streamReader(stderr, "") }()
-
-	// Wait for output streams to finish
-	wg.Wait()
-	err = cmd.Wait()
-	duration := time.Since(start)
+	duration := runnerResult.Duration
+	if duration <= 0 {
+		duration = time.Since(start)
+	}
 
 	// ── Phase 5: Build result ──
 	result := BashExecResult{
-		Duration:  duration,
-		Truncated: truncated,
+		Stdout:        string(runnerResult.Stdout),
+		Stderr:        string(runnerResult.Stderr),
+		ExitCode:      runnerResult.ExitCode,
+		Duration:      duration,
+		TimedOut:      runnerResult.TimedOut,
+		Canceled:      runnerResult.Canceled,
+		SandboxReport: report,
+	}
+	output := combineBashOutput(result.Stdout, result.Stderr)
+	totalOutputBytes := len(output)
+	output, result.Truncated = truncateBashOutput(output)
+	if opts.Progress != nil && output != "" {
+		opts.Progress(output, totalOutputBytes)
 	}
 
-	mu.Lock()
-	output := outputBuf.String()
-	mu.Unlock()
-
-	// Truncate if still too large
-	if len(output) > maxOutputBytes {
-		output = output[:outputHeadKeep] + "\n\n... (middle truncated) ...\n\n" + output[len(output)-outputTailKeep:]
-		result.Truncated = true
+	if !runnerResult.Started {
+		result.IsError = true
+		if strings.TrimSpace(report.Detail) != "" {
+			output = appendBashLine(output, "[SANDBOX] "+report.Detail)
+		} else if runnerResult.Err != nil {
+			output = appendBashLine(output, "[SANDBOX] "+runnerResult.Err.Error())
+		} else {
+			output = appendBashLine(output, "[SANDBOX] process did not start")
+		}
+		result.Output = appendBashFooter(output, workDir, duration, report)
+		return result
 	}
 
 	// ── Phase 6: Exit code interpretation ──
-	exitCode := 0
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			result.TimedOut = true
-			result.IsError = true
-			output += fmt.Sprintf("\n[TIMEOUT after %ds]", int(timeout.Seconds()))
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	exitCode := runnerResult.ExitCode
+	if result.TimedOut {
+		result.IsError = true
+		output = appendBashLine(output, fmt.Sprintf("[TIMEOUT after %ds]", int(timeout.Seconds())))
+	} else if result.Canceled {
+		result.IsError = true
+		output = appendBashLine(output, "[CANCELED]")
+	} else if runnerResult.Err != nil && exitCode == 0 {
+		result.IsError = true
+		output = appendBashLine(output, "[EXECUTION ERROR] "+runnerResult.Err.Error())
 	}
 
 	result.ExitCode = exitCode
 
 	// Apply exit code semantics
 	baseCmd := ParseBaseCommand(command)
-	if exitCode != 0 && !result.TimedOut {
+	if exitCode != 0 && !result.TimedOut && !result.Canceled {
 		semantic, isRealError := ExitCodeSemantics(baseCmd, exitCode)
 		if !isRealError {
 			result.IsError = false
@@ -242,12 +217,80 @@ func ExecuteBashDeep(input json.RawMessage, workDir string, progressCb BashProgr
 	// Add footer
 	if backgrounded.Load() {
 		result.Backgrounded = true
-		output += fmt.Sprintf("\n[backgrounded after %v]", autoBackgroundAfter)
+		output = appendBashLine(output, fmt.Sprintf("[backgrounded after %v]", autoBackgroundAfter))
 	}
-	output += fmt.Sprintf("\n[%s | %.1fs]", filepath.Base(workDir), duration.Seconds())
-
-	result.Output = output
+	result.Output = appendBashFooter(output, workDir, duration, report)
 	return result
+}
+
+func bashSetupFailure(opts BashExecOptions, code sandbox.FailureCode, detail string) BashExecResult {
+	report := sandbox.Report{
+		Runner:               "unconfigured",
+		RequestedEnforcement: opts.Policy.Enforcement,
+		Failure:              code,
+		Detail:               detail,
+	}
+	if opts.Runner != nil {
+		report.Runner = opts.Runner.Name()
+		report.Capabilities = opts.Runner.Capabilities()
+	}
+	if opts.ObserveReport != nil {
+		opts.ObserveReport(report)
+	}
+	return BashExecResult{
+		Output:        "[SANDBOX] " + detail,
+		ExitCode:      sandbox.ExitNotStarted,
+		IsError:       true,
+		SandboxReport: report,
+	}
+}
+
+func combineBashOutput(stdout, stderr string) string {
+	if stdout == "" {
+		return stderr
+	}
+	if stderr == "" {
+		return stdout
+	}
+	if strings.HasSuffix(stdout, "\n") {
+		return stdout + stderr
+	}
+	return stdout + "\n" + stderr
+}
+
+func truncateBashOutput(output string) (string, bool) {
+	if len(output) <= maxOutputBytes {
+		return output, false
+	}
+	return output[:outputHeadKeep] + "\n\n... (middle truncated) ...\n\n" + output[len(output)-outputTailKeep:], true
+}
+
+func appendBashLine(output, line string) string {
+	if output == "" {
+		return line
+	}
+	if strings.HasSuffix(output, "\n") {
+		return output + line
+	}
+	return output + "\n" + line
+}
+
+func appendBashFooter(output, workDir string, duration time.Duration, report sandbox.Report) string {
+	effective := string(report.EffectiveEnforcement)
+	if effective == "" {
+		effective = "not-started"
+	}
+	sandboxLine := fmt.Sprintf(
+		"[sandbox: %s | requested=%s | effective=%s",
+		report.Runner,
+		report.RequestedEnforcement,
+		effective,
+	)
+	if report.Failure != sandbox.FailureNone {
+		sandboxLine += " | status=" + string(report.Failure)
+	}
+	output = appendBashLine(output, sandboxLine+"]")
+	return appendBashLine(output, fmt.Sprintf("[%s | %.1fs]", filepath.Base(workDir), duration.Seconds()))
 }
 
 func truncateForDisplay(s string, max int) string {

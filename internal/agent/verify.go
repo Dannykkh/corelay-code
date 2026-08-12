@@ -2,7 +2,6 @@ package agent
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 )
 
@@ -12,10 +11,10 @@ import (
 const maxVerifyAttempts = 2
 
 // autoVerifyEnabled reports whether post-edit auto-verification is active. On by
-// default; set ANICLEW_AUTOVERIFY to off/0/false to disable (e.g. for very slow
-// suites).
+// default; set CORELAY_AUTOVERIFY to off/0/false to disable (the legacy
+// ANICLEW_AUTOVERIFY name remains a fallback).
 func autoVerifyEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("ANICLEW_AUTOVERIFY")))
+	v := strings.ToLower(renamedAgentEnv("CORELAY_AUTOVERIFY", "ANICLEW_AUTOVERIFY"))
 	return v != "off" && v != "0" && v != "false"
 }
 

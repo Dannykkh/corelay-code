@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/memory"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/memory"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ---------- mock provider ----------
@@ -63,7 +63,7 @@ func TestBuildMemoryContext_EmptyWorkspaceStillReturnsSection(t *testing.T) {
 }
 
 func TestBuildMemoryContext_DisabledByEnv(t *testing.T) {
-	t.Setenv("ANICLEW_MEMORY", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
 	got := BuildMemoryContext(t.TempDir(), []types.Message{
 		{Role: "user", Content: mustJSON("hello")},
 	})
@@ -156,7 +156,7 @@ func TestExtractMemoriesAsync_SavesOnValidResponse(t *testing.T) {
 	workDir := t.TempDir()
 
 	// Ensure memory is enabled for this test.
-	t.Setenv("ANICLEW_MEMORY", "on")
+	t.Setenv("CORELAY_MEMORY", "on")
 
 	mock := &mockProvider{
 		responses: []string{
@@ -199,7 +199,7 @@ func TestExtractMemoriesAsync_SavesOnValidResponse(t *testing.T) {
 
 func TestExtractMemoriesAsync_NoopOnShortConversation(t *testing.T) {
 	workDir := t.TempDir()
-	t.Setenv("ANICLEW_MEMORY", "on")
+	t.Setenv("CORELAY_MEMORY", "on")
 
 	mock := &mockProvider{responses: []string{"[]"}}
 	ExtractMemoriesAsync(context.Background(), mock, "mock-model", workDir,
@@ -215,7 +215,7 @@ func TestExtractMemoriesAsync_NoopOnShortConversation(t *testing.T) {
 
 func TestExtractMemoriesAsync_NoopWhenDisabled(t *testing.T) {
 	workDir := t.TempDir()
-	t.Setenv("ANICLEW_MEMORY", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
 
 	mock := &mockProvider{responses: []string{`[{"name":"x","description":"x","type":"user","body":"x"}]`}}
 	ExtractMemoriesAsync(context.Background(), mock, "mock-model", workDir,
@@ -232,7 +232,7 @@ func TestExtractMemoriesAsync_NoopWhenDisabled(t *testing.T) {
 
 func TestExtractMemoriesAsync_HandlesEmptyArray(t *testing.T) {
 	workDir := t.TempDir()
-	t.Setenv("ANICLEW_MEMORY", "on")
+	t.Setenv("CORELAY_MEMORY", "on")
 
 	mock := &mockProvider{responses: []string{"[]"}}
 	ExtractMemoriesAsync(context.Background(), mock, "mock-model", workDir,
@@ -254,7 +254,7 @@ func TestExtractMemoriesAsync_HandlesEmptyArray(t *testing.T) {
 
 func TestMaybeConsolidateAsync_SkipsWhenGateNotReady(t *testing.T) {
 	workDir := t.TempDir()
-	t.Setenv("ANICLEW_MEMORY", "on")
+	t.Setenv("CORELAY_MEMORY", "on")
 
 	// No entries yet → count gate fails → no provider call.
 	mock := &mockProvider{responses: []string{"[]"}}
@@ -281,12 +281,12 @@ func TestMemoryEnabled_EnvToggle(t *testing.T) {
 	}
 	for val, want := range cases {
 		if val == "" {
-			os.Unsetenv("ANICLEW_MEMORY")
+			os.Unsetenv("CORELAY_MEMORY")
 		} else {
-			t.Setenv("ANICLEW_MEMORY", val)
+			t.Setenv("CORELAY_MEMORY", val)
 		}
 		if got := memoryEnabled(); got != want {
-			t.Errorf("ANICLEW_MEMORY=%q: got %v, want %v", val, got, want)
+			t.Errorf("CORELAY_MEMORY=%q: got %v, want %v", val, got, want)
 		}
 	}
 }

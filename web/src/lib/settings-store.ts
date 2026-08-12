@@ -78,22 +78,42 @@ const RESET_SCOPES: Record<string, (keyof Settings)[]> = {
   privacy: ['telemetryEnabled'],
 };
 
-const STORAGE_KEY = 'aniclew.settings';
+const STORAGE_KEY = 'corelay.settings';
+const LEGACY_STORAGE_KEY = 'aniclew.settings';
+
+function parseSettings(raw: string): Settings {
+  const parsed = JSON.parse(raw) as Partial<Settings>;
+  // Merge rather than replace: a settings key added in a later version must
+  // not come back undefined for users with an older payload in storage.
+  return {
+    ...DEFAULT_SETTINGS,
+    ...parsed,
+    permissions: { ...DEFAULT_SETTINGS.permissions, ...(parsed.permissions ?? {}) },
+    mcpServers: parsed.mcpServers ?? DEFAULT_SETTINGS.mcpServers,
+  };
+}
 
 function load(): Settings {
   if (typeof localStorage === 'undefined') return DEFAULT_SETTINGS;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_SETTINGS;
-    const parsed = JSON.parse(raw) as Partial<Settings>;
-    // Merge rather than replace: a settings key added in a later version must
-    // not come back undefined for users with an older payload in storage.
-    return {
-      ...DEFAULT_SETTINGS,
-      ...parsed,
-      permissions: { ...DEFAULT_SETTINGS.permissions, ...(parsed.permissions ?? {}) },
-      mcpServers: parsed.mcpServers ?? DEFAULT_SETTINGS.mcpServers,
-    };
+    if (raw) return parseSettings(raw);
+  } catch {
+    // A corrupt current payload can still fall back to a valid legacy one.
+  }
+
+  try {
+    const legacyRaw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!legacyRaw) return DEFAULT_SETTINGS;
+
+    const settings = parseSettings(legacyRaw);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+    } catch {
+      // Continue with the valid legacy payload when migration cannot persist.
+    }
+    return settings;
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -103,6 +123,7 @@ function persist(next: Settings) {
   if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
   } catch {
     // Quota or private-mode failure is not worth breaking the UI over.
   }
@@ -164,8 +185,9 @@ export interface SettingsStore {
 /** Stable empty list so the snapshot identity does not change between renders. */
 const NO_CONVERSATIONS: Conversation[] = [];
 
-function deleteConversation(_id: string) {
+function deleteConversation(id: string) {
   // Intentionally inert until the sessions layer is wired in — see below.
+  void id;
 }
 
 export function useSettingsStore(): SettingsStore {

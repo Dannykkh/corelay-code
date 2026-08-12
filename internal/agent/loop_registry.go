@@ -20,6 +20,10 @@ var ErrTooManyLoops = errors.New("too many concurrent agent loops")
 // seconds", which is what ErrTooManyLoops means).
 var ErrShuttingDown = errors.New("loop registry is shutting down")
 
+// ErrInvalidRegistryOperation is returned when a caller supplies an invalid
+// operation to a LoopRegistry synchronization boundary.
+var ErrInvalidRegistryOperation = errors.New("invalid loop registry operation")
+
 // ActiveLoopSnapshot is a read-only view of a running loop, safe to marshal
 // to clients. It intentionally omits the cancel func.
 type ActiveLoopSnapshot struct {
@@ -78,6 +82,26 @@ func NewLoopRegistry(maxConcurrent int) *LoopRegistry {
 // MaxConcurrent returns the configured cap.
 func (r *LoopRegistry) MaxConcurrent() int {
 	return r.maxConcurrent
+}
+
+// WithRegistrationBarrier runs fn while loop registration and release are
+// paused. active is the exact number of registered loops for the full duration
+// of fn. This is the composition boundary for process-wide configuration
+// mutations that must not race with a loop starting or finishing.
+//
+// The callback must be bounded and must not call another LoopRegistry method.
+// A shutting-down registry fails closed without invoking fn.
+func (r *LoopRegistry) WithRegistrationBarrier(fn func(active int) error) error {
+	if fn == nil {
+		return ErrInvalidRegistryOperation
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.shuttingDown {
+		return ErrShuttingDown
+	}
+	return fn(len(r.loops))
 }
 
 // Register reserves a slot, generates a session id, and returns a cancellable

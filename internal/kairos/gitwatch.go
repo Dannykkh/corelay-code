@@ -1,13 +1,29 @@
 package kairos
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
+const defaultGitWatchTimeout = 5 * time.Second
+
+// GitExecutionOptions binds KAIROS' fixed, read-only Git probes to the same
+// supervised process boundary used by the agent runtime. The zero value is
+// invalid; CheckGitStatus supplies the secure application default.
+type GitExecutionOptions struct {
+	Context       context.Context
+	Runner        sandbox.Runner
+	Policy        sandbox.Policy
+	Timeout       time.Duration
+	ObserveReport func(sandbox.Report)
+}
 
 // GitStatus holds the current git state of a project.
 type GitStatus struct {
@@ -22,31 +38,49 @@ type GitStatus struct {
 
 // CheckGitStatus runs git commands in the given directory and returns status.
 func CheckGitStatus(workDir string) (*GitStatus, error) {
+	return CheckGitStatusWithOptions(workDir, defaultGitExecution(workDir))
+}
+
+// CheckGitStatusWithOptions runs only fixed read-only Git argv through an
+// explicitly supplied sandbox boundary. No model or project string is ever
+// used as an executable or argument.
+func CheckGitStatusWithOptions(workDir string, options GitExecutionOptions) (*GitStatus, error) {
 	if workDir == "" {
 		return nil, fmt.Errorf("no workDir")
 	}
+	canonicalWorkDir, err := canonicalGitWorkDir(workDir)
+	if err != nil {
+		return nil, err
+	}
+	options, err = resolveGitExecution(options, canonicalWorkDir)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if it's a git repo
-	if err := gitCmd(workDir, "rev-parse", "--git-dir"); err != nil {
+	if _, err := gitOutput(options, canonicalWorkDir, "rev-parse", "--git-dir"); err != nil {
 		return nil, fmt.Errorf("not a git repo")
 	}
 
 	status := &GitStatus{}
 
 	// Branch name
-	if out, err := gitOutput(workDir, "branch", "--show-current"); err == nil {
+	if out, err := gitOutput(options, canonicalWorkDir, "branch", "--show-current"); err == nil {
 		status.Branch = strings.TrimSpace(out)
 	}
 
 	// Porcelain status
-	if out, err := gitOutput(workDir, "status", "--porcelain"); err == nil {
+	if out, err := gitOutput(options, canonicalWorkDir, "status", "--porcelain=v1", "--untracked-files=normal"); err == nil {
 		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+			line = strings.TrimRight(line, "\r")
+			if len(line) < 3 {
 				continue
 			}
 			xy := line[:2]
-			file := strings.TrimSpace(line[2:])
+			file := sanitizeGitDisplayPath(strings.TrimSpace(line[2:]))
+			if file == "" {
+				continue
+			}
 			// Rename arrows
 			if idx := strings.Index(file, " -> "); idx >= 0 {
 				file = file[idx+4:]
@@ -65,12 +99,12 @@ func CheckGitStatus(workDir string) (*GitStatus, error) {
 	}
 
 	// Ahead count
-	if out, err := gitOutput(workDir, "rev-list", "--count", "@{u}..HEAD"); err == nil {
+	if out, err := gitOutput(options, canonicalWorkDir, "rev-list", "--count", "@{u}..HEAD"); err == nil {
 		fmt.Sscanf(strings.TrimSpace(out), "%d", &status.AheadBy)
 	}
 
 	// Last commit
-	if out, err := gitOutput(workDir, "log", "-1", "--format=%s|||%ci"); err == nil {
+	if out, err := gitOutput(options, canonicalWorkDir, "log", "-1", "--format=%s|||%ci"); err == nil {
 		parts := strings.SplitN(strings.TrimSpace(out), "|||", 2)
 		if len(parts) == 2 {
 			status.LastCommit = parts[0]
@@ -122,17 +156,112 @@ func GitWatchSummary(prev, curr *GitStatus) string {
 
 // ── Helpers ──
 
-func gitCmd(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = filepath.FromSlash(dir)
-	return cmd.Run()
+func gitOutput(options GitExecutionOptions, dir string, args ...string) (string, error) {
+	result, report := options.Runner.Run(options.Context, options.Policy, sandbox.CommandSpec{
+		Path: "git",
+		Args: append([]string(nil), args...),
+		Dir:  dir,
+		Environment: sandbox.EnvironmentSpec{
+			Inherit: gitInheritedEnvironment(),
+		},
+		Timeout: options.Timeout,
+	})
+	if options.ObserveReport != nil {
+		options.ObserveReport(report)
+	}
+	if report.Failure != sandbox.FailureNone || !result.Started {
+		return "", fmt.Errorf("git probe failed: %s", safeGitFailure(report.Failure))
+	}
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("git probe exited non-zero")
+	}
+	return string(result.Stdout), nil
 }
 
-func gitOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = filepath.FromSlash(dir)
-	out, err := cmd.Output()
-	return string(out), err
+func defaultGitExecution(workDir string) GitExecutionOptions {
+	runner := sandbox.NewAutoRunner()
+	capabilities := runner.Capabilities()
+	policy := sandbox.Policy{
+		Enforcement: sandbox.EnforcementPreferred,
+		Required: sandbox.Capabilities{
+			ProcessTreeKill:      true,
+			EnvironmentFiltering: true,
+			Timeouts:             true,
+		},
+	}
+	if capabilities.FilesystemIsolation {
+		policy.Workspace = workDir
+		policy.WorkspaceAccess = sandbox.WorkspaceReadOnly
+	}
+	if capabilities.NetworkIsolation {
+		policy.Network = sandbox.NetworkDenied
+	}
+	return GitExecutionOptions{
+		Context: context.Background(), Runner: runner, Policy: policy,
+		Timeout: defaultGitWatchTimeout,
+	}
+}
+
+func resolveGitExecution(options GitExecutionOptions, workDir string) (GitExecutionOptions, error) {
+	if options.Context == nil {
+		options.Context = context.Background()
+	}
+	if options.Runner == nil || options.Policy.Enforcement == "" {
+		return GitExecutionOptions{}, fmt.Errorf("git probe sandbox is not configured")
+	}
+	if options.Timeout <= 0 || options.Timeout > 30*time.Second {
+		return GitExecutionOptions{}, fmt.Errorf("git probe timeout is invalid")
+	}
+	if options.Policy.WorkspaceAccess != sandbox.WorkspaceAccessUnspecified {
+		options.Policy.Workspace = workDir
+	}
+	return options, nil
+}
+
+func canonicalGitWorkDir(workDir string) (string, error) {
+	absolute, err := filepath.Abs(filepath.FromSlash(strings.TrimSpace(workDir)))
+	if err != nil {
+		return "", fmt.Errorf("invalid workDir")
+	}
+	canonical, err := filepath.EvalSymlinks(filepath.Clean(absolute))
+	if err != nil {
+		return "", fmt.Errorf("invalid workDir")
+	}
+	info, err := os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("invalid workDir")
+	}
+	return canonical, nil
+}
+
+func gitInheritedEnvironment() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"PATH", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP"}
+	}
+	return []string{"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ"}
+}
+
+func safeGitFailure(code sandbox.FailureCode) string {
+	if code == sandbox.FailureNone {
+		return "execution_failed"
+	}
+	return string(code)
+}
+
+func sanitizeGitDisplayPath(value string) string {
+	const maxDisplayBytes = 512
+	var builder strings.Builder
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			builder.WriteByte('?')
+		} else {
+			builder.WriteRune(char)
+		}
+		if builder.Len() >= maxDisplayBytes {
+			break
+		}
+	}
+	return builder.String()
 }
 
 func joinMax(items []string, max int) string {

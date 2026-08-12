@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/router"
-	"github.com/aniclew/aniclew/internal/runtimeplane"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/router"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func TestResolveDirectRuntimeProviderSwitchesByRequestedModel(t *testing.T) {
@@ -331,7 +331,7 @@ func TestHandleMessagesDirectPathRoutesGPTModelToOpenAICompatibleProvider(t *tes
 		t.Fatalf("response did not preserve translated model: %s", rec.Body.String())
 	}
 	accounts := s.runtimeTelemetry.Merge(nil, time.Now().UTC())
-	if len(accounts) != 1 || accounts[0].ID != "provider:openai" || accounts[0].SevenDay.Used != 7 {
+	if len(accounts) != 1 || accounts[0].ID != "provider:openai" || accounts[0].SevenDay.Used != 18 {
 		t.Fatalf("runtime telemetry did not record OpenAI usage: %+v", accounts)
 	}
 	if accounts[0].RateLimit.Limit != 1000 || accounts[0].RateLimit.Used != 100 {

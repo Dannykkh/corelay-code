@@ -5,8 +5,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 type Router struct {

@@ -14,23 +14,25 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	apiPkg "github.com/aniclew/aniclew/internal/api"
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/gateway"
-	"github.com/aniclew/aniclew/internal/hooks"
-	"github.com/aniclew/aniclew/internal/kairos"
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/router"
-	"github.com/aniclew/aniclew/internal/runtimeplane"
-	"github.com/aniclew/aniclew/internal/stream"
-	"github.com/aniclew/aniclew/internal/types"
-	"github.com/aniclew/aniclew/internal/workstream"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	apiPkg "github.com/Dannykkh/corelay-code/internal/api"
+	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/gateway"
+	"github.com/Dannykkh/corelay-code/internal/hooks"
+	"github.com/Dannykkh/corelay-code/internal/kairos"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/protocol"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/router"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 //go:embed dashboard.html
@@ -59,8 +61,16 @@ type Server struct {
 	workDir          string // current workspace
 	port             int
 	loops            *agent.LoopRegistry
+	approvals        *approvalHub
 	evidenceMu       sync.RWMutex
 	evidencePolicy   agent.EvidencePolicyConfig
+	// durableQuarantine is process-local and fail-closed. It covers the rare
+	// case where a side effect began but even the interruption marker could not
+	// be persisted; a server restart or explicit operator recovery is required.
+	durableQuarantine sync.Map
+	// durableActive admits at most one live run for an exact durable session ID
+	// and prevents deletion while result blobs may still be published.
+	durableActive sync.Map
 }
 
 func (s *Server) SetTracker(t *observability.Tracker) {
@@ -95,6 +105,7 @@ func New(provider types.Provider, model string, port int) *Server {
 		// projects. 3 is the Wave-1 default — raise it if users report
 		// contention, but a low cap keeps provider spend predictable.
 		loops:          agent.NewLoopRegistry(3),
+		approvals:      newApprovalHub(approval.DefaultTTL),
 		evidencePolicy: agent.DefaultEvidencePolicyConfig(),
 	}
 }
@@ -104,6 +115,14 @@ func New(provider types.Provider, model string, port int) *Server {
 // called before New, which never happens in practice.
 func (s *Server) Loops() *agent.LoopRegistry {
 	return s.loops
+}
+
+// ShutdownApprovals fails every pending approval closed. Start calls this when
+// its HTTP lifecycle ends; embedders should call it during their own drain.
+func (s *Server) ShutdownApprovals() {
+	if s.approvals != nil {
+		s.approvals.Shutdown()
+	}
 }
 
 func (s *Server) SetProvider(p types.Provider, model string) {
@@ -175,10 +194,13 @@ func (s *Server) SetWorkDir(dir string) {
 }
 
 func (s *Server) Start() error {
+	defer s.ShutdownApprovals()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
 	mux.HandleFunc("POST /messages", s.handleMessages)
+	mux.HandleFunc("POST /v1/chat/completions", s.handleOpenAIChatCompletions)
+	mux.HandleFunc("POST /v1/responses", s.handleOpenAIResponses)
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 
 	// React SPA — serve static files from embedded webdist
@@ -281,6 +303,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/agent", s.handleAgentLoop)
 	mux.HandleFunc("GET /api/agent/loops", s.handleAgentLoops)
 	mux.HandleFunc("POST /api/agent/{sessionId}/cancel", s.handleAgentCancel)
+	mux.HandleFunc("GET /api/approvals", s.handleApprovalList)
+	mux.HandleFunc("GET /api/approvals/{id}", s.handleApprovalGet)
+	mux.HandleFunc("POST /api/approvals/{id}/resolve", s.handleApprovalResolve)
 	mux.HandleFunc("POST /api/chronos", s.handleChronos)
 	mux.HandleFunc("POST /api/team", s.handleTeamExecute)
 	mux.HandleFunc("GET /api/agent-types", s.handleAgentTypes)
@@ -326,16 +351,24 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleSessionGet)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleSessionDelete)
 	mux.HandleFunc("PUT /api/sessions/{id}", s.handleSessionRename)
+	mux.HandleFunc("POST /api/sessions/{id}/fork", s.handleSessionFork)
+	mux.HandleFunc("POST /api/sessions/{id}/interrupt", s.handleSessionInterrupt)
+	mux.HandleFunc("POST /api/sessions/{id}/reconcile", s.handleSessionReconcile)
+	mux.HandleFunc("POST /api/sessions/{id}/close", s.handleSessionClose)
+	mux.HandleFunc("GET /api/sessions/{id}/resume-state", s.handleSessionResumeState)
 
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /", s.handleRoot)
 
 	handler := corsMiddleware(authMiddleware(mux))
-	// Default to loopback only — a dev box running AniClew should not be
+	// Default to loopback only — a dev box running Corelay Code should not be
 	// reachable from the LAN by default (the agent has Bash/Write/Edit and
-	// auth is optional). Set ANICLEW_BIND=0.0.0.0 to open to other hosts
+	// auth is optional). Set CORELAY_BIND=0.0.0.0 to open to other hosts
 	// (e.g. a server in a closed network used by other machines).
-	host := strings.TrimSpace(os.Getenv("ANICLEW_BIND"))
+	host := strings.TrimSpace(os.Getenv("CORELAY_BIND"))
+	if host == "" {
+		host = strings.TrimSpace(os.Getenv("ANICLEW_BIND"))
+	}
 	if host == "" {
 		host = "127.0.0.1"
 	}
@@ -367,8 +400,11 @@ func authMiddleware(next http.Handler) http.Handler {
 			provided = r.Header.Get("X-Access-Token")
 		}
 		if provided == "" {
-			if c, err := r.Cookie("aniclew-token"); err == nil {
-				provided = c.Value
+			for _, name := range []string{"corelay-token", "aniclew-token"} {
+				if c, err := r.Cookie(name); err == nil {
+					provided = c.Value
+					break
+				}
 			}
 		}
 		// Also accept via Authorization: Bearer
@@ -409,7 +445,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // ── Messages Handler (core proxy logic) ──
 
-func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCanonicalProtocol(w http.ResponseWriter, r *http.Request, adapterName protocol.Name) {
+	adapter, ok := protocol.DefaultRegistry().Get(adapterName)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "Protocol adapter is not configured")
+		return
+	}
 	s.mu.RLock()
 	activeProvider := s.activeProvider
 	activeModel := s.activeModel
@@ -424,7 +465,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if gw != nil {
 		user, err := gw.Authenticate(r)
 		if err != nil {
-			writeError(w, 401, err.Error())
+			adapter.WriteError(w, http.StatusUnauthorized, "authentication_error", "authentication failed")
 			return
 		}
 		if user != nil {
@@ -432,17 +473,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	body, err := io.ReadAll(r.Body)
+	r.Body = http.MaxBytesReader(w, r.Body, protocol.MaxRequestBytes)
+	decoded, err := adapter.Decode(r.Body)
 	if err != nil {
-		writeError(w, 400, "Failed to read body")
+		status, code, message := protocol.ErrorDetails(err)
+		adapter.WriteError(w, status, code, message)
 		return
 	}
-
-	var req types.MessagesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, 400, "Invalid JSON")
-		return
-	}
+	req := *decoded.Messages
 
 	startTime := time.Now()
 	opts := &types.StreamOptions{IncomingHeaders: extractHeaders(r)}
@@ -501,7 +539,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if provider == nil {
-		writeError(w, 500, "No provider configured")
+		adapter.WriteError(w, http.StatusInternalServerError, "server_error", "no provider is configured")
 		return
 	}
 
@@ -527,7 +565,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		recordRuntimeFailure(telemetry, provider, target, lastErr)
 
-		log.Printf("[Proxy] Attempt %d/%d failed: %v", attempt, retryCfg.MaxRetries, lastErr)
+		// Provider connection errors may include credential-bearing URLs. Keep
+		// protocol logs to non-secret routing metadata only.
+		log.Printf("[Proxy] Attempt %d/%d failed for %s/%s", attempt, retryCfg.MaxRetries, provider.Name(), model)
 
 		// Track 529s for fallback
 		if strings.Contains(lastErr.Error(), "529") || strings.Contains(lastErr.Error(), "overloaded") {
@@ -547,7 +587,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Proxy] Retrying in %v", delay)
 			select {
 			case <-streamCtx.Done():
-				writeError(w, 499, "Client disconnected")
+				adapter.WriteError(w, 499, "request_cancelled", "client disconnected")
 				return
 			case <-time.After(delay):
 			}
@@ -578,51 +618,44 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if lastErr != nil {
-			writeError(w, 502, lastErr.Error())
+			adapter.WriteError(w, http.StatusBadGateway, "upstream_error", "upstream provider request failed")
 			return
 		}
 	}
 
-	// ── Stream SSE ──
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(200)
-
-	// Stream with watchdog
-	outputTokens := 0
-	inputTokens := 0
-	flusher, hasFlusher := w.(http.Flusher)
-
+	// The adapter owns only wire egress. The provider/router/retry kernel above
+	// remains shared by Anthropic Messages, Chat Completions, and Responses.
 	watchdog := apiPkg.NewStreamWatchdog(func() {
 		log.Printf("[Stream] Idle timeout for %s/%s — aborting", provider.Name(), model)
-		streamCancel() // Actually abort the stream
+		streamCancel()
 	})
 	defer watchdog.Stop()
-
-	for event := range ch {
-		watchdog.Ping()
-		if err := stream.WriteSSEEvent(w, event); err != nil {
-			streamCancel()
-			break
-		}
-		if hasFlusher {
-			flusher.Flush()
-		}
-		// Track tokens
-		if event.Usage != nil {
-			if event.Usage.OutputTokens > 0 {
-				outputTokens = event.Usage.OutputTokens
-			}
-			if event.Usage.InputTokens > 0 {
-				inputTokens = event.Usage.InputTokens
+	observed := make(chan types.SSEEvent)
+	go func() {
+		defer close(observed)
+		for event := range ch {
+			watchdog.Ping()
+			select {
+			case <-streamCtx.Done():
+				return
+			case observed <- event:
 			}
 		}
-		if event.Type == "message_stop" {
-			break
+	}()
+	usage, writeErr := adapter.WriteResponse(streamCtx, w, protocol.ResponseMeta{Model: model, Created: startTime.UTC()}, observed, decoded)
+	if writeErr != nil {
+		streamCancel()
+		if r.Context().Err() == nil {
+			log.Printf("[Protocol] %s response failed: %v", adapterName, writeErr)
+			if !decoded.Stream {
+				status, code, message := classifyProtocolWriteError(writeErr, r.Context().Err())
+				adapter.WriteError(w, status, code, message)
+			}
 		}
+		return
 	}
+	outputTokens := usage.OutputTokens
+	inputTokens := usage.InputTokens
 
 	recordRuntimeSuccess(telemetry, provider, target, inputTokens, outputTokens)
 
@@ -1093,6 +1126,19 @@ func (s *Server) handleRegisterProvider(w http.ResponseWriter, r *http.Request) 
 
 // ── Config API ──
 
+var (
+	errConfigActiveRuns          = errors.New("configuration change blocked by active agent runs")
+	errConfigRegistryUnavailable = errors.New("loop registry unavailable")
+	errConfigPersistFailed       = errors.New("configuration persistence failed")
+)
+
+type serverConfigUpdate struct {
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	RouterEnabled *bool  `json:"routerEnabled"`
+	ResponseLang  string `json:"responseLang"`
+}
+
 func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1105,56 +1151,54 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
-	var update struct {
-		Provider      string `json:"provider"`
-		Model         string `json:"model"`
-		RouterEnabled *bool  `json:"routerEnabled"`
-		ResponseLang  string `json:"responseLang"`
-	}
+	var update serverConfigUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		writeError(w, 400, "Invalid JSON")
 		return
 	}
 
+	var nextProvider types.Provider
 	if update.Provider != "" && update.Model != "" {
 		p, err := providers.Create(update.Provider, nil)
 		if err != nil {
 			writeError(w, 400, err.Error())
 			return
 		}
-		s.SetProvider(p, update.Model)
-		log.Printf("Provider switched → %s/%s", update.Provider, update.Model)
+		nextProvider = p
 	}
 
+	activeRuns, err := s.applyConfigUpdate(update, nextProvider)
+	if err != nil {
+		switch {
+		case errors.Is(err, errConfigActiveRuns):
+			writeConfigAPIError(
+				w,
+				http.StatusConflict,
+				"config_change_blocked_active_runs",
+				"provider, model, and router configuration cannot change while agent runs are active",
+				map[string]any{"activeRuns": activeRuns},
+			)
+		case errors.Is(err, errConfigRegistryUnavailable):
+			writeConfigAPIError(w, http.StatusServiceUnavailable, "loop_registry_unavailable", "agent run state is unavailable", nil)
+		case errors.Is(err, agent.ErrShuttingDown):
+			writeConfigAPIError(w, http.StatusServiceUnavailable, "server_shutting_down", "server is shutting down", nil)
+		case errors.Is(err, errConfigPersistFailed):
+			writeConfigAPIError(w, http.StatusInternalServerError, "config_persist_failed", "configuration could not be persisted", nil)
+		default:
+			writeConfigAPIError(w, http.StatusInternalServerError, "config_update_failed", "configuration could not be updated", nil)
+		}
+		return
+	}
+
+	if update.Provider != "" && update.Model != "" {
+		log.Printf("Provider configuration set to %s/%s", update.Provider, update.Model)
+	}
 	if update.ResponseLang != "" {
-		s.SetResponseLang(update.ResponseLang)
 		log.Printf("Response language set to: %s", update.ResponseLang)
 	}
-
 	if update.RouterEnabled != nil {
-		s.mu.Lock()
-		if *update.RouterEnabled && s.router == nil {
-			s.router = router.New(nil, nil)
-			log.Println("Smart Router enabled")
-		} else if !*update.RouterEnabled {
-			s.router = nil
-			log.Println("Smart Router disabled")
-		}
-		s.mu.Unlock()
+		log.Printf("Smart Router enabled: %t", *update.RouterEnabled)
 	}
-
-	// Persist to config.json
-	cfg := config.Load()
-	if update.Provider != "" {
-		cfg.DefaultProvider = update.Provider
-	}
-	if update.Model != "" {
-		cfg.DefaultModel = update.Model
-	}
-	if update.ResponseLang != "" {
-		cfg.ResponseLang = update.ResponseLang
-	}
-	config.Save(cfg)
 
 	s.mu.RLock()
 	writeJSON(w, map[string]any{
@@ -1164,6 +1208,86 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		"routerEnabled": s.router != nil,
 	})
 	s.mu.RUnlock()
+}
+
+// applyConfigUpdate composes process-wide runtime configuration with the loop
+// registry's registration barrier. Either a loop is already registered and a
+// real provider/model/router change is rejected, or the mutation completes
+// before the next loop can register and read its runtime snapshot.
+func (s *Server) applyConfigUpdate(update serverConfigUpdate, nextProvider types.Provider) (int, error) {
+	if s.loops == nil {
+		return 0, errConfigRegistryUnavailable
+	}
+
+	activeRuns := 0
+	err := s.loops.WithRegistrationBarrier(func(active int) error {
+		activeRuns = active
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		currentProvider := ""
+		if s.activeProvider != nil {
+			currentProvider = s.activeProvider.Name()
+		}
+		providerChanged := update.Provider != "" && update.Provider != currentProvider
+		modelChanged := update.Model != "" && update.Model != s.activeModel
+		routerChanged := update.RouterEnabled != nil && *update.RouterEnabled != (s.router != nil)
+		if active > 0 && (providerChanged || modelChanged || routerChanged) {
+			return errConfigActiveRuns
+		}
+
+		cfg := config.Load()
+		if update.Provider != "" {
+			cfg.DefaultProvider = update.Provider
+		}
+		if update.Model != "" {
+			cfg.DefaultModel = update.Model
+		}
+		if update.ResponseLang != "" {
+			cfg.ResponseLang = update.ResponseLang
+		}
+		if update.RouterEnabled != nil {
+			cfg.RouterEnabled = *update.RouterEnabled
+		}
+		if err := config.Save(cfg); err != nil {
+			return errConfigPersistFailed
+		}
+
+		if update.Provider != "" && update.Model != "" && (providerChanged || modelChanged) {
+			s.activeProvider = nextProvider
+			s.activeModel = update.Model
+		}
+		if update.ResponseLang != "" {
+			s.responseLang = update.ResponseLang
+		}
+		if routerChanged {
+			if *update.RouterEnabled {
+				s.router = router.New(nil, nil)
+			} else {
+				s.router = nil
+			}
+		}
+		return nil
+	})
+	return activeRuns, err
+}
+
+func writeConfigAPIError(w http.ResponseWriter, status int, code, message string, details map[string]any) {
+	errorBody := map[string]any{
+		"type":    "config_error",
+		"code":    code,
+		"message": message,
+	}
+	for key, value := range details {
+		errorBody[key] = value
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": errorBody,
+	})
 }
 
 // ── Routes API ──
@@ -1232,7 +1356,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := map[string]any{
-		"name":     "aniclew",
+		"name":     "corelaycode",
 		"version":  "1.0.0",
 		"provider": s.activeProvider.Name(),
 		"model":    s.activeModel,
@@ -1658,8 +1782,19 @@ func (s *Server) handleSubAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		workDir, _ = os.Getwd()
 	}
 
+	sessionID := ""
 	if subAgentMgr == nil {
-		subAgentMgr = agent.NewSubAgentManager(provider, model, workDir)
+		sessionID = observability.NewTraceID("subagent")
+		sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(workDir)
+		subAgentMgr = agent.NewSubAgentManagerWithOptions(provider, model, workDir, agent.SubAgentManagerOptions{
+			SessionID:         sessionID,
+			ApprovalRequester: s.approvals,
+			SandboxRunner:     sandboxRunner,
+			SandboxPolicy:     sandboxPolicy,
+			CapabilityProfile: selectAutomaticCapabilityProfile(provider, model, time.Now()),
+		})
+	} else {
+		sessionID = subAgentMgr.SessionID()
 	}
 
 	var spawned []map[string]string
@@ -1667,7 +1802,7 @@ func (s *Server) handleSubAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		task := subAgentMgr.Spawn(t.Name, t.Instruction, t.Files)
 		spawned = append(spawned, map[string]string{"id": task.ID, "name": task.Name, "status": task.Status})
 	}
-	writeJSON(w, map[string]any{"spawned": len(spawned), "tasks": spawned})
+	writeJSON(w, map[string]any{"spawned": len(spawned), "sessionId": sessionID, "tasks": spawned})
 }
 
 func (s *Server) handleSubAgentTasks(w http.ResponseWriter, _ *http.Request) {
@@ -1978,6 +2113,188 @@ func (s *Server) handleWorkstreamHandoff(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{"ok": true, "path": snap.Path, "markdown": snap.Markdown})
 }
 
+const maxSessionRequestBytes = 8 << 20
+
+type sessionSaveRequest struct {
+	agent.Session
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+}
+
+type sessionRevisionRequest struct {
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+}
+
+type sessionInterruptRequest struct {
+	ExpectedRevision *uint64                      `json:"expectedRevision"`
+	RunID            string                       `json:"runId"`
+	ToolName         string                       `json:"toolName"`
+	ToolCallID       string                       `json:"toolCallId,omitempty"`
+	InputDigest      string                       `json:"inputDigest"`
+	SideEffectState  agent.SessionSideEffectState `json:"sideEffectState"`
+	Summary          string                       `json:"summary"`
+}
+
+type sessionRecoveryResponse struct {
+	SessionID             string                       `json:"sessionId,omitempty"`
+	Kind                  string                       `json:"kind"`
+	LifecycleStatus       agent.SessionLifecycleStatus `json:"lifecycleStatus"`
+	LastCommittedRevision uint64                       `json:"lastCommittedRevision,omitempty"`
+	Quarantined           bool                         `json:"quarantined"`
+}
+
+type sessionResumeInterruptionResponse struct {
+	At              time.Time                    `json:"at"`
+	RunID           string                       `json:"runId,omitempty"`
+	ToolName        string                       `json:"toolName,omitempty"`
+	ToolCallID      string                       `json:"toolCallId,omitempty"`
+	InputDigest     string                       `json:"inputDigest,omitempty"`
+	SideEffectState agent.SessionSideEffectState `json:"sideEffectState,omitempty"`
+	Summary         string                       `json:"summary,omitempty"`
+}
+
+type sessionResumeStateResponse struct {
+	SessionID             string                             `json:"sessionId"`
+	Revision              uint64                             `json:"revision"`
+	ParentSessionID       string                             `json:"parentSessionId,omitempty"`
+	ParentRevision        uint64                             `json:"parentRevision,omitempty"`
+	LifecycleStatus       agent.SessionLifecycleStatus       `json:"lifecycleStatus"`
+	LastCommittedRevision uint64                             `json:"lastCommittedRevision"`
+	ReconcileRequired     bool                               `json:"reconcileRequired"`
+	Interruption          *sessionResumeInterruptionResponse `json:"interruption,omitempty"`
+}
+
+func decodeSessionRequest(w http.ResponseWriter, r *http.Request, target any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxSessionRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_request", "invalid session request", nil, nil)
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_request", "session request must contain one JSON value", nil, nil)
+		return false
+	}
+	return true
+}
+
+func requireSessionRevision(w http.ResponseWriter, expected *uint64) bool {
+	if expected != nil {
+		return true
+	}
+	writeSessionAPIError(
+		w,
+		http.StatusPreconditionRequired,
+		"expected_revision_required",
+		"expectedRevision is required for an existing session",
+		nil,
+		nil,
+	)
+	return false
+}
+
+func writeSessionAPIError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+	details map[string]any,
+	recovery *sessionRecoveryResponse,
+) {
+	errorBody := map[string]any{
+		"type":    "session_error",
+		"code":    code,
+		"message": message,
+	}
+	for key, value := range details {
+		errorBody[key] = value
+	}
+	if recovery != nil {
+		errorBody["recovery"] = recovery
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": errorBody,
+	})
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	code := "session_operation_failed"
+	message := "session operation failed"
+	details := map[string]any(nil)
+
+	var revisionConflict *agent.SessionRevisionConflictError
+	switch {
+	case errors.As(err, &revisionConflict):
+		status = http.StatusConflict
+		code = "session_revision_conflict"
+		message = "session revision conflict"
+		details = map[string]any{
+			"sessionId":        revisionConflict.SessionID,
+			"expectedRevision": revisionConflict.Expected,
+			"currentRevision":  revisionConflict.Current,
+		}
+	case errors.Is(err, agent.ErrInvalidSessionID):
+		status = http.StatusBadRequest
+		code = "invalid_session_id"
+		message = "invalid session id"
+	case errors.Is(err, agent.ErrSessionNotFound):
+		status = http.StatusNotFound
+		code = "session_not_found"
+		message = "session not found"
+	case errors.Is(err, agent.ErrSessionCorrupt):
+		status = http.StatusUnprocessableEntity
+		code = "session_corrupt"
+		message = "session requires recovery"
+	case errors.Is(err, agent.ErrSessionVersionUnsupported):
+		status = http.StatusConflict
+		code = "session_version_unsupported"
+		message = "session version is not supported"
+	case errors.Is(err, agent.ErrSessionConflict), errors.Is(err, agent.ErrSessionParentInvalid):
+		status = http.StatusConflict
+		code = "session_conflict"
+		message = "session state conflict"
+	case errors.Is(err, agent.ErrSessionReconcileRequired):
+		status = http.StatusConflict
+		code = "session_reconcile_required"
+		message = "session must be reconciled before this operation"
+	case errors.Is(err, agent.ErrSessionLifecycleInvalid):
+		status = http.StatusConflict
+		code = "session_lifecycle_conflict"
+		message = "invalid session lifecycle transition"
+	case errors.Is(err, agent.ErrSessionRevisionOverflow):
+		status = http.StatusConflict
+		code = "session_revision_overflow"
+		message = "session revision cannot be advanced"
+	}
+
+	var safeRecovery *sessionRecoveryResponse
+	if recovery, ok := agent.SessionRecoveryFromError(err); ok {
+		safeRecovery = &sessionRecoveryResponse{
+			SessionID:             recovery.SessionID,
+			Kind:                  recovery.Kind,
+			LifecycleStatus:       recovery.LifecycleStatus,
+			LastCommittedRevision: recovery.LastCommittedRevision,
+			Quarantined:           recovery.Quarantined,
+		}
+	}
+	writeSessionAPIError(w, status, code, message, details, safeRecovery)
+}
+
+func (s *Server) sessionStoreOrError(w http.ResponseWriter) *agent.SessionStore {
+	s.mu.RLock()
+	store := s.sessions
+	s.mu.RUnlock()
+	if store == nil {
+		writeSessionAPIError(w, http.StatusServiceUnavailable, "sessions_unavailable", "sessions are not initialized", nil, nil)
+	}
+	return store
+}
+
 func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	store := s.sessions
@@ -1995,17 +2312,14 @@ func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionGet(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	store := s.sessions
-	s.mu.RUnlock()
+	store := s.sessionStoreOrError(w)
 	if store == nil {
-		writeError(w, 400, "Sessions not initialized")
 		return
 	}
 	id := r.PathValue("id")
 	sess, err := store.Get(id)
 	if err != nil {
-		writeError(w, 404, err.Error())
+		writeSessionError(w, err)
 		return
 	}
 	writeJSON(w, sess)
@@ -2018,78 +2332,500 @@ func (s *Server) handleSessionSave(w http.ResponseWriter, r *http.Request) {
 	model := s.activeModel
 	s.mu.RUnlock()
 	if store == nil {
-		writeError(w, 400, "Sessions not initialized")
+		writeSessionAPIError(w, http.StatusServiceUnavailable, "sessions_unavailable", "sessions are not initialized", nil, nil)
 		return
 	}
-	var sess agent.Session
-	if err := json.NewDecoder(r.Body).Decode(&sess); err != nil {
-		writeError(w, 400, "Invalid JSON")
+	var body sessionSaveRequest
+	if !decodeSessionRequest(w, r, &body) {
 		return
 	}
-	if sess.Provider == "" {
+	sess := body.Session
+	if sess.Provider == "" && prov != nil {
 		sess.Provider = prov.Name()
 	}
 	if sess.Model == "" {
 		sess.Model = model
 	}
-	if err := store.Save(&sess); err != nil {
-		writeError(w, 500, err.Error())
+	expectedRevision := body.ExpectedRevision
+	if sess.ID != "" {
+		_, err := store.Get(sess.ID)
+		switch {
+		case err == nil:
+			if !requireSessionRevision(w, expectedRevision) {
+				return
+			}
+		case errors.Is(err, agent.ErrSessionNotFound):
+			// A valid caller-supplied ID remains supported for create. SaveExpected
+			// performs the definitive atomic not-found/revision-zero check.
+		case err != nil:
+			writeSessionError(w, err)
+			return
+		}
+	}
+	if expectedRevision == nil {
+		zero := uint64(0)
+		expectedRevision = &zero
+	}
+	if err := store.SaveExpected(&sess, *expectedRevision); err != nil {
+		writeSessionError(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "id": sess.ID})
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"id":       sess.ID,
+		"version":  sess.Version,
+		"revision": sess.Revision,
+	})
 }
 
 func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	store := s.sessions
-	s.mu.RUnlock()
+	store := s.sessionStoreOrError(w)
 	if store == nil {
-		writeError(w, 400, "Sessions not initialized")
 		return
 	}
 	id := r.PathValue("id")
-	store.Delete(id)
-	writeJSON(w, map[string]any{"ok": true})
+	var expectedRevision *uint64
+	if raw := strings.TrimSpace(r.URL.Query().Get("expectedRevision")); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			writeSessionAPIError(w, http.StatusBadRequest, "invalid_request", "expectedRevision must be an unsigned integer", nil, nil)
+			return
+		}
+		expectedRevision = &parsed
+	}
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		var body sessionRevisionRequest
+		if !decodeSessionRequest(w, r, &body) {
+			return
+		}
+		if body.ExpectedRevision != nil {
+			if expectedRevision != nil && *expectedRevision != *body.ExpectedRevision {
+				writeSessionAPIError(w, http.StatusBadRequest, "invalid_request", "conflicting expectedRevision values", nil, nil)
+				return
+			}
+			expectedRevision = body.ExpectedRevision
+		}
+	}
+	if !requireSessionRevision(w, expectedRevision) {
+		return
+	}
+	if _, active := s.durableActive.Load(id); active {
+		writeSessionAPIError(w, http.StatusConflict, "session_run_active", "session has an active durable run", nil, nil)
+		return
+	}
+	result, err := store.DeleteExpected(id, *expectedRevision)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "cleanup": result})
 }
 
 func (s *Server) handleSessionRename(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	store := s.sessions
-	s.mu.RUnlock()
+	store := s.sessionStoreOrError(w)
 	if store == nil {
-		writeError(w, 400, "Sessions not initialized")
 		return
 	}
 	id := r.PathValue("id")
 	var body struct {
-		Title string `json:"title"`
+		Title            string  `json:"title"`
+		ExpectedRevision *uint64 `json:"expectedRevision"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
-	if err := store.Rename(id, body.Title); err != nil {
-		writeError(w, 500, err.Error())
+	if !decodeSessionRequest(w, r, &body) {
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true})
+	if !requireSessionRevision(w, body.ExpectedRevision) {
+		return
+	}
+	sess, err := store.Get(id)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	sess.Title = body.Title
+	if err := store.SaveExpected(sess, *body.ExpectedRevision); err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"id":       sess.ID,
+		"version":  sess.Version,
+		"revision": sess.Revision,
+	})
+}
+
+func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	var body sessionRevisionRequest
+	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
+		return
+	}
+	forked, err := store.Fork(r.PathValue("id"), *body.ExpectedRevision)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"id":       forked.ID,
+		"version":  forked.Version,
+		"revision": forked.Revision,
+		"session":  forked,
+	})
+}
+
+func (s *Server) handleSessionInterrupt(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	var body sessionInterruptRequest
+	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
+		return
+	}
+	marker := agent.SessionInterruption{
+		At:              time.Now().UTC(),
+		RunID:           body.RunID,
+		ToolName:        body.ToolName,
+		ToolCallID:      body.ToolCallID,
+		InputDigest:     body.InputDigest,
+		SideEffectState: body.SideEffectState,
+		Summary:         body.Summary,
+	}
+	if err := agent.ValidateSessionInterruption(marker); err != nil {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_interruption", "invalid interruption metadata", nil, nil)
+		return
+	}
+	updated, err := store.MarkInterrupted(r.PathValue("id"), *body.ExpectedRevision, marker)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "session": updated, "revision": updated.Revision})
+}
+
+func (s *Server) handleSessionReconcile(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	var body sessionRevisionRequest
+	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
+		return
+	}
+	updated, err := store.MarkReconciled(r.PathValue("id"), *body.ExpectedRevision)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "session": updated, "revision": updated.Revision})
+}
+
+func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	var body sessionRevisionRequest
+	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
+		return
+	}
+	updated, err := store.Close(r.PathValue("id"), *body.ExpectedRevision)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "session": updated, "revision": updated.Revision})
+}
+
+func (s *Server) handleSessionResumeState(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	state, err := store.ResumeState(r.PathValue("id"))
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	response := sessionResumeStateResponse{
+		SessionID:             state.SessionID,
+		Revision:              state.Revision,
+		ParentSessionID:       state.ParentSessionID,
+		ParentRevision:        state.ParentRevision,
+		LifecycleStatus:       state.LifecycleStatus,
+		LastCommittedRevision: state.LastCommittedRevision,
+		ReconcileRequired:     state.ReconcileRequired,
+	}
+	if state.Interruption != nil {
+		response.Interruption = &sessionResumeInterruptionResponse{
+			At:              state.Interruption.At,
+			RunID:           state.Interruption.RunID,
+			ToolName:        state.Interruption.ToolName,
+			ToolCallID:      state.Interruption.ToolCallID,
+			InputDigest:     state.Interruption.InputDigest,
+			SideEffectState: state.Interruption.SideEffectState,
+			Summary:         state.Interruption.Summary,
+		}
+	}
+	writeJSON(w, response)
+}
+
+// ── Approval Broker ──
+
+type approvalHub struct {
+	mu      sync.RWMutex
+	broker  *approval.Broker
+	pending map[string]approval.Pending
+	closed  bool
+}
+
+var _ approval.Requester = (*approvalHub)(nil)
+
+func newApprovalHub(ttl time.Duration) *approvalHub {
+	return &approvalHub{
+		broker:  approval.NewBroker(ttl),
+		pending: make(map[string]approval.Pending),
+	}
+}
+
+func (h *approvalHub) Open(draft approval.Draft) (approval.Pending, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return approval.Pending{}, approval.ErrBrokerClosed
+	}
+	h.pruneExpiredLocked(time.Now())
+	pending, err := h.broker.Open(draft)
+	if err != nil {
+		return approval.Pending{}, err
+	}
+	h.pending[pending.ID] = pending
+	return pending, nil
+}
+
+func (h *approvalHub) Await(ctx context.Context, sessionID, approvalID string) (approval.Resolution, error) {
+	resolution, err := h.broker.Await(ctx, sessionID, approvalID)
+	if resolution.ApprovalID != "" {
+		h.remove(resolution.ApprovalID)
+	}
+	return resolution, err
+}
+
+func (h *approvalHub) Resolve(decision approval.Decision) (approval.Resolution, error) {
+	resolution, err := h.broker.Resolve(decision)
+	if resolution.ApprovalID != "" {
+		h.remove(resolution.ApprovalID)
+	}
+	return resolution, err
+}
+
+func (h *approvalHub) CancelSession(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Serialize the broker tombstone and the public pending index with Open.
+	// Broker also enforces the same invariant so callers that bypass this hub
+	// still cannot reopen a canceled session.
+	h.broker.CancelSession(sessionID)
+	for id, pending := range h.pending {
+		if pending.SessionID == sessionID {
+			delete(h.pending, id)
+		}
+	}
+}
+
+func (h *approvalHub) Shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	h.broker.Shutdown()
+	clear(h.pending)
+}
+
+func (h *approvalHub) list(sessionID string) []approval.Pending {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pruneExpiredLocked(time.Now())
+	pending := make([]approval.Pending, 0)
+	for _, item := range h.pending {
+		if item.SessionID == sessionID {
+			pending = append(pending, item)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+	})
+	return pending
+}
+
+func (h *approvalHub) get(sessionID, approvalID string) (approval.Pending, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pruneExpiredLocked(time.Now())
+	pending, ok := h.pending[approvalID]
+	if !ok || pending.SessionID != sessionID {
+		return approval.Pending{}, false
+	}
+	return pending, true
+}
+
+func (h *approvalHub) remove(approvalID string) {
+	h.mu.Lock()
+	delete(h.pending, approvalID)
+	h.mu.Unlock()
+}
+
+func (h *approvalHub) pruneExpiredLocked(now time.Time) {
+	for id, pending := range h.pending {
+		if !now.Before(pending.ExpiresAt) {
+			delete(h.pending, id)
+		}
+	}
+}
+
+type approvalPendingResponse struct {
+	ID              string    `json:"id"`
+	SessionRevision uint64    `json:"sessionRevision"`
+	RunID           string    `json:"runId"`
+	ToolName        string    `json:"toolName"`
+	RedactedInput   string    `json:"redactedInput,omitempty"`
+	InputDigest     string    `json:"inputDigest,omitempty"`
+	DangerLevel     string    `json:"dangerLevel,omitempty"`
+	Scope           string    `json:"scope,omitempty"`
+	RememberAllowed bool      `json:"rememberAllowed"`
+	CreatedAt       time.Time `json:"createdAt"`
+	ExpiresAt       time.Time `json:"expiresAt"`
+}
+
+type approvalResolutionResponse struct {
+	ID         string                    `json:"id"`
+	Decision   approval.Outcome          `json:"decision"`
+	Reason     approval.ResolutionReason `json:"reason"`
+	ResolvedAt time.Time                 `json:"resolvedAt"`
+}
+
+func approvalPendingView(pending approval.Pending) approvalPendingResponse {
+	return approvalPendingResponse{
+		ID:              pending.ID,
+		SessionRevision: pending.SessionRevision,
+		RunID:           pending.RunID,
+		ToolName:        pending.ToolName,
+		RedactedInput:   pending.RedactedInput,
+		InputDigest:     pending.InputDigest,
+		DangerLevel:     pending.DangerLevel,
+		Scope:           pending.Scope,
+		RememberAllowed: pending.RememberAllowed,
+		CreatedAt:       pending.CreatedAt,
+		ExpiresAt:       pending.ExpiresAt,
+	}
+}
+
+func writeApprovalError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, approval.ErrInvalidDraft), errors.Is(err, approval.ErrInvalidDecision):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, approval.ErrApprovalNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, approval.ErrAlreadyResolved),
+		errors.Is(err, approval.ErrApprovalExpired),
+		errors.Is(err, approval.ErrSessionCanceled),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, approval.ErrBrokerClosed):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func (s *Server) handleApprovalList(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "missing sessionId")
+		return
+	}
+	pending := s.approvals.list(sessionID)
+	views := make([]approvalPendingResponse, 0, len(pending))
+	for _, item := range pending {
+		views = append(views, approvalPendingView(item))
+	}
+	writeJSON(w, map[string]any{"approvals": views})
+}
+
+func (s *Server) handleApprovalGet(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	approvalID := r.PathValue("id")
+	if sessionID == "" || approvalID == "" {
+		writeError(w, http.StatusBadRequest, "missing sessionId or approval id")
+		return
+	}
+	pending, ok := s.approvals.get(sessionID, approvalID)
+	if !ok {
+		writeError(w, http.StatusNotFound, approval.ErrApprovalNotFound.Error())
+		return
+	}
+	writeJSON(w, approvalPendingView(pending))
+}
+
+func (s *Server) handleApprovalResolve(w http.ResponseWriter, r *http.Request) {
+	approvalID := r.PathValue("id")
+	if approvalID == "" {
+		writeError(w, http.StatusBadRequest, "missing approval id")
+		return
+	}
+	var body struct {
+		SessionID string           `json:"sessionId"`
+		Decision  approval.Outcome `json:"decision"`
+		Outcome   approval.Outcome `json:"outcome"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	outcome := body.Decision
+	if outcome == "" {
+		outcome = body.Outcome
+	}
+	sessionID := strings.TrimSpace(body.SessionID)
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "missing sessionId")
+		return
+	}
+	resolution, err := s.approvals.Resolve(approval.Decision{
+		ApprovalID: approvalID,
+		SessionID:  sessionID,
+		Outcome:    outcome,
+	})
+	if err != nil {
+		writeApprovalError(w, err)
+		return
+	}
+	writeJSON(w, approvalResolutionResponse{
+		ID:         resolution.ApprovalID,
+		Decision:   resolution.Outcome,
+		Reason:     resolution.Reason,
+		ResolvedAt: resolution.ResolvedAt,
+	})
 }
 
 // ── Agent Loop ──
 
 func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	provider := s.activeProvider
-	model := s.activeModel
-	s.mu.RUnlock()
-
-	if provider == nil {
-		writeError(w, 500, "No provider configured")
-		return
-	}
-
 	var body struct {
-		Messages     []types.Message `json:"messages"`
-		WorkDir      string          `json:"workDir"`
-		ResponseLang string          `json:"responseLang"`
-		WorkstreamID string          `json:"workstreamId"`
+		Messages         []types.Message `json:"messages"`
+		WorkDir          string          `json:"workDir"`
+		ResponseLang     string          `json:"responseLang"`
+		WorkstreamID     string          `json:"workstreamId"`
+		DurableSessionID string          `json:"durableSessionId"`
+		ExpectedRevision *uint64         `json:"expectedRevision"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
@@ -2115,8 +2851,53 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		respLang = "auto"
 	}
 	tracker := s.tracker
+	sessionStore := s.sessions
 	s.mu.RUnlock()
 	traceID := observability.NewTraceID("run")
+
+	var durableRun *durableAgentRun
+	durableSessionID := strings.TrimSpace(body.DurableSessionID)
+	switch {
+	case durableSessionID == "" && body.ExpectedRevision != nil:
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_session_binding", "expectedRevision requires durableSessionId", nil, nil)
+		return
+	case durableSessionID != "" && body.ExpectedRevision == nil:
+		writeSessionAPIError(w, http.StatusPreconditionRequired, "expected_revision_required", "expectedRevision is required for a durable agent run", nil, nil)
+		return
+	case durableSessionID != "":
+		if _, quarantined := s.durableQuarantine.Load(durableSessionID); quarantined {
+			writeSessionAPIError(w, http.StatusConflict, "session_runtime_quarantined", "durable session requires operator recovery before another run", nil, nil)
+			return
+		}
+		if sessionStore == nil {
+			writeSessionAPIError(w, http.StatusServiceUnavailable, "sessions_unavailable", "sessions are not initialized", nil, nil)
+			return
+		}
+		if _, active := s.durableActive.LoadOrStore(durableSessionID, struct{}{}); active {
+			writeSessionAPIError(w, http.StatusConflict, "session_run_active", "durable session already has an active run", nil, nil)
+			return
+		}
+		defer s.durableActive.Delete(durableSessionID)
+		var err error
+		durableRun, err = prepareDurableAgentRun(
+			sessionStore,
+			durableSessionID,
+			*body.ExpectedRevision,
+			workDir,
+			body.Messages,
+		)
+		if err != nil {
+			if errors.Is(err, errDurableTranscriptMismatch) {
+				writeSessionAPIError(w, http.StatusConflict, "session_transcript_conflict", "durable session transcript does not match the run request", nil, nil)
+				return
+			}
+			writeSessionError(w, err)
+			return
+		}
+		durableRun.quarantine = func(sessionID string) {
+			s.durableQuarantine.Store(sessionID, struct{}{})
+		}
+	}
 
 	var ws *workstream.Workstream
 	var wsStore *workstream.Store
@@ -2135,6 +2916,10 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	// Register with the loop registry before we touch the response writer
 	// — if the cap is already hit we reject with 429 instead of opening
 	// an SSE stream that will never stream anything useful.
+	if s.loops == nil {
+		writeConfigAPIError(w, http.StatusServiceUnavailable, "loop_registry_unavailable", "agent run state is unavailable", nil)
+		return
+	}
 	sessionID, loopCtx, release, err := s.loops.Register(r.Context(), workDir)
 	if err != nil {
 		switch {
@@ -2149,6 +2934,22 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	defer s.approvals.CancelSession(sessionID)
+
+	// Read the runtime only after registration succeeds. A config mutation and
+	// Register share the registry barrier, so this snapshot is either wholly
+	// before or wholly after a provider/model/router update.
+	s.mu.RLock()
+	provider := s.activeProvider
+	model := s.activeModel
+	s.mu.RUnlock()
+	if provider == nil {
+		writeError(w, http.StatusInternalServerError, "No provider configured")
+		return
+	}
+	if durableRun != nil {
+		durableRun.SetRuntimeRunID(sessionID)
+	}
 
 	// SSE response
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2158,9 +2959,14 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 
 	// First frame: hand the client its session id so it can later POST to
 	// /api/agent/{sessionId}/cancel or query /api/agent/loops.
+	sessionData := map[string]any{"sessionId": sessionID, "workDir": workDir, "traceId": traceID}
+	if durableRun != nil {
+		sessionData["durableSessionId"] = durableRun.session.ID
+		sessionData["durableRevision"] = durableRun.expectedRevision
+	}
 	sessionEvent, _ := json.Marshal(agent.Event{
 		Type: "session",
-		Data: map[string]string{"sessionId": sessionID, "workDir": workDir, "traceId": traceID},
+		Data: sessionData,
 	})
 	fmt.Fprintf(w, "data: %s\n\n", sessionEvent)
 	if f, ok := w.(http.Flusher); ok {
@@ -2218,21 +3024,96 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		recorder = compositeRunRecorder{recorders: recorders}
 	}
 
+	// Resolve the process boundary explicitly at the HTTP composition root.
+	// Preferred remains fail-closed if the platform adapter is unavailable.
+	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(workDir)
+	capabilityProfile := selectAutomaticCapabilityProfile(provider, model, time.Now())
+	var planAnchor *agent.PlanAnchor
+	if capabilityProfile != nil {
+		planAnchor = capabilityPlanAnchor(body.Messages, ws)
+		if planAnchor == nil {
+			// A profile may require compact/strict anchor rendering. If the request
+			// has no objective from which to construct one, preserve legacy fallback.
+			capabilityProfile = nil
+		}
+	}
+	var toolResultStore agent.ToolResultStore
+	var toolResultReader agent.ToolResultReader
+	var toolResultReferences []agent.ToolResultReference
+	var preExecutionJournal agent.ToolExecutionJournal
+	if durableRun != nil {
+		toolResultStore = durableRun.toolResultMemory
+		toolResultReader = durableRun.toolResultMemory
+		toolResultReferences = append([]agent.ToolResultReference(nil), durableRun.toolResultRefs...)
+		preExecutionJournal = durableRun.JournalToolExecution
+	}
+
 	go agent.RunLoopWithOptions(loopCtx, provider, model, body.Messages, workDir, agent.RunOptions{
-		ResponseLang:      respLang,
-		WorkstreamContext: workstreamContext,
-		Recorder:          recorder,
-		EvidencePolicy:    s.currentEvidencePolicy(),
+		SessionID:            sessionID,
+		ApprovalRequester:    s.approvals,
+		ResponseLang:         respLang,
+		WorkstreamContext:    workstreamContext,
+		Recorder:             recorder,
+		EvidencePolicy:       s.currentEvidencePolicy(),
+		SandboxRunner:        sandboxRunner,
+		SandboxPolicy:        sandboxPolicy,
+		CapabilityProfile:    capabilityProfile,
+		PlanAnchor:           planAnchor,
+		ToolResultStore:      toolResultStore,
+		ToolResultReader:     toolResultReader,
+		ToolResultReferences: toolResultReferences,
+		PreExecutionJournal:  preExecutionJournal,
 	}, eventCh)
 
 	clientGone := false
 	for event := range eventCh {
+		if durableRun != nil {
+			durableRun.Observe(event)
+			if event.Type == "done" {
+				committed, commitErr := durableRun.Finalize(provider.Name(), model)
+				var durableEvent agent.Event
+				if commitErr != nil {
+					if durableRun.observer != nil && durableRun.observer.HasToolActivity() && !durableRun.session.ReconcileRequired {
+						s.durableQuarantine.Store(durableRun.session.ID, struct{}{})
+					}
+					durableEvent = agent.Event{Type: "durable_session_error", Data: map[string]any{
+						"sessionId": durableRun.session.ID,
+						"code":      durableSessionErrorCode(commitErr),
+						"message":   "Agent output could not be committed to the durable session",
+					}}
+				} else {
+					durableEvent = durableSessionCommittedEvent(committed)
+				}
+				if !clientGone && !writeAgentSSE(w, durableEvent) {
+					clientGone = true
+					s.loops.Cancel(sessionID)
+					s.approvals.CancelSession(sessionID)
+				}
+			}
+		}
 		if clientGone {
 			continue
 		}
 		if !writeAgentSSE(w, event) {
 			clientGone = true
 			s.loops.Cancel(sessionID)
+			s.approvals.CancelSession(sessionID)
+		}
+	}
+
+	if durableRun != nil && !durableRun.completed {
+		updated, interruptErr := durableRun.MarkInterrupted("agent stream ended before a normal completion event")
+		if interruptErr != nil {
+			s.durableQuarantine.Store(durableRun.session.ID, struct{}{})
+			if !clientGone {
+				_ = writeAgentSSE(w, agent.Event{Type: "durable_session_error", Data: map[string]any{
+					"sessionId": durableRun.session.ID,
+					"code":      durableSessionErrorCode(interruptErr),
+					"message":   "Interrupted run state could not be checkpointed",
+				}})
+			}
+		} else if updated != nil && !clientGone {
+			_ = writeAgentSSE(w, durableSessionCommittedEvent(updated))
 		}
 	}
 
@@ -2478,6 +3359,7 @@ func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "session not found")
 		return
 	}
+	s.approvals.CancelSession(sessionID)
 	writeJSON(w, map[string]any{"sessionId": sessionID, "cancelled": true})
 }
 
@@ -2543,17 +3425,12 @@ func (s *Server) handlePlugins(w http.ResponseWriter, _ *http.Request) {
 	workDir := s.workDir
 	s.mu.RUnlock()
 
-	home, _ := os.UserHomeDir()
-	dirs := []string{
-		filepath.Join(workDir, ".claude", "plugins"),
-		filepath.Join(home, ".claude", "plugins"),
-	}
-	pm := agent.NewPluginManager(dirs...)
+	pm := agent.NewPluginManager(agent.DefaultPluginDirs(workDir)...)
 	pm.LoadAll()
 	writeJSON(w, pm.GetPlugins())
 }
 
-func (s *Server) handleWorktrees(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleWorktrees(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	workDir := s.workDir
 	s.mu.RUnlock()
@@ -2561,7 +3438,17 @@ func (s *Server) handleWorktrees(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, []any{})
 		return
 	}
-	writeJSON(w, agent.ListWorktrees(workDir))
+	runner, policy := agent.DefaultSandboxExecution(workDir)
+	worktrees, err := agent.ListWorktreesWithOptions(workDir, agent.ToolExecutionOptions{
+		Context:       r.Context(),
+		SandboxRunner: runner,
+		SandboxPolicy: policy,
+	})
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, worktrees)
 }
 
 // ── Team Execution ──
@@ -2654,6 +3541,7 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	traceID := observability.NewTraceID("run")
+	defer s.approvals.CancelSession(traceID)
 
 	var ws *workstream.Workstream
 	var wsStore *workstream.Store
@@ -2684,14 +3572,19 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	teamSandboxRunner, teamSandboxPolicy := agent.DefaultSandboxExecution(workDir)
 	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
 		Name:              teamName,
 		VerifyCommand:     body.VerifyCommand,
 		Capacity:          body.Capacity,
 		WorkstreamContext: workstreamContext,
+		SessionID:         traceID,
+		ApprovalRequester: s.approvals,
 		ProviderFactory: func(name string) (types.Provider, error) {
 			return providers.Create(name, &types.ProviderConfig{})
 		},
+		SandboxRunner: teamSandboxRunner,
+		SandboxPolicy: teamSandboxPolicy,
 	})
 	for _, task := range plan.ToTeamTasks() {
 		team.AddTask(task)
@@ -3001,6 +3894,7 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		workDir, _ = os.Getwd()
 	}
 	traceID := observability.NewTraceID("run")
+	defer s.approvals.CancelSession(traceID)
 
 	cfg := agent.DefaultChronosConfig()
 	if body.VerifyCommand != "" {
@@ -3095,6 +3989,12 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	chronosSandboxRunner, chronosSandboxPolicy := agent.DefaultSandboxExecution(workDir)
+	cfg.SandboxRunner = chronosSandboxRunner
+	cfg.SandboxPolicy = chronosSandboxPolicy
+	cfg.SessionID = traceID
+	cfg.ApprovalRequester = s.approvals
+	cfg.CapabilityProfile = selectAutomaticCapabilityProfile(provider, model, time.Now())
 	go agent.RunChronos(streamCtx, provider, model, body.Task, workDir, cfg, eventCh)
 
 	recordedChronosEnd := false
@@ -3104,18 +4004,28 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 			switch event.Type {
 			case "done":
 				recordedChronosEnd = true
-				finishRunTrace(&chronosTrace, "ok", "")
+				verification := chronosVerificationFromDone(event.Data, cfg.VerifyCommand)
+				traceStatus := "ok"
+				traceError := ""
+				timelineType := "chronos_run_completed"
+				timelineMessage := "Chronos run completed"
+				if verification.Status == "failed" {
+					traceStatus = "failed"
+					traceError = verification.Summary
+					timelineType = "chronos_run_failed"
+					timelineMessage = "Chronos run stopped without verified completion"
+				}
+				finishRunTrace(&chronosTrace, traceStatus, traceError)
 				if tracker != nil {
 					tracker.RecordRun(chronosTrace)
 				}
 				if wsStore != nil && ws != nil {
-					verification := chronosVerificationFromDone(event.Data, cfg.VerifyCommand)
 					if _, err := wsStore.Patch(ws.ID, workstream.Patch{LastVerification: &verification}); err != nil {
 						log.Printf("[workstream] record chronos verification failed: %v", err)
 					}
 					if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
-						Type:    "chronos_run_completed",
-						Message: "Chronos run completed",
+						Type:    timelineType,
+						Message: timelineMessage,
 						Data: map[string]string{
 							"provider": provider.Name(),
 							"model":    model,

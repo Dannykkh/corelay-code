@@ -1,10 +1,10 @@
-# IP Provenance — AniClew
+# IP Provenance — Corelay Code
 
 > 코드 출처 검증 기록. 2026-07-25 실시.
 
 ## 배경
 
-AniClew(`proxy-go/`)는 2026년 4월부터 7월까지 Anthropic Claude Code의 유출 소스 트리와 같은 워크스페이스(`D:\git\claudecode`)에서 개발되었다. 유출 트리는 2026-03-31 npm 소스맵 사고로 노출된 독점 코드이며, 저장소 `LICENSE`가 `UNLICENSED — NOT FOR REDISTRIBUTION`으로 명시한다.
+Corelay Code(당시 명칭 AniClew, `proxy-go/`)는 2026년 4월부터 7월까지 Anthropic Claude Code의 유출 소스 트리와 같은 워크스페이스(`D:\git\claudecode`)에서 개발되었다. 유출 트리는 2026-03-31 npm 소스맵 사고로 노출된 독점 코드이며, 저장소 `LICENSE`가 `UNLICENSED — NOT FOR REDISTRIBUTION`으로 명시한다.
 
 개발 과정에서 유출 트리를 **개념 수준으로 벤치마킹**했다(메모리 시스템, 하네스 구조, 설정 UI 구성 등). 저작권은 아이디어·방법·시스템이 아니라 표현을 보호하므로, 실제 리스크는 "참고 여부"가 아니라 "표현을 그대로 옮겼는가"에 있다. 이 문서는 그 점을 기계적으로 검증한 기록이다.
 

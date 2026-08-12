@@ -1,15 +1,33 @@
 package agent
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 )
+
+// toolCallMessageInput keeps rejected native calls representable in the
+// assistant/tool-result round trip. Invalid or non-object input is reported by
+// the dispatcher, while the protocol history receives a neutral JSON object
+// instead of malformed JSON that could break the next provider request.
+func toolCallMessageInput(call toolUseBlock) json.RawMessage {
+	raw := bytes.TrimSpace(call.Input)
+	if strings.TrimSpace(call.InputRaw) != "" {
+		raw = bytes.TrimSpace([]byte(call.InputRaw))
+	}
+	var object map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &object) != nil || object == nil {
+		return json.RawMessage(`{}`)
+	}
+	return append(json.RawMessage(nil), raw...)
+}
 
 // IsConcurrencySafe checks if a tool call can run in parallel.
 // Semantic analysis for concurrency safety.
 func IsConcurrencySafe(toolName string, input map[string]interface{}) bool {
 	switch toolName {
 	// Always safe: read-only tools
-	case "Read", "Glob", "Grep":
+	case "Read", "Glob", "Grep", loadToolResultToolName:
 		return true
 
 	// Never safe: write tools
@@ -35,13 +53,13 @@ func isBashConcurrencySafe(cmd string) bool {
 
 	// Unsafe patterns: state-changing commands
 	unsafePatterns := []string{
-		"cd ", "cd\t",      // directory change
-		"rm ", "rm\t",      // file deletion
-		"mv ", "mv\t",      // file move
-		"cp ", "cp\t",      // file copy (can overwrite)
-		"mkdir ", "touch ",  // create
-		"chmod ", "chown ",  // permissions
-		">", ">>",          // output redirection
+		"cd ", "cd\t", // directory change
+		"rm ", "rm\t", // file deletion
+		"mv ", "mv\t", // file move
+		"cp ", "cp\t", // file copy (can overwrite)
+		"mkdir ", "touch ", // create
+		"chmod ", "chown ", // permissions
+		">", ">>", // output redirection
 		"git push", "git commit", "git reset", "git checkout",
 		"npm install", "npm run", "yarn ", "pnpm ",
 		"pip install", "go install", "cargo build",

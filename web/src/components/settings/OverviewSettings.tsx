@@ -324,7 +324,7 @@ export function OverviewSettings({
   // CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST makes Claude Code drop provider vars that
   // come from ~/.claude/settings.json, so a base URL left behind by another proxy
   // tool cannot silently take routing back. Model slots set there are dropped too —
-  // the model comes from AniClew instead.
+  // the model comes from Corelay Code instead.
   const anthropicBaseEnv = `ANTHROPIC_BASE_URL=${runtimeBaseUrl} CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`;
   const powerShellLaunch = `$env:ANTHROPIC_BASE_URL="${runtimeBaseUrl}"; $env:CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST="1"; claude`;
   const isRuntimeOnline = runtime.status === "success" && Boolean(runtime.data);

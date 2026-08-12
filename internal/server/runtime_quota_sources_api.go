@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
 )
 
 type runtimeQuotaSourcesResponse struct {

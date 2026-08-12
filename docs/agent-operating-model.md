@@ -1,6 +1,6 @@
 # Agent Operating Model
 
-AniClew already has most of the operating discipline that newer agent harnesses
+Corelay Code already has most of the operating discipline that newer agent harnesses
 try to introduce: trust boundaries, plan mode, bounded execution, verification,
 memory, and skill extraction. The cleanup target is not more surface area. It is
 making the existing surface small, explicit, and auditable.
@@ -54,7 +54,7 @@ Related implementation:
 
 - `src/utils/messages.ts` in the TypeScript prototype uses
   `<recalled-context>` fencing.
-- `proxy-go/internal/agent/memory_hook.go` and `internal/memory` load long-term
+- `internal/agent/memory_hook.go` and `internal/memory` load long-term
   memory as background context.
 
 ### 2. Planning and execution are separate phases
@@ -82,7 +82,7 @@ For file-changing work, completion is backed by observable data:
 The loop writes JSON receipts under:
 
 ```text
-~/.aniclew/receipts/<workspace-key>/<timestamp>.json
+~/.corelay/receipts/<workspace-key>/<timestamp>.json
 ```
 
 Receipt schema:
@@ -111,7 +111,7 @@ secrets.
 Team and worker runs use the same workspace namespace and add a `team-` prefix:
 
 ```text
-~/.aniclew/receipts/<workspace-key>/team-<timestamp>.json
+~/.corelay/receipts/<workspace-key>/team-<timestamp>.json
 ```
 
 Team receipts record the run status, TeamPlan identity, provider/model,

@@ -1,0 +1,35 @@
+flowchart TD
+    A([Tool call from immutable catalog]) --> B{Known tool and valid schema?}
+    B -->|No| X[Typed denied or invalid result]
+    B -->|Yes| C[Normalize arguments and target paths]
+    C --> D{Permission decision}
+    D -->|Deny| X
+    D -->|Ask| E{Explicit approval granted?}
+    E -->|No| X
+    E -->|Yes| F{Security validators pass?}
+    D -->|Allow| F
+    F -->|No| X
+    F -->|Yes| G{Ownership and workspace scope pass?}
+    G -->|No| X
+    G -->|Yes| H{Required isolation is ready?}
+    H -->|No| X
+    H -->|Yes| I{Concurrency safe?}
+    I -->|Yes| J[Bounded parallel queue]
+    I -->|No| K[Serial queue]
+    J --> L[Bind final execution identity and proof]
+    K --> L
+    L --> S{Durable journal configured?}
+    S -->|No| T[Emit start and execute inside selected isolation]
+    S -->|Yes| U[Persist synchronous digest-only marker]
+    U --> V{Exact marker CAS succeeds?}
+    V -->|No| X
+    V -->|Yes| T
+    T --> M{Execution succeeds?}
+    M -->|Yes| N[Post-hook and success evidence]
+    M -->|No| O{Rollback available?}
+    O -->|Yes| P[Rollback mutation]
+    O -->|No| Q[Post-hook and error evidence]
+    P --> Q
+    X --> Q
+    N --> R([Return typed result])
+    Q --> R

@@ -1,8 +1,8 @@
-# AniClew
+# Corelay Code
 
 **Small models, finished work.**
 
-AniClew is a coding agent and control plane for models you run yourself. It is
+Corelay Code is a coding agent and control plane for models you run yourself. It is
 also a proxy: point an existing CLI at it to reach any provider through one
 endpoint, with account pooling and quota windows for hosted models.
 
@@ -60,12 +60,12 @@ any feature below.
 
 | | Own agent | Proxy |
 |---|---|---|
-| Entry | Web UI, `/api/agent` | `/v1/messages`, your CLI |
-| Owns the loop | AniClew | your CLI |
+| Entry | Web UI, built-in TUI (`corelaycode chat`), `/api/agent` | `/v1/messages`, your CLI |
+| Owns the loop | Corelay Code | your CLI |
 | Built for | models you host | any provider |
 | Gets the hardening below | yes | partly — request shaping and routing only |
 
-Everything in **Agent Hardening** happens inside AniClew's own loop. A CLI
+Everything in **Agent Hardening** happens inside Corelay Code's own loop. A CLI
 pointed at the proxy runs its own loop, so it sees translation, routing, tool
 pruning and retries — but not the edit repair or compaction.
 
@@ -102,7 +102,7 @@ router's job; this is what it takes to get one to *finish*.
 - **No silent hijack**: setting `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` makes the
   CLI ignore provider settings left in its own config by other proxy tools, so a
   stale base URL cannot quietly take routing back
-- **Auth passthrough**: CLI tools send their own API keys through AniClew transparently
+- **Auth passthrough**: CLI tools send their own API keys through Corelay Code transparently
 - **Runtime switching**: Change provider/model without restarting
 - **Smart retry**: Exponential backoff with jitter, 529 fallback model switching
 - **Smart router**: Auto-route requests by role (coding, review, chat)
@@ -112,7 +112,7 @@ router's job; this is what it takes to get one to *finish*.
 - **22 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
 - **115-command read-only allowlist**: Per-command flag validation for safe auto-approval
 - **Parallel tool execution**: Read-only tools run concurrently, write tools serial
-- **Verification receipts**: File-changing runs write compact JSON proof under `~/.aniclew/receipts/`
+- **Verification receipts**: File-changing runs write compact JSON proof under `~/.corelay/receipts/`
 
 ### Account & Quota Scheduling
 
@@ -138,8 +138,8 @@ Applies to hosted accounts; local models skip most of it.
 - **Resource-aware waves**: Team waves are internally batched by model/tool/web/test slots and file-scope locks
 - **Task routing**: TeamPlan tasks can override provider/model for role-specific execution
 - **Team dashboard**: The web Team page submits objectives, verification commands, capacity, per-task kind/role/provider/model, read-only mode, dependencies, file scopes, and resource reservations
-- **Plan CLI**: `aniclew team plan --objective "..." --out team-plan.json`, `aniclew team validate --plan team-plan.json`
-- **CLI worker/team**: `aniclew worker run --provider ollama --model qwen3:8b --task task.json` or `aniclew team run --plan team-plan.json`
+- **Plan CLI**: `corelaycode team plan --objective "..." --out team-plan.json`, `corelaycode team validate --plan team-plan.json`
+- **CLI worker/team**: `corelaycode worker run --provider ollama --model qwen3:8b --task task.json` or `corelaycode team run --plan team-plan.json`
 - **Team receipts**: Team and worker runs write `team-*.json` receipts with task status, provider/model, verification state, and output file pointers
 - **Wave execution**: Topological sort (Kahn's algorithm) for dependency-based parallelism
 - **File ownership**: Hard enforcement at ExecuteTool level
@@ -203,7 +203,7 @@ invariants, receipt schema, and cleanup direction.
 ### Option 1: Script (Mac/Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dannykkh/Ani-Clew/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dannykkh/corelay-code/main/install.sh | bash
 ```
 
 ### Option 2: Docker
@@ -212,50 +212,102 @@ curl -fsSL https://raw.githubusercontent.com/Dannykkh/Ani-Clew/main/install.sh |
 # With Ollama (local LLM)
 docker compose up -d
 
-# AniClew only (bring your own LLM)
-docker run -p 4000:4000 -v $(pwd):/workspace ghcr.io/dannykkh/aniclew
+# Corelay Code only (bring your own LLM)
+docker run -p 4000:4000 -v $(pwd):/workspace ghcr.io/dannykkh/corelaycode
 ```
 
 ### Option 3: Build from source
 
 ```bash
-git clone https://github.com/Dannykkh/Ani-Clew.git && cd Ani-Clew
+git clone https://github.com/Dannykkh/corelay-code.git && cd corelay-code
 make all    # builds frontend + backend
-./aniclew   # interactive provider select
+./corelaycode   # interactive provider select
 ```
+
+The build also produces the `corelaycode-acp` and `corelaycode-profile` helper
+executables.
 
 ### Option 4: Download binary
 
-Go to [Releases](https://github.com/Dannykkh/Ani-Clew/releases) and download for your platform.
+Go to [Releases](https://github.com/Dannykkh/corelay-code/releases) and download
+`corelaycode`, `corelaycode-acp`, and `corelaycode-profile` for your platform.
+The install script installs all three executables.
 
 ## Quick Start
 
 ```bash
 # Start with Ollama (local, free)
-./aniclew -provider ollama -model qwen3:14b
+./corelaycode -provider ollama -model qwen3:14b
 
 # Start with OpenAI
-OPENAI_API_KEY=sk-... ./aniclew -provider openai -model gpt-4o
+OPENAI_API_KEY=sk-... ./corelaycode -provider openai -model gpt-4o
 
 # Start with Anthropic
-ANTHROPIC_API_KEY=sk-ant-... ./aniclew -provider anthropic -model claude-sonnet-4-6-20250217
+ANTHROPIC_API_KEY=sk-ant-... ./corelaycode -provider anthropic -model claude-sonnet-4-6-20250217
 ```
 
 Browser opens at `http://localhost:4000/app`.
 
+### Built-in terminal UI
+
+Start Corelay Code in one terminal, then run the client from the project the agent
+should edit:
+
+```bash
+cd /path/to/project
+corelaycode chat
+# Explicit full-screen alias:
+corelaycode tui
+# Windows:
+.\corelaycode.exe chat
+```
+
+On an interactive terminal, `corelaycode chat` opens the full-screen Agent
+Workbench. It falls back to the line-oriented client when stdin/stdout is not a
+TTY or `TERM=dumb`; use `corelaycode chat -plain` to select line mode explicitly.
+One-shot use remains available with `corelaycode chat -p "..."`.
+
+When server authentication is enabled, prefer the environment variable so the
+token is not placed in shell history:
+
+```bash
+CORELAY_ACCESS_TOKEN=... corelaycode chat
+```
+
+`ANICLEW_ACCESS_TOKEN` remains available as a legacy fallback during migration.
+
+Sessions are saved before each agent turn. Use `corelaycode chat -session <id>` to
+open one directly, or `/sessions`, `/load`, `/new`, `/fork`, `/rename`,
+`/reconcile`, `/close`, and `/delete` inside the TUI.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Send or select |
+| `Ctrl+K` | Open the command palette |
+| `Ctrl+O` | List sessions |
+| `Ctrl+N` | Start a new session |
+| `PageUp` / `PageDown` | Scroll the transcript |
+| `End` | Follow the latest output |
+| `Esc` / `Ctrl+C` | Cancel the active run |
+| `Ctrl+Q` | Quit and restore the terminal |
+
+Approval requests are fail-closed: `A` allows once; `D`, `Esc`, or `Enter`
+denies. Interrupted sessions remain locked until their external side effects
+are explicitly reviewed and reconciled.
+
 ### Connect your CLI tools
 
 ```bash
-# Anthropic-compatible CLI → AniClew → any provider
+# Anthropic-compatible CLI → Corelay Code → any provider
 ANTHROPIC_BASE_URL=http://localhost:4000 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude
 
-# OpenAI-compatible CLI → AniClew → any provider
+# OpenAI-compatible CLI → Corelay Code → any provider
 OPENAI_BASE_URL=http://localhost:4000 codex
 ```
 
 ## Configuration
 
-`~/.aniclew/config.json`:
+`~/.corelay/config.json`:
 
 ```json
 {
@@ -271,6 +323,12 @@ OPENAI_BASE_URL=http://localhost:4000 codex
   }
 }
 ```
+
+Upgrades preserve existing state. Corelay Code prefers `~/.corelay` and
+`CORELAY_*` environment variables, while continuing to read the former
+`~/.aniclew`, `~/.claude-proxy`, and `ANICLEW_*` names as migration fallbacks.
+New installations and newly persisted protocol values use only the Corelay
+names.
 
 ## Architecture
 
@@ -298,7 +356,7 @@ OPENAI_BASE_URL=http://localhost:4000 codex
                         v
            Ollama  SGLang  Anthropic  OpenAI  ...
 
-  AniClew also runs:
+  Corelay Code also runs:
    +-- KAIROS Daemon (cron, git-watch)
    +-- Team (waves, mailbox, worktree)
    +-- Observability (traces, metrics, feedback)

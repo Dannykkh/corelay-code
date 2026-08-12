@@ -50,7 +50,7 @@ type Config struct {
 	// Agent-loop tuning for local models (Ollama/SGLang). Zero/absent values use
 	// built-in defaults; these only apply to local providers (cloud models keep
 	// their full toolset and provider-default sampling).
-	LocalToolBudget  int      `json:"localToolBudget,omitempty"`  // max tools sent to local models (0 → default 16; env ANICLEW_MAX_TOOLS overrides)
+	LocalToolBudget  int      `json:"localToolBudget,omitempty"`  // max tools sent to local models (0 → default 16; env CORELAY_MAX_TOOLS overrides; ANICLEW_MAX_TOOLS is legacy)
 	AgentTemperature *float64 `json:"agentTemperature,omitempty"` // sampling temperature for the local agent loop (absent → 0 for reliable tool calls)
 
 	// ReadOnlyExploreRounds bounds how many tool-using rounds a pure read-only
@@ -68,11 +68,12 @@ func DefaultConfig() Config {
 	}
 }
 
-// LegacyBaseDirName is the state directory this project used before it was its
-// own repository. Kept so existing installs are not orphaned.
+// BaseDirName is the canonical Corelay Code state directory. The legacy names
+// remain readable so a rename never strands an existing installation.
 const (
-	BaseDirName       = ".aniclew"
-	LegacyBaseDirName = ".claude-proxy"
+	BaseDirName            = ".corelay"
+	LegacyBaseDirName      = ".aniclew"
+	LegacyProxyBaseDirName = ".claude-proxy"
 )
 
 // BaseDir returns the directory holding config, receipts, undo snapshots and
@@ -80,9 +81,10 @@ const (
 //
 // An existing legacy directory wins over a non-existent new one: renaming the
 // default must not strand a user's history. New installs get BaseDirName. Set
-// ANICLEW_CONFIG_DIR to override both.
+// CORELAY_CONFIG_DIR to override discovery; ANICLEW_CONFIG_DIR remains a
+// compatibility fallback.
 func BaseDir() string {
-	if dir := strings.TrimSpace(os.Getenv("ANICLEW_CONFIG_DIR")); dir != "" {
+	if dir := renamedEnv("CORELAY_CONFIG_DIR", "ANICLEW_CONFIG_DIR"); dir != "" {
 		return dir
 	}
 	home, _ := os.UserHomeDir()
@@ -91,9 +93,11 @@ func BaseDir() string {
 	if _, err := os.Stat(current); err == nil {
 		return current
 	}
-	legacy := filepath.Join(home, LegacyBaseDirName)
-	if _, err := os.Stat(legacy); err == nil {
-		return legacy
+	for _, name := range []string{LegacyBaseDirName, LegacyProxyBaseDirName} {
+		legacy := filepath.Join(home, name)
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
 	}
 	return current
 }
@@ -102,7 +106,16 @@ func BaseDir() string {
 // legacy state directory. Used by the permission layer, which must recognise
 // both names for as long as the legacy one can still be in service.
 func IsBaseDirPath(path string) bool {
-	return strings.Contains(path, BaseDirName) || strings.Contains(path, LegacyBaseDirName)
+	return strings.Contains(path, BaseDirName) ||
+		strings.Contains(path, LegacyBaseDirName) ||
+		strings.Contains(path, LegacyProxyBaseDirName)
+}
+
+func renamedEnv(primary, legacy string) string {
+	if value := strings.TrimSpace(os.Getenv(primary)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(legacy))
 }
 
 func configDir() string {
@@ -140,6 +153,13 @@ func Save(cfg Config) error {
 
 func ConfigPath() string {
 	return configPath()
+}
+
+// CapabilityProfileDir is the process-wide root for immutable empirical model
+// profiles. CORELAY_CONFIG_DIR (or its ANICLEW_CONFIG_DIR compatibility
+// fallback) relocates all application state without a second path override.
+func CapabilityProfileDir() string {
+	return filepath.Join(BaseDir(), "capability-profiles")
 }
 
 func _() string { return runtime.GOOS } // keep import

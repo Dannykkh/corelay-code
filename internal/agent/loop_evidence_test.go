@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func TestRunLoopEvidenceMeasureRecordsWouldBlockReceipt(t *testing.T) {
@@ -30,8 +30,8 @@ func TestRunLoopEvidenceMeasureRecordsWouldBlockReceipt(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(workDir, "src", "app.data")); err != nil {
 		t.Fatalf("expected src/app.data to be written: %v\nevents:\n%s", err, eventDump(events))
 	}
-	if receipt.Verification.Status != "not-run" || receipt.Verification.Gate != EvidenceGateWouldBlock || receipt.Verification.Mode != EvidenceModeDeep {
-		t.Fatalf("verification = %+v, want not-run/would-block/deep", receipt.Verification)
+	if receipt.Verification.Status != "not-run" || receipt.Verification.TerminalState != EvidenceTerminalUnverified || receipt.Verification.Gate != EvidenceGateWouldBlock || receipt.Verification.Mode != EvidenceModeDeep {
+		t.Fatalf("verification = %+v, want not-run/unverified/would-block/deep", receipt.Verification)
 	}
 	if len(receipt.EditedFiles) != 1 || filepath.ToSlash(receipt.EditedFiles[0]) != "src/app.data" {
 		t.Fatalf("edited files = %+v", receipt.EditedFiles)
@@ -68,8 +68,8 @@ func TestRunLoopEvidenceBlockStopsUntilVerificationEvidence(t *testing.T) {
 	if !eventTextContains(events, "Evidence gate blocked completion") {
 		t.Fatalf("events did not report block gate: %+v", events)
 	}
-	if receipt.Verification.Status != "passed" || receipt.Verification.Source != "tool" || receipt.Verification.Gate != EvidenceGateAllow {
-		t.Fatalf("verification = %+v, want passed/tool/allow", receipt.Verification)
+	if receipt.Verification.Status != "passed" || receipt.Verification.TerminalState != EvidenceTerminalVerified || receipt.Verification.Source != "tool" || receipt.Verification.Gate != EvidenceGateAllow {
+		t.Fatalf("verification = %+v, want passed/verified/tool/allow", receipt.Verification)
 	}
 	if receipt.Verification.Command != "echo verify ok" || len(receipt.Verification.Evidence) != 1 {
 		t.Fatalf("verification evidence not preserved: %+v", receipt.Verification)
@@ -79,10 +79,10 @@ func TestRunLoopEvidenceBlockStopsUntilVerificationEvidence(t *testing.T) {
 func isolateEvidenceLoopTest(t *testing.T) string {
 	t.Helper()
 	configDir := t.TempDir()
-	t.Setenv("ANICLEW_CONFIG_DIR", configDir)
-	t.Setenv("ANICLEW_MEMORY", "off")
-	t.Setenv("ANICLEW_AUTOSKILL", "off")
-	t.Setenv("ANICLEW_AUTOVERIFY", "off")
+	t.Setenv("CORELAY_CONFIG_DIR", configDir)
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
 	return configDir
 }
 
@@ -192,6 +192,14 @@ func (p *scriptedLoopProvider) StreamMessage(context.Context, *types.MessagesReq
 	ch := make(chan types.SSEEvent, 8)
 	go func() {
 		defer close(ch)
+		if step.text != "" {
+			ch <- types.SSEEvent{Type: "content_block_start", ContentBlock: mustJSON(map[string]string{"type": "text"})}
+			ch <- types.SSEEvent{Type: "content_block_delta", Delta: mustJSON(map[string]string{
+				"type": "text_delta",
+				"text": step.text,
+			})}
+			ch <- types.SSEEvent{Type: "content_block_stop"}
+		}
 		if step.toolName != "" {
 			ch <- types.SSEEvent{Type: "content_block_start", ContentBlock: mustJSON(map[string]string{
 				"type": "tool_use",
@@ -207,12 +215,6 @@ func (p *scriptedLoopProvider) StreamMessage(context.Context, *types.MessagesReq
 			ch <- types.SSEEvent{Type: "message_stop"}
 			return
 		}
-		ch <- types.SSEEvent{Type: "content_block_start", ContentBlock: mustJSON(map[string]string{"type": "text"})}
-		ch <- types.SSEEvent{Type: "content_block_delta", Delta: mustJSON(map[string]string{
-			"type": "text_delta",
-			"text": step.text,
-		})}
-		ch <- types.SSEEvent{Type: "content_block_stop"}
 		ch <- types.SSEEvent{Type: "message_delta", Delta: mustJSON(map[string]string{"stop_reason": "end_turn"})}
 		ch <- types.SSEEvent{Type: "message_stop"}
 	}()
@@ -226,4 +228,10 @@ func toolUseStep(id, name string, input any) scriptedLoopStep {
 
 func textStep(text string) scriptedLoopStep {
 	return scriptedLoopStep{text: text}
+}
+
+func textAndToolUseStep(text, id, name string, input any) scriptedLoopStep {
+	step := toolUseStep(id, name, input)
+	step.text = text
+	return step
 }

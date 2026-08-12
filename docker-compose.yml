@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ── Ollama: Local LLM server ──
   ollama:
@@ -16,14 +14,14 @@ services:
             - capabilities: [gpu]  # Remove if no GPU
     restart: unless-stopped
 
-  # ── AniClew: LLM Harness ──
-  aniclew:
+  # ── Corelay Code: LLM Harness ──
+  corelaycode:
     build: .
-    container_name: aniclew
+    container_name: corelaycode
     ports:
       - "4000:4000"
     volumes:
-      - aniclew-data:/root/.claude-proxy
+      - corelaycode-data:/root/.corelay
       - ./:/workspace  # Mount your project here
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
@@ -38,4 +36,4 @@ services:
 
 volumes:
   ollama-models:
-  aniclew-data:
+  corelaycode-data:

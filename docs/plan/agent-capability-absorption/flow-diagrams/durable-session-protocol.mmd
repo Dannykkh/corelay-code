@@ -1,0 +1,85 @@
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Adapter as HTTP or ACP Adapter
+    participant Store as Durable Session Store
+    participant Kernel as Agent Kernel
+    participant Provider
+    participant Safety as Tool Safety Pipeline
+    participant Observer as Durable Run Observer
+    participant Evidence as Evidence and Receipt
+
+    Client->>Adapter: Create, load, resume, or fork
+    Adapter->>Adapter: Validate opaque ID and workspace boundary
+    Adapter->>Store: Load exact revision or apply lifecycle transition
+    alt Invalid, corrupt, stale, or reconciliation-required
+        Store-->>Adapter: Typed session error
+        Adapter-->>Client: Fail before provider call
+    else Exact active snapshot
+        Store-->>Adapter: Snapshot and revision
+        Adapter->>Observer: Bind session, run ID, and revision
+        Adapter->>Kernel: Canonical history, policy, and synchronous journal
+
+        loop Bounded kernel iterations
+            Kernel->>Provider: Profile-adapted request
+            Provider-->>Kernel: Canonical bounded stream
+            Kernel-->>Observer: Bounded assistant text
+            opt Response contains tool calls
+                Kernel->>Safety: Validate schema, permission, approval, sandbox
+                alt Authorization, identity, or proof fails
+                    Safety-->>Kernel: Typed denied result
+                else Authorized immutable call
+                    Safety->>Adapter: Journal ID, name, input digest, and run ID
+                    Adapter->>Store: Mark first or exact-CAS update aggregate marker
+                    alt Journal persistence fails or revision is stale
+                        Store-->>Adapter: Typed persistence or CAS error
+                        Adapter-->>Safety: Content-free journal failure
+                        Safety-->>Kernel: Fail before start event and executor
+                    else Write-ahead marker is durable
+                        Store-->>Adapter: Guarded revision and exact marker
+                        Adapter-->>Safety: Journal acknowledged
+                        Safety-->>Observer: tool_execution_start after durable write
+                        Safety->>Safety: Execute inside selected isolation
+                        Safety-->>Kernel: Typed result or execution error
+                        Kernel-->>Observer: Bounded redacted tool result
+                    end
+                end
+            end
+        end
+
+        alt Successful terminal
+            Kernel-->>Observer: completed terminal and evidence state
+            Observer->>Observer: Freeze ordered transcript and latest marker
+            alt Run has a journal marker
+                Adapter->>Store: CommitInterruptedRun with revision and exact marker
+                Note over Adapter,Store: One CAS commits transcript and terminal and clears lifecycle marker
+            else No tool execution began
+                Adapter->>Store: SaveExpected transcript and terminal
+            end
+            alt Commit succeeds
+                Store-->>Adapter: Active session at new revision
+                Kernel->>Evidence: Redacted evidence and artifact digests
+                Adapter-->>Client: Durable revision before success
+            else Commit fails
+                Store-->>Adapter: Typed persistence or CAS error
+                Adapter->>Adapter: Quarantine runtime; durable marker remains when present
+                Adapter-->>Client: Typed durable session error
+            end
+        else Cancel, failure, disconnect, or process hard-exit
+            opt Process remains alive for graceful finalization
+                Observer->>Adapter: Applied or may-have-applied aggregate marker
+                Adapter->>Store: Exact-CAS enrich current run marker
+            end
+            Note over Store: Hard exit skips terminal commit; the write-ahead marker remains on disk
+            Adapter-->>Client: Failure when transport remains
+        end
+    end
+
+    Client->>Adapter: Fresh-process load or resume
+    Adapter->>Store: Read durable lifecycle
+    Store-->>Adapter: Reconciliation required with digest-only marker
+    Adapter-->>Client: Block before provider call
+    Client->>Adapter: Explicit reconciliation at exact revision
+    Adapter->>Store: MarkReconciled
+    Store-->>Adapter: Active session at new revision
+    Adapter-->>Client: Continuation may start without replay

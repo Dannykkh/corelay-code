@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ABTestConfig configures model A/B testing.

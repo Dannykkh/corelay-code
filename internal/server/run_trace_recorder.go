@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/observability"
 )
 
 type compositeRunRecorder struct {
@@ -90,9 +90,10 @@ func (r *observabilityRunRecorder) RunStarted() {
 func (r *observabilityRunRecorder) ReceiptWritten(path string, receipt agent.AgentReceipt) {
 	r.RunSpanStarted("receipt", "agent.receipt", map[string]string{"path": path})
 	r.RunSpanCompleted("receipt", "ok", map[string]string{
-		"provider":     receipt.Provider,
-		"model":        receipt.Model,
-		"verification": receipt.Verification.Status,
+		"provider":      receipt.Provider,
+		"model":         receipt.Model,
+		"verification":  receipt.Verification.Status,
+		"terminalState": receipt.Verification.TerminalState,
 	})
 }
 
@@ -101,8 +102,9 @@ func (r *observabilityRunRecorder) RunCompleted(summary agent.RunSummary) {
 	defer r.mu.Unlock()
 	now := time.Now().UTC()
 	r.completeSpanLocked("run", "ok", map[string]string{
-		"iterations":   fmt.Sprintf("%d", summary.Iterations),
-		"verification": summary.Verification.Status,
+		"iterations":    fmt.Sprintf("%d", summary.Iterations),
+		"verification":  summary.Verification.Status,
+		"terminalState": summary.Verification.TerminalState,
 	})
 	r.trace.EndedAt = now
 	r.trace.DurationMs = now.Sub(r.trace.StartedAt).Milliseconds()
@@ -118,6 +120,7 @@ func (r *observabilityRunRecorder) RunCompleted(summary agent.RunSummary) {
 	r.trace.Metadata["iterations"] = fmt.Sprintf("%d", summary.Iterations)
 	r.trace.Metadata["editedFiles"] = strings.Join(summary.EditedFiles, ",")
 	r.trace.Metadata["verification"] = summary.Verification.Status
+	r.trace.Metadata["terminalState"] = summary.Verification.TerminalState
 	r.trace.Metadata["receipt"] = summary.ReceiptPath
 	if r.tracker != nil {
 		r.tracker.RecordRun(r.trace)

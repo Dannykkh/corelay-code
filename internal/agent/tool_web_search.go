@@ -195,7 +195,7 @@ func defaultSearchProviderNames() []string {
 			names = append(names, name)
 		}
 	}
-	if truthyEnv("ANICLEW_ENABLE_YAHOO_SEARCH") {
+	if truthyEnv("CORELAY_ENABLE_YAHOO_SEARCH", "ANICLEW_ENABLE_YAHOO_SEARCH") {
 		names = append(names, "yahoo")
 	}
 	return names
@@ -274,7 +274,7 @@ func (googleSearchProvider) Configured() bool {
 	return googleSearchAPIKey() != "" && googleSearchEngineID() != ""
 }
 func (googleSearchProvider) Search(ctx context.Context, opts webSearchOptions) ([]webSearchResult, error) {
-	base := coalesceString(os.Getenv("ANICLEW_GOOGLE_SEARCH_URL"), "https://www.googleapis.com/customsearch/v1")
+	base := coalesceString(renamedAgentEnv("CORELAY_GOOGLE_SEARCH_URL", "ANICLEW_GOOGLE_SEARCH_URL"), "https://www.googleapis.com/customsearch/v1")
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, err
@@ -352,7 +352,7 @@ func (naverBlogSearchProvider) Search(ctx context.Context, opts webSearchOptions
 }
 
 func naverSearch(ctx context.Context, opts webSearchOptions, kind string) ([]webSearchResult, error) {
-	base := coalesceString(os.Getenv("ANICLEW_NAVER_SEARCH_URL"), "https://openapi.naver.com/v1/search/"+kind+".json")
+	base := coalesceString(renamedAgentEnv("CORELAY_NAVER_SEARCH_URL", "ANICLEW_NAVER_SEARCH_URL"), "https://openapi.naver.com/v1/search/"+kind+".json")
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, err
@@ -473,7 +473,7 @@ func (bingSearchProvider) Search(ctx context.Context, opts webSearchOptions) ([]
 func (yahooSearchProvider) Name() string     { return "yahoo" }
 func (yahooSearchProvider) Configured() bool { return true }
 func (yahooSearchProvider) Search(ctx context.Context, opts webSearchOptions) ([]webSearchResult, error) {
-	base := coalesceString(os.Getenv("ANICLEW_YAHOO_SEARCH_URL"), "https://search.yahoo.com/search")
+	base := coalesceString(renamedAgentEnv("CORELAY_YAHOO_SEARCH_URL", "ANICLEW_YAHOO_SEARCH_URL"), "https://search.yahoo.com/search")
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, err
@@ -850,8 +850,12 @@ func naverClientSecret() string {
 	return coalesceString(os.Getenv("NAVER_CLIENT_SECRET"), os.Getenv("X_NAVER_CLIENT_SECRET"))
 }
 
-func truthyEnv(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+func truthyEnv(name string, legacy ...string) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" && len(legacy) > 0 {
+		value = renamedAgentEnv(name, legacy[0])
+	}
+	switch strings.ToLower(value) {
 	case "1", "true", "yes", "on":
 		return true
 	default:

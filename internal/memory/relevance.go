@@ -12,7 +12,7 @@ import (
 // The scorer is intentionally simple: a Jaccard-like overlap over
 // lowercase word sets, normalized by the geometric mean of the two set
 // sizes so that short queries are not over-rewarded against long bodies.
-// This is the same class of signal AniClew's internal/agent/rag.go already
+// This is the same class of signal Corelay Code's internal/agent/rag.go already
 // uses for code retrieval — good enough to pull the top few memory
 // entries for a system prompt without the opacity of an embedding-based
 // approach. Rank is exported so future upgrades (embeddings, BM25) can

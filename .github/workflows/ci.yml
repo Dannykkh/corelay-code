@@ -7,6 +7,34 @@ on:
     branches: [main]
 
 jobs:
+  test:
+    name: Go test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install Linux sandbox backend
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Test all packages
+        run: go test ./... -count=1
+
+      - name: Repeat platform sandbox contracts
+        run: go test ./internal/sandbox ./internal/processsupervisor -count=3
+
+      - name: Vet
+        run: go vet ./...
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -17,10 +45,26 @@ jobs:
           go-version: '1.22'
 
       - name: Build
-        run: go build ./cmd/proxy/
+        run: go build ./...
 
       - name: Vet
         run: go vet ./...
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install Linux sandbox backend
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Race-test concurrent runtime boundaries
+        run: go test -race ./internal/approval ./internal/agent ./internal/acpbridge ./internal/server -count=1
 
   web:
     runs-on: ubuntu-latest
@@ -29,5 +73,11 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      - name: Install & Build
-        run: cd web && bun install && bun run build
+      - name: Install
+        run: cd web && bun install --frozen-lockfile
+
+      - name: Lint
+        run: cd web && bun run lint
+
+      - name: Build
+        run: cd web && bun run build

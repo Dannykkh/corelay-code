@@ -52,7 +52,7 @@ export function ActivityBar({ active, onNavigate, onThemeToggle, theme }: Props)
 
   return (
     <div className="w-12 bg-[var(--color-surface)] border-r border-[var(--color-border)] flex flex-col items-center py-2 shrink-0 h-[calc(100vh-24px)] sticky top-0">
-      <div className="w-7 h-7 rounded-md bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-[10px] font-bold mb-4">A</div>
+      <div className="w-7 h-7 rounded-md bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-[10px] font-bold mb-4">C</div>
 
       <div className="flex-1 flex flex-col items-center gap-0.5">
         {top.map((item) => (

@@ -3,25 +3,31 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/hooks"
-	"github.com/aniclew/aniclew/internal/translate"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/capabilityprofile"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/harness"
+	"github.com/Dannykkh/corelay-code/internal/hooks"
+	"github.com/Dannykkh/corelay-code/internal/processsupervisor"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
+	"github.com/Dannykkh/corelay-code/internal/translate"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // defaultLocalToolBudget caps the tool count for local providers (Ollama,
 // SGLang) whose context windows are small. 16 keeps the 8 core file/exec tools
 // plus the 8 most task-relevant extras — enough for real coding work while
 // roughly halving the tool-definition tokens in the system prompt. Overridable
-// via config (localToolBudget) or env (ANICLEW_MAX_TOOLS).
+// via config (localToolBudget) or env (CORELAY_MAX_TOOLS; legacy
+// ANICLEW_MAX_TOOLS remains supported).
 const defaultLocalToolBudget = 16
 
 // defaultLocalTemperature is the sampling temperature for the local agent loop.
@@ -68,7 +74,10 @@ func iterationWeight(toolUses []toolUseBlock) float64 {
 
 // planModeTools is the read-only tool surface allowed in plan mode: the agent
 // explores but cannot change anything, so it produces a plan instead of acting.
-var planModeTools = map[string]bool{"Read": true, "Glob": true, "Grep": true, "LS": true}
+var planModeTools = map[string]bool{
+	"Read": true, "Glob": true, "Grep": true, "LS": true,
+	loadToolResultToolName: true, reportCompletionToolName: true,
+}
 
 // filterReadOnlyTools keeps only the read-only tools used by plan mode.
 func filterReadOnlyTools(tools []types.ToolDef) []types.ToolDef {
@@ -79,6 +88,38 @@ func filterReadOnlyTools(tools []types.ToolDef) []types.ToolDef {
 		}
 	}
 	return out
+}
+
+func renderToolResultInventory(references []ToolResultReference) string {
+	if len(references) == 0 {
+		return ""
+	}
+	verified := make([]ToolResultReference, 0, len(references))
+	seen := make(map[string]struct{}, len(references))
+	for _, reference := range references {
+		digest := normalizeResultID(reference.ID)
+		if !validResultDigest(digest) || reference.Digest != "sha256:"+digest || reference.Size <= 0 {
+			continue
+		}
+		id := "result_" + digest
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		reference.ID = id
+		verified = append(verified, reference)
+	}
+	if len(verified) == 0 {
+		return ""
+	}
+	sort.Slice(verified, func(i, j int) bool { return verified[i].ID < verified[j].ID })
+	var builder strings.Builder
+	builder.WriteString("\n\n## Available durable tool results\n")
+	builder.WriteString("These IDs are referenced by the committed session transcript and verified in this workspace. Use LoadToolResult with offset/limit to read bounded chunks.\n")
+	for _, reference := range verified {
+		fmt.Fprintf(&builder, "- %s (%d bytes, %s)\n", reference.ID, reference.Size, reference.Digest)
+	}
+	return strings.TrimRight(builder.String(), "\n")
 }
 
 // editIntentWords mark a request that wants the agent to CHANGE something. Their
@@ -220,7 +261,7 @@ func startHeartbeat(eventCh chan<- Event, outChars *int64) (stop func()) {
 	}
 }
 
-const baseSystemPrompt = `You are AniClew, an expert coding agent. You act by CALLING TOOLS, not by describing actions.
+const baseSystemPrompt = `You are Corelay Code, an expert coding agent. You act by CALLING TOOLS, not by describing actions.
 
 ## Acting vs. talking (read this first)
 The ONLY way to change the filesystem, run code, or inspect the project is to emit a tool call. Writing code or commands in your reply text does NOTHING — no file is created, nothing runs.
@@ -268,10 +309,247 @@ var langReminders = map[string]string{
 // langReminder returns the recency reminder for a response language ("" if none).
 func langReminder(responseLang string) string { return langReminders[responseLang] }
 
+type resolvedRunHarness struct {
+	Profile harness.HarnessProfile
+	Label   string
+	Matched bool
+}
+
+func resolveRunHarness(
+	provider types.Provider,
+	model string,
+	override *harness.HarnessProfile,
+	cfg config.Config,
+	environmentToolBudget int,
+) (resolvedRunHarness, error) {
+	return resolveRunHarnessWithCapability(
+		provider,
+		model,
+		override,
+		cfg,
+		environmentToolBudget,
+		nil,
+		time.Now(),
+	)
+}
+
+func resolveRunHarnessWithCapability(
+	provider types.Provider,
+	model string,
+	override *harness.HarnessProfile,
+	cfg config.Config,
+	environmentToolBudget int,
+	empirical *capabilityprofile.AutomaticSelection,
+	now time.Time,
+) (resolvedRunHarness, error) {
+	if override != nil {
+		profile := *override
+		if !profile.Valid() {
+			return resolvedRunHarness{}, fmt.Errorf("explicit HarnessProfile is unresolved")
+		}
+		return resolvedRunHarness{
+			Profile: profile,
+			Label:   profile.ID(),
+			Matched: true,
+		}, nil
+	}
+
+	local := isLocalProvider(provider.Name())
+	var base harness.HarnessProfile
+	label := "provider-default"
+	matched := false
+	if local {
+		legacy, legacyMatched := profileFor(model)
+		base = legacy.HarnessProfile()
+		label = legacy.name
+		matched = legacyMatched
+	} else {
+		id := strings.TrimSpace(provider.Name())
+		if id == "" {
+			id = "provider"
+		}
+		var err error
+		base, err = harness.ResolveProfile(harness.ProfileSpec{
+			ID: id + "-default",
+		})
+		if err != nil {
+			return resolvedRunHarness{}, err
+		}
+		label = base.ID()
+	}
+
+	explicitToolBudget := 0
+	if environmentToolBudget > 0 {
+		explicitToolBudget = environmentToolBudget
+	} else if local && cfg.LocalToolBudget > 0 {
+		explicitToolBudget = cfg.LocalToolBudget
+	}
+
+	explicitTemperature := harness.OptionalFloat64{}
+	if local && cfg.AgentTemperature != nil {
+		explicitTemperature = harness.SomeFloat64(*cfg.AgentTemperature)
+	}
+
+	info, hasModelInfo := providerModelInfo(provider, model)
+	modelContextWindow := 0
+	modelOutputLimit := 0
+	if hasModelInfo {
+		if info.ContextWindow > 0 {
+			modelContextWindow = info.ContextWindow
+		}
+		if info.MaxOutput > 0 {
+			modelOutputLimit = info.MaxOutput
+		}
+	}
+	composition, err := harness.ComposeProfile(harness.CompositionInput{
+		Base:                base,
+		ProviderName:        strings.TrimSpace(provider.Name()),
+		Model:               strings.TrimSpace(model),
+		Now:                 now,
+		ModelContextWindow:  modelContextWindow,
+		ModelOutputLimit:    modelOutputLimit,
+		Empirical:           empirical,
+		ExplicitToolBudget:  explicitToolBudget,
+		ExplicitTemperature: explicitTemperature,
+	})
+	if err != nil {
+		return resolvedRunHarness{}, fmt.Errorf("resolve run HarnessProfile: %w", err)
+	}
+	if composition.EmpiricalApplied {
+		label = "empirical:" + composition.EmpiricalProfileID
+		matched = true
+	}
+	return resolvedRunHarness{Profile: composition.Profile, Label: label, Matched: matched}, nil
+}
+
+func providerModelInfo(provider types.Provider, model string) (types.ModelInfo, bool) {
+	for _, info := range provider.Models() {
+		if strings.EqualFold(strings.TrimSpace(info.ID), strings.TrimSpace(model)) {
+			return info, true
+		}
+	}
+	return types.ModelInfo{}, false
+}
+
+func renderRunPlanAnchor(
+	profile harness.HarnessProfile,
+	anchor *PlanAnchor,
+) (string, error) {
+	if profile.PlanAnchorMode() == harness.PlanAnchorOff {
+		return "", nil
+	}
+	if anchor == nil {
+		return "", fmt.Errorf(
+			"HarnessProfile %q requires a PlanAnchor",
+			profile.ID(),
+		)
+	}
+	return anchor.Render(profile.PlanAnchorMode())
+}
+
+func appendPromptPolicy(base, suffix, planAnchor string) string {
+	for _, section := range []string{suffix, planAnchor} {
+		if section = strings.TrimSpace(section); section != "" {
+			base += "\n\n" + section
+		}
+	}
+	return base
+}
+
+func requestMaxTokens(profile harness.HarnessProfile) int {
+	const existingDefault = 8192
+	if reserve := profile.OutputReserve(); reserve > 0 && reserve < existingDefault {
+		return reserve
+	}
+	return existingDefault
+}
+
+func shouldCompactForHarness(
+	profile harness.HarnessProfile,
+	compactFailures int,
+	currentTokens int,
+) bool {
+	if !profile.Valid() || compactFailures >= maxCompactFailures {
+		return false
+	}
+	usable, err := profile.UsableInputTokens(0, 0)
+	if err != nil {
+		return true
+	}
+	margin := compactMargin
+	if margin >= usable {
+		margin = usable / 10
+	}
+	threshold := usable - margin
+	return currentTokens > threshold
+}
+
+func estimateRequestTokens(
+	messages []types.Message,
+	systemPrompt string,
+	tools []types.ToolDef,
+) int {
+	estimate, err := (ConservativeTokenEstimator{}).EstimateTokens(ContextEstimateRequest{
+		Protocol: harness.WireAuto,
+		Request: types.MessagesRequest{
+			System:   mustJSON([]map[string]string{{"type": "text", "text": systemPrompt}}),
+			Messages: messages,
+			Tools:    tools,
+		},
+	})
+	if err != nil {
+		return 0
+	}
+	return estimate.InputTokens + estimate.ProtocolOverheadTokens
+}
+
 // Event is sent to the client via SSE during the agent loop.
 type Event struct {
 	Type string      `json:"type"`
 	Data interface{} `json:"data,omitempty"`
+}
+
+// ContextBlockedEvent is the typed compatibility event emitted before the
+// common terminal done frame. Plan contains budget metadata only; Message is
+// sanitized and bounded before it reaches clients/recorders.
+type ContextBlockedEvent struct {
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Plan    ContextPlan `json:"plan"`
+}
+
+func emitContextBlocked(
+	eventCh chan<- Event,
+	terminal *runTerminalFinalizer,
+	recorder RunRecorder,
+	plan ContextPlan,
+	code string,
+	message string,
+) {
+	if code == "" {
+		code = "context_blocked"
+	}
+	message = sanitizeSnapshotText(message, 1000)
+	if message == "" {
+		message = "The completed request cannot fit the selected model context window."
+	}
+	plan.Blocked = true
+	plan.BlockCode = code
+	plan.Fits = false
+	plan.NeedsCompaction = false
+	recordContextPlan(recorder, plan)
+	eventCh <- Event{Type: "context_blocked", Data: ContextBlockedEvent{
+		Code:    code,
+		Message: message,
+		Plan:    plan,
+	}}
+	eventCh <- Event{Type: "error", Data: message}
+	terminal.Fail(
+		RunTerminalContextBlocked,
+		code,
+		message,
+		map[string]interface{}{"contextCode": code},
+	)
 }
 
 // RunLoop executes the agent loop: prompt → LLM → tool_use → execute → repeat.
@@ -287,6 +565,23 @@ func RunLoop(
 	RunLoopWithOptions(ctx, provider, model, userMessages, workDir, RunOptions{ResponseLang: responseLang}, eventCh)
 }
 
+// isExplicitUndoRequest defines the consent boundary for /undo. Only an exact
+// top-level role=user slash command qualifies. Team workers are excluded
+// because their role=user prompt is generated by the orchestrator/model, and
+// assistant or tool-result messages cannot trigger this pre-loop branch.
+func isExplicitUndoRequest(messages []types.Message, opts RunOptions) bool {
+	if len(messages) == 0 || strings.TrimSpace(opts.WorkerID) != "" || opts.RunMode != nil {
+		return false
+	}
+	lastMessage := messages[len(messages)-1]
+	if lastMessage.Role != "user" {
+		return false
+	}
+	var command string
+	return json.Unmarshal(lastMessage.Content, &command) == nil &&
+		strings.EqualFold(strings.TrimSpace(command), "/undo")
+}
+
 func RunLoopWithOptions(
 	ctx context.Context,
 	provider types.Provider,
@@ -296,7 +591,8 @@ func RunLoopWithOptions(
 	opts RunOptions,
 	eventCh chan<- Event,
 ) {
-	defer close(eventCh)
+	terminal := newRunTerminalFinalizer(eventCh, opts.Recorder)
+	defer terminal.Finalize()
 
 	responseLang := opts.ResponseLang
 	if responseLang == "" {
@@ -305,27 +601,246 @@ func RunLoopWithOptions(
 
 	messages := make([]types.Message, len(userMessages))
 	copy(messages, userMessages)
+	interactiveDirectives := strings.TrimSpace(opts.WorkerID) == "" && opts.RunMode == nil
 
-	// /undo: revert the agent's most recent edits, then stop (no LLM call).
-	if len(messages) > 0 {
-		var last string
-		if json.Unmarshal(messages[len(messages)-1].Content, &last) == nil &&
-			strings.EqualFold(strings.TrimSpace(last), "/undo") {
-			if reverted, ok := undoCheckpoint(workDir); ok {
-				eventCh <- Event{Type: "text", Data: "되돌렸습니다:\n- " + strings.Join(reverted, "\n- ")}
+	// /undo is an explicit user-consent command. It is handled before any model
+	// call, but only after the role/worker boundary above has rejected messages
+	// that a model, tool result, or team orchestrator could have produced.
+	if isExplicitUndoRequest(messages, opts) {
+		reverted, ok, err := undoCheckpointSecure(workDir)
+		if err != nil {
+			log.Printf("[Agent] /undo safety validation failed: %v", err)
+			if ok {
+				eventCh <- Event{Type: "text", Data: "되돌렸지만 체크포인트 정리에 실패했습니다:\n- " + strings.Join(reverted, "\n- ")}
 			} else {
-				eventCh <- Event{Type: "text", Data: "되돌릴 변경이 없습니다."}
+				eventCh <- Event{Type: "text", Data: "안전 검증에 실패하여 변경을 되돌리지 않았습니다."}
 			}
-			eventCh <- Event{Type: "done", Data: nil}
+		} else if ok {
+			eventCh <- Event{Type: "text", Data: "되돌렸습니다:\n- " + strings.Join(reverted, "\n- ")}
+		} else {
+			eventCh <- Event{Type: "text", Data: "되돌릴 변경이 없습니다."}
+		}
+		terminal.Complete(
+			RunTerminalCommand,
+			"undo",
+			RunTerminalDurableNone,
+			nil,
+			RunSummary{},
+		)
+		return
+	}
+
+	cfg := config.Load()
+	runHarness, err := resolveRunHarnessWithCapability(
+		provider,
+		model,
+		opts.HarnessProfile,
+		cfg,
+		translate.ToolBudget(),
+		opts.CapabilityProfile,
+		time.Now(),
+	)
+	if err != nil {
+		message := "HarnessProfile resolution failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "harness_resolution_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	compiledHarness := runHarness.Profile
+	runModeSystemSuffix, err := resolveRunMode(opts.RunMode)
+	if err != nil {
+		message := "Run mode resolution failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "run_mode_resolution_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	maxIterations, err := effectiveRunIterationLimit(compiledHarness, opts.IterationLimit)
+	if err != nil {
+		message := "Run mode resolution failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "iteration_limit_resolution_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	sandboxRunner, sandboxPolicy, err := resolveRunSandboxExecution(opts, workDir)
+	if err != nil {
+		message := "Sandbox configuration failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "sandbox_configuration_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	planAnchorPrompt, err := renderRunPlanAnchor(compiledHarness, opts.PlanAnchor)
+	if err != nil {
+		message := "PlanAnchor resolution failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "plan_anchor_resolution_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	activeRunID := newActiveRunID()
+	evidence := NewEvidenceLedger(lastUserText(userMessages), opts.EvidencePolicy)
+	completionContract, err := newRunCompletionContract(
+		compiledHarness,
+		opts.PlanAnchor,
+		activeRunID,
+		opts.CompletionEvidenceNotRequiredCriteria(),
+	)
+	if err != nil {
+		message := "CompletionContract resolution failed: " + sanitizeSnapshotText(err.Error(), 1000)
+		terminal.Fail(RunTerminalFailed, "completion_contract_resolution_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	if completionContract != nil {
+		if bindErr := evidence.BindCompletionRun(activeRunID); bindErr != nil {
+			message := "Completion evidence binding failed"
+			terminal.Fail(RunTerminalFailed, "completion_evidence_binding_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
 			return
 		}
 	}
-
-	tools := AllToolDefs(workDir)
-	toolExecOptions := ToolExecutionOptions{
-		WorkerID:         opts.WorkerID,
-		OwnershipChecker: opts.OwnershipChecker,
+	activePlanStep := ""
+	if opts.PlanAnchor != nil {
+		activePlanStep = opts.PlanAnchor.CurrentStep()
 	}
+
+	// Connect before catalog construction so the first model request sees the
+	// exact MCP definitions bound to this run's live executor generation. No
+	// process-global client registry participates in this composition.
+	mcpConfigDetected := false
+	mcpExecution := DefaultMCPExecutionOptions(ctx, workDir)
+	if opts.MCPExecution != nil {
+		mcpExecution = *opts.MCPExecution
+		mcpExecution.Context = ctx
+	}
+	var mcpReportsMu sync.Mutex
+	var mcpReports []processsupervisor.Report
+	configuredObserver := mcpExecution.ObserveStart
+	mcpExecution.ObserveStart = func(report processsupervisor.Report) {
+		if configuredObserver != nil {
+			configuredObserver(report)
+		}
+		mcpReportsMu.Lock()
+		mcpReports = append(mcpReports, report)
+		mcpReportsMu.Unlock()
+		recordMCPExecution(opts.Recorder, report)
+		eventCh <- Event{Type: "mcp_process", Data: report}
+	}
+	var runMCP = opts.MCPRuntime
+	ownedRunMCP := false
+	mcpGeneration := ""
+	var mcpServers []MCPServerSpec
+	var mcpErr error
+	if runMCP != nil {
+		if opts.MCPServers != nil || !opts.DisableWorkspaceMCP {
+			message := "MCP configuration failed: borrowed runtime cannot be merged with another MCP authority"
+			terminal.Fail(RunTerminalFailed, "mcp_configuration_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		mcpConfigDetected = true
+	} else {
+		var configured bool
+		mcpServers, configured, mcpErr = resolveRunMCPServerSpecs(opts, workDir)
+		mcpConfigDetected = configured
+		if mcpErr != nil {
+			message := "MCP configuration failed: " + mcpErr.Error()
+			terminal.Fail(RunTerminalFailed, "mcp_configuration_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+	}
+	if runMCP == nil && len(mcpServers) > 0 {
+		factory := opts.MCPRuntimeFactory
+		if factory == nil {
+			factory = NewMCPRuntime
+		}
+		runMCP, mcpErr = factory(ctx, workDir, cloneMCPServerSpecs(mcpServers), mcpExecution)
+		if mcpErr != nil || runMCP == nil {
+			// Runtime factories receive secret-bearing process specs. Never copy
+			// their error text into an event, recorder, receipt, or trace.
+			message := "MCP connection failed: secure stdio runtime unavailable"
+			terminal.Fail(RunTerminalFailed, "mcp_connection_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		ownedRunMCP = true
+	}
+	if runMCP != nil {
+		if !runMCP.Healthy() {
+			if ownedRunMCP {
+				runMCP.Close()
+			}
+			message := "MCP connection failed: runtime generation is not healthy"
+			terminal.Fail(RunTerminalFailed, "mcp_connection_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		if ownedRunMCP {
+			defer runMCP.Close()
+		} else {
+			for _, report := range runMCP.Reports() {
+				mcpReportsMu.Lock()
+				mcpReports = append(mcpReports, report)
+				mcpReportsMu.Unlock()
+				recordMCPExecution(opts.Recorder, report)
+				eventCh <- Event{Type: "mcp_process", Data: report}
+			}
+		}
+		mcpGeneration = runMCP.Generation()
+		eventCh <- Event{Type: "mcp_runtime", Data: map[string]interface{}{
+			"generation": mcpGeneration,
+			"servers":    runMCP.ServerCount(),
+			"borrowed":   !ownedRunMCP,
+		}}
+		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Connected to %d MCP servers", runMCP.ServerCount())}
+	}
+
+	baseTools := staticToolDefsWithResultReader(workDir, opts.ToolResultReader)
+	if runMCP != nil {
+		baseTools = append(baseTools, runMCP.ToolDefs()...)
+	}
+	pluginTools, pluginErr := resolveRunPluginToolDefs(opts, workDir, sandboxRunner)
+	if pluginErr != nil {
+		detail := sanitizeSnapshotText(pluginErr.Error(), 1000)
+		if explicitRunPluginConfiguration(opts) {
+			message := "Executable plugin configuration failed: " + detail
+			terminal.Fail(RunTerminalFailed, "plugin_configuration_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		// Default discovery is optional. Reject the whole plugin set and keep the
+		// base catalog; never downgrade to an unconfined plugin runner.
+		log.Printf("[Agent] executable plugins not advertised: %s", detail)
+		eventCh <- Event{Type: "status", Data: "Executable plugins not advertised: " + detail}
+	} else if len(pluginTools) > 0 {
+		baseTools = append(baseTools, pluginTools...)
+		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Loaded %d executable plugin tool(s)", len(pluginTools))}
+	}
+	baseTools, err = pinCompletionControlTool(baseTools, completionContract)
+	if err != nil {
+		message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
+		terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	// Plugin definitions enter the same immutable catalog, pruning and routing
+	// pipeline as built-ins and MCP. No parallel plugin-only loop exists.
+	tools := applyEditPolicyToToolDefs(baseTools, compiledHarness.EditPolicy())
+	toolExecOptions := ToolExecutionOptions{
+		WorkerID:                   opts.WorkerID,
+		OwnershipChecker:           opts.OwnershipChecker,
+		ExpectedSessionID:          opts.SessionID,
+		ExpectedRunID:              activeRunID,
+		Context:                    ctx,
+		SandboxRunner:              sandboxRunner,
+		SandboxPolicy:              sandboxPolicy,
+		EditPolicy:                 compiledHarness.EditPolicy(),
+		ToolResultReader:           opts.ToolResultReader,
+		CompletionContract:         completionContract,
+		CompletionEvidenceResolver: evidence.ResolveCompletionEvidence,
+	}
+	var sandboxReports sync.Map
+	var sandboxRecordsMu sync.Mutex
+	var sandboxRecords []SandboxExecutionRecord
 
 	// Plan mode: "/plan <task>" makes the agent explore read-only and produce a
 	// step-by-step plan WITHOUT editing — the Claude-Code plan-then-execute flow.
@@ -334,7 +849,7 @@ func RunLoopWithOptions(
 	// it and asks to proceed in a follow-up (normal) turn.
 	planMode := false
 	planTask := ""
-	if len(messages) > 0 {
+	if interactiveDirectives && len(messages) > 0 {
 		var last string
 		if json.Unmarshal(messages[len(messages)-1].Content, &last) == nil {
 			if trimmed := strings.TrimSpace(last); strings.HasPrefix(strings.ToLower(trimmed), "/plan") {
@@ -350,11 +865,25 @@ func RunLoopWithOptions(
 	if planMode {
 		tools = filterReadOnlyTools(tools)
 	}
+	tools, err = pinCompletionControlTool(tools, completionContract)
+	if err != nil {
+		message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
+		terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	allowedTools := toolCatalogNamesForRun(tools)
+	if _, catalogErr := snapshotForAllowedTools(allowedTools); catalogErr != nil {
+		message := "Tool catalog construction failed: " + sanitizeSnapshotText(catalogErr.Error(), 1000)
+		terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
 
 	// @file mentions: "@path" in the message pulls that file's content into
 	// context up front, so the model doesn't have to crawl to find it — a focused
 	// alternative to exploration, especially helpful for local models.
-	if len(messages) > 0 {
+	if interactiveDirectives && len(messages) > 0 {
 		var last string
 		if json.Unmarshal(messages[len(messages)-1].Content, &last) == nil && strings.Contains(last, "@") {
 			if block, files := expandFileMentions(last, workDir); len(files) > 0 {
@@ -364,47 +893,92 @@ func RunLoopWithOptions(
 		}
 	}
 
-	// Agent-loop tuning (tool budget + temperature) for local models, resolved
-	// from config with built-in fallbacks.
-	cfg := config.Load()
-
-	// Resolve agent-loop tuning. Local models (Ollama/SGLang) run with small
-	// context windows and degrade with large tool lists or default sampling, so a
-	// per-model profile supplies sensible defaults (tool budget + temperature)
-	// that explicit config/env still override.
-	//   tool budget : env ANICLEW_MAX_TOOLS > config localToolBudget > profile > 16
-	//                 (the full ~30-tool list overflows a small context; core
-	//                  file/exec tools are always kept, peripherals dropped by
-	//                  relevance)
-	//   temperature : config agentTemperature > profile (0 — pinning it low makes
-	//                 tool calling deterministic; at the provider default local
-	//                 models drift into prose instead of emitting tool_use)
-	// Cloud models keep the full toolset and provider default unless
-	// ANICLEW_MAX_TOOLS is set.
-	toolBudget := translate.ToolBudget()
+	// The Compiled Harness was resolved once at run start. No config, model
+	// metadata, or override is re-read inside the iteration loop.
+	toolBudget := compiledHarness.ToolBudget()
 	var agentTemp *float64
-	if isLocalProvider(provider.Name()) {
-		prof, matched := profileFor(model)
-		if toolBudget == 0 {
-			if toolBudget = cfg.LocalToolBudget; toolBudget == 0 {
-				toolBudget = prof.toolBudget
-			}
-		}
-		if cfg.AgentTemperature != nil {
-			agentTemp = cfg.AgentTemperature
-		} else {
-			t := prof.temperature
-			agentTemp = &t
-		}
-		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Model profile: %s (tools=%d, temp=%.1f)", prof.name, toolBudget, *agentTemp)}
-		log.Printf("[Agent] profile=%q matched=%v budget=%d temp=%.2f model=%s", prof.name, matched, toolBudget, *agentTemp, model)
+	if temperature, configured := compiledHarness.Temperature(); configured {
+		value := temperature
+		agentTemp = &value
 	}
+	if isLocalProvider(provider.Name()) && agentTemp != nil {
+		eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+			"Model profile: %s (tools=%d, temp=%.1f)",
+			runHarness.Label,
+			toolBudget,
+			*agentTemp,
+		)}
+	}
+	log.Printf(
+		"[Agent] harness=%q label=%q matched=%v budget=%d context=%d reserve=%d model=%s",
+		compiledHarness.ID(),
+		runHarness.Label,
+		runHarness.Matched,
+		toolBudget,
+		compiledHarness.ContextWindow(),
+		compiledHarness.OutputReserve(),
+		model,
+	)
 	if toolBudget > 0 {
 		var dropped int
-		tools, dropped = translate.PruneTools(tools, lastUserText(messages), toolBudget)
+		var pruneErr error
+		tools, dropped, pruneErr = pruneToolsPreservingRequired(
+			tools,
+			lastUserText(messages),
+			toolBudget,
+			completionRequiredToolNames(completionContract),
+		)
+		if pruneErr != nil {
+			message := "Tool budget construction failed: " + sanitizeSnapshotText(pruneErr.Error(), 1000)
+			terminal.Fail(RunTerminalFailed, "tool_budget_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
 		if dropped > 0 {
 			log.Printf("[Agent] tool budget %d: kept %d, dropped %d (provider=%s)", toolBudget, len(tools), dropped, provider.Name())
 		}
+	}
+	routing, err := newToolRoutingState(compiledHarness, tools, lastUserText(messages))
+	if err != nil {
+		message := "Tool routing configuration failed: " + err.Error()
+		terminal.Fail(RunTerminalFailed, "tool_routing_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	tools, err = pinCompletionControlTool(routing.tools(), completionContract)
+	if err != nil {
+		message := "Tool routing configuration failed: " + sanitizeSnapshotText(err.Error(), 1000)
+		terminal.Fail(RunTerminalFailed, "tool_routing_failed", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	if compiledHarness.ToolRouting() != harness.ToolRoutingDirect {
+		record := routing.record()
+		record.Exposed = len(tools)
+		eventCh <- Event{Type: "tool_route", Data: record}
+		log.Printf(
+			"[Agent] tool routing policy=%s phase=%s category=%s exposed=%d/%d confidence=%.2f fallback=%v",
+			record.Policy,
+			record.Phase,
+			record.Category,
+			record.Exposed,
+			record.Total,
+			record.Confidence,
+			record.Fallback,
+		)
+	}
+	if opts.RunMode != nil {
+		directive, modeErr := opts.RunMode.Start(time.Now())
+		if modeErr != nil || validateRunModeDirective(directive, true) != nil {
+			message := "Run mode start failed"
+			terminal.Fail(RunTerminalFailed, "run_mode_start_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		for _, status := range directive.Status {
+			eventCh <- Event{Type: "status", Data: status}
+		}
+		messages = appendRunModeDirective(messages, directive)
 	}
 
 	// Read-only over-exploration guard: a pure question ("what is this project?")
@@ -438,25 +1012,55 @@ func RunLoopWithOptions(
 		}
 	}
 
-	maxIterations := 25
-
 	// Reflection guard: stop if the model keeps producing tool calls that all
 	// fail for several rounds in a row (e.g. repeating an edit the lint gate
 	// rejects). Prevents burning iterations on a stuck self-correction loop.
 	consecutiveErrorRounds := 0
-	const maxErrorRounds = 3
+	maxErrorRounds := compiledHarness.MaxErrorRounds()
 
 	// ── Hook system: load from project + skill source ──
-	hookRegistry := hooks.NewRegistry()
-	hookRegistry.Load(workDir, "") // "" = all sources
-	hookRegistry.Execute(hooks.HookSessionStart, map[string]string{"WORK_DIR": workDir})
+	hookRegistry := opts.HookRegistry
+	if hookRegistry == nil {
+		hookRegistry = hooks.NewRegistry()
+	}
+	_ = hookRegistry.Load(workDir, "") // "" = all sources; failures remain quarantined
+	var hookResultsMu sync.Mutex
+	var hookResults []hooks.HookResult
+	executeHooksWithContext := func(hookCtx context.Context, hookType hooks.HookType, env map[string]string) []hooks.HookResult {
+		results := hookRegistry.ExecuteContext(hookCtx, hookType, env)
+		hookResultsMu.Lock()
+		hookResults = append(hookResults, results...)
+		recordHookResults(opts.Recorder, results)
+		hookResultsMu.Unlock()
+		return results
+	}
+	executeHooks := func(hookType hooks.HookType, env map[string]string) []hooks.HookResult {
+		return executeHooksWithContext(ctx, hookType, env)
+	}
+	terminal.BeginHookSession(
+		func() {
+			executeHooks(hooks.HookSessionStart, map[string]string{"WORK_DIR": workDir})
+		},
+		func() {
+			// SessionEnd is cleanup, so it must still run after the request
+			// context is cancelled. Registry runner timeouts remain authoritative.
+			executeHooksWithContext(
+				context.WithoutCancel(ctx),
+				hooks.HookSessionEnd,
+				map[string]string{"WORK_DIR": workDir},
+			)
+		},
+		func() []hooks.HookResult {
+			hookResultsMu.Lock()
+			defer hookResultsMu.Unlock()
+			return append([]hooks.HookResult(nil), hookResults...)
+		},
+	)
 
 	// ── Permission snapshot (immutable for this session) ──
 	permissions := hooks.CapturePermissions(workDir)
-	_ = permissions // used in tool execution below
-
-	// ── Compaction config ──
-	compactCfg := CompactConfig{ContextWindow: 200000}
+	readLedger := NewReadLedger(workDir)
+	runGuard := NewRunGuard(compiledHarness.RepeatLimit())
 
 	// ── Detect project type ──
 	project := DetectProject(workDir)
@@ -466,36 +1070,39 @@ func RunLoopWithOptions(
 	// ── Load project context (CLAUDE.md, AGENTS.md, skills) ──
 	projectCtx := LoadProjectContext(workDir)
 	skills := LoadSkills(workDir)
-	mcpConfig := LoadMCPConfig(workDir)
 
 	// ── Long-term memory: load index + top relevant entries for this turn ──
 	// Computed once before the iteration loop — the snippet only depends
 	// on the first user message, so recomputing per-iteration would just
 	// defeat the prompt cache.
 	memoryContext := BuildMemoryContext(workDir, messages)
+	memoryContext += renderToolResultInventory(opts.ToolResultReferences)
 	workstreamContext := ""
 	if strings.TrimSpace(opts.WorkstreamContext) != "" {
 		workstreamContext = "\n\n" + strings.TrimSpace(opts.WorkstreamContext)
 	}
-	if opts.Recorder != nil {
-		opts.Recorder.RunStarted()
-	}
-
 	// ── Process slash commands ──
-	if len(messages) > 0 {
+	if interactiveDirectives && len(messages) > 0 {
 		lastMsg := messages[len(messages)-1]
 		var lastText string
 		json.Unmarshal(lastMsg.Content, &lastText)
 		if IsSlashCommand(lastText) {
 			processed, err := ProcessSlashCommand(lastText, skills)
 			if err != nil {
-				failRun(opts.Recorder, err.Error())
+				terminal.Fail(RunTerminalFailed, "slash_command_failed", err.Error(), nil)
 				eventCh <- Event{Type: "error", Data: err.Error()}
 				return
 			}
 			// Direct output commands — don't send to LLM
 			if processed == "[CLEAR_CHAT]" || processed == "[SHOW_MODEL_SELECTOR]" {
 				eventCh <- Event{Type: "command", Data: processed}
+				terminal.Complete(
+					RunTerminalCommand,
+					"ui_command",
+					RunTerminalDurableNone,
+					nil,
+					RunSummary{Provider: provider.Name(), Model: model, ProjectType: project.Type},
+				)
 				return
 			}
 			if processed == "[COMPACT_CONTEXT]" {
@@ -504,7 +1111,13 @@ func RunLoopWithOptions(
 			// /help → return directly, no LLM needed
 			if strings.HasPrefix(lastText, "/help") {
 				eventCh <- Event{Type: "text", Data: processed}
-				eventCh <- Event{Type: "done", Data: nil}
+				terminal.Complete(
+					RunTerminalCommand,
+					"help",
+					RunTerminalDurableNone,
+					nil,
+					RunSummary{Provider: provider.Name(), Model: model, ProjectType: project.Type},
+				)
 				return
 			}
 			// Replace last message with processed skill prompt
@@ -513,14 +1126,6 @@ func RunLoopWithOptions(
 				Content: mustJSON(processed),
 			}
 			eventCh <- Event{Type: "status", Data: "Skill loaded: " + lastText}
-		}
-	}
-
-	// ── Connect MCP servers ──
-	if mcpConfig != "" {
-		count, _ := ConnectMCPServers(workDir)
-		if count > 0 {
-			eventCh <- Event{Type: "status", Data: fmt.Sprintf("Connected to %d MCP servers", count)}
 		}
 	}
 
@@ -546,20 +1151,15 @@ func RunLoopWithOptions(
 	if projectCtx != "" {
 		eventCh <- Event{Type: "status", Data: "Project context loaded (CLAUDE.md)"}
 	}
-	if mcpConfig != "" {
+	if mcpConfigDetected {
 		eventCh <- Event{Type: "status", Data: "MCP config detected"}
 	}
 
-	// First-run heads-up: surface the agent-managed files this workspace will get
-	// (long-term memory + remembered permissions) instead of creating them
-	// silently. The permission file (.claude/settings.json) is only created if a
-	// tool gets auto-allowed, so it is announced at creation time below.
+	// First-run heads-up: surface agent-managed memory files before creation.
+	// Permission ask decisions are never persisted implicitly.
 	if msg := MemoryHeadsUp(workDir); msg != "" {
 		eventCh <- Event{Type: "status", Data: msg}
 	}
-	claudeSettings := filepath.Join(workDir, ".claude", "settings.json")
-	permFileExisted := fileExists(claudeSettings)
-	permFileNotified := false
 
 	// exploreScore weights the read-only guard by what the model actually read:
 	// content reads (Read/Grep) count full, navigation (LS/Glob) counts half — so
@@ -574,8 +1174,63 @@ func RunLoopWithOptions(
 	checkpointStarted := false // clear the undo buffer on this turn's first edit
 	var editedFiles []string   // files changed this session, for the completion summary
 	testResult := ""           // auto-verify outcome for the summary ("passed"/"failed"/"")
-	evidence := NewEvidenceLedger(lastUserText(userMessages), opts.EvidencePolicy)
+	recoverySnapshot := func() *RunGuardSnapshot {
+		snapshot := runGuard.Snapshot()
+		if snapshot.Denied == 0 {
+			return nil
+		}
+		return &snapshot
+	}
+	writeRecoveryReceipt := func(iterations int, recovery *RunGuardSnapshot) string {
+		if recovery == nil {
+			return ""
+		}
+		verification := evidence.ApplyToReceipt(receiptVerification(testResult))
+		verification.TerminalState = EvidenceTerminalBlocked
+		verification.Gate = EvidenceGateBlock
+		receipt := AgentReceipt{
+			Provider:     provider.Name(),
+			Model:        model,
+			ProjectType:  project.Type,
+			PlanMode:     planMode,
+			Iterations:   iterations,
+			EditedFiles:  uniqueStrings(editedFiles),
+			Verification: verification,
+			Recovery:     recovery,
+		}
+		path, receiptErr := terminal.WriteReceipt(workDir, receipt)
+		if receiptErr != nil {
+			log.Printf("[Agent] recovery receipt write failed: %v", receiptErr)
+			return ""
+		}
+		eventCh <- Event{Type: "status", Data: "Receipt saved: " + path}
+		return path
+	}
+	systemCorePrefix := buildSystemPrompt(responseLang) +
+		projectPrompt +
+		projectCtx +
+		skillText
+	systemCoreSuffix := workstreamContext
+	if runModeSystemSuffix != "" {
+		systemCoreSuffix += "\n\n" + runModeSystemSuffix
+	}
+	if planMode {
+		systemCoreSuffix += "\n\n## PLAN MODE\nYou are in plan mode. Explore the codebase with the read-only tools and produce a concrete, step-by-step implementation plan (which files to change and what to do in each). You have NO edit tools — do not attempt to make changes. End with the plan; the user will review it and ask you to proceed."
+	}
+	systemCoreSuffix = appendPromptPolicy(
+		systemCoreSuffix,
+		compiledHarness.PromptSuffix(),
+		planAnchorPrompt,
+	)
 
+	responseCorrections := newToolResponseCorrectionState()
+	selectorCorrections := 0
+	completionCorrections := 0
+	compactionAttempts := 0
+	runModeStopReason := ""
+	runModeTerminalText := ""
+	runModeTotalTools := 0
+	runModeEstimatedTokens := 0
 	for i := 0; i < maxIterations; i++ {
 		// ── Read-only over-exploration guard ──
 		// Once a pure question has explored enough rounds, collapse the
@@ -602,49 +1257,19 @@ func RunLoopWithOptions(
 				"\n\n## Context I gathered from the codebase\n" + digest +
 				collapseClosing + langReminder(responseLang)
 			messages = []types.Message{{Role: "user", Content: mustJSON(collapsed)}}
-			tools = nil
+			tools, err = pinCompletionControlTool(nil, completionContract)
+			if err != nil {
+				message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
+				terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+				eventCh <- Event{Type: "error", Data: message}
+				return
+			}
 			readOnly = false // collapse once; the next pass produces the answer
 			eventCh <- Event{Type: "status", Data: fmt.Sprintf("Read-only question — explored %d rounds, answering now", i)}
 		}
 
-		// ── Context compression ──
-		tokenEstimate := EstimateMessageTokens(messages)
-		if ShouldCompact(compactCfg, tokenEstimate) && len(messages) >= minMessagesForCompact {
-			eventCh <- Event{Type: "status", Data: fmt.Sprintf("Compacting context (~%dk tokens, %d messages)...", tokenEstimate/1000, len(messages))}
-
-			// Try LLM-based compaction first
-			compacted, err := CompactMessages(ctx, provider, model, messages)
-			if err != nil {
-				compactCfg.CompactFailures++
-				log.Printf("[Compact] LLM compact failed (%d/%d): %v — falling back to snip", compactCfg.CompactFailures, maxCompactFailures, err)
-
-				// Snip fallback: keep first 2 + last 4, summarize middle inline
-				if len(messages) > 8 {
-					var middleSummary string
-					for _, m := range messages[2 : len(messages)-4] {
-						var text string
-						json.Unmarshal(m.Content, &text)
-						if len(text) > 100 {
-							text = text[:100] + "..."
-						}
-						if text != "" {
-							middleSummary += fmt.Sprintf("[%s] %s\n", m.Role, text)
-						}
-					}
-					snipped := make([]types.Message, 0)
-					snipped = append(snipped, messages[:2]...)
-					snipped = append(snipped, types.Message{Role: "user", Content: mustJSON("[Context Summary]\n" + middleSummary)})
-					snipped = append(snipped, messages[len(messages)-4:]...)
-					messages = snipped
-				}
-			} else {
-				messages = compacted
-				compactCfg.CompactFailures = 0
-			}
-			eventCh <- Event{Type: "status", Data: fmt.Sprintf("Compacted to %d messages", len(messages))}
-		}
-
-		// Normalize messages before API call
+		// Normalize before planning so the estimate describes the exact message
+		// shape handed to the provider, including any role framing repairs.
 		messages = NormalizeMessages(messages)
 
 		// RAG: search project for relevant context based on last user message
@@ -663,19 +1288,132 @@ func RunLoopWithOptions(
 			}
 		}
 
-		// Build request with full context
-		sysPrompt := buildSystemPrompt(responseLang) + projectPrompt + projectCtx + skillText + ragContext + memoryContext + workstreamContext
-		if planMode {
-			sysPrompt += "\n\n## PLAN MODE\nYou are in plan mode. Explore the codebase with the read-only tools and produce a concrete, step-by-step implementation plan (which files to change and what to do in each). You have NO edit tools — do not attempt to make changes. End with the plan; the user will review it and ask you to proceed."
+		// Build and reduce the completed request. Every calculation includes the
+		// full system prompt, schemas, messages, first-turn RAG, recalled memory,
+		// output reservation, protocol framing, and safety margin.
+		iterationSystemCoreSuffix := systemCoreSuffix
+		if completionContract != nil {
+			completionPrompt, promptErr := renderRunCompletionContract(
+				completionContract,
+				evidence.CompletionEvidenceSnapshot(),
+			)
+			if promptErr != nil {
+				message := "CompletionContract prompt rendering failed"
+				terminal.Fail(RunTerminalFailed, "completion_contract_render_failed", message, nil)
+				eventCh <- Event{Type: "error", Data: message}
+				return
+			}
+			iterationSystemCoreSuffix = appendPromptPolicy(iterationSystemCoreSuffix, completionPrompt, "")
 		}
-		req := &types.MessagesRequest{
-			Model:       model,
-			System:      mustJSON([]map[string]string{{"type": "text", "text": sysPrompt}}),
-			Messages:    messages,
-			Tools:       tools,
-			MaxTokens:   8192,
-			Temperature: agentTemp,
+
+		planningInput := ContextPlanningRequest{
+			Profile:  compiledHarness,
+			Protocol: compiledHarness.WirePolicy(),
+			Model:    model,
+			System: ContextSystemSections{
+				CorePrefix:    systemCorePrefix,
+				RAGContext:    ragContext,
+				MemoryContext: memoryContext,
+				CoreSuffix:    iterationSystemCoreSuffix,
+			},
+			Messages:           messages,
+			Tools:              tools,
+			RequiredToolNames:  completionRequiredToolNames(completionContract),
+			MaxTokens:          requestMaxTokens(compiledHarness),
+			Temperature:        agentTemp,
+			Estimator:          opts.TokenEstimator,
+			SafetyMarginTokens: DefaultContextSafetyMarginTokens,
+			Task:               lastUserText(userMessages),
+			ContextReducer:     opts.ContextReducer,
+			ToolResultStore:    opts.ToolResultStore,
 		}
+		planned, planErr := PlanContextRequest(planningInput)
+		if planErr != nil {
+			code := "context_planning_failed"
+			plan := ContextPlan{}
+			if typed, ok := planErr.(*ContextBudgetError); ok {
+				code = typed.Code
+				plan = typed.Plan
+			}
+			emitContextBlocked(eventCh, terminal, opts.Recorder, plan, code, planErr.Error())
+			return
+		}
+
+		if planned.NeedsCompaction {
+			if compactionAttempts >= maxCompactFailures {
+				emitContextBlocked(
+					eventCh,
+					terminal,
+					opts.Recorder,
+					planned.Plan,
+					"compaction_limit_reached",
+					"Context remains over budget after the bounded compaction attempt limit.",
+				)
+				return
+			}
+			compactionAttempts++
+			eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+				"Compacting completed request (~%dk input tokens, %d messages)...",
+				planned.Plan.EstimatedInputTokens/1000,
+				len(planned.Messages),
+			)}
+			outcome := compactPlannedContext(
+				ctx,
+				provider,
+				hookRegistry,
+				planningInput,
+				planned,
+				CompactionState{
+					Objective:   lastUserText(userMessages),
+					PlanAnchor:  opts.PlanAnchor,
+					EditedFiles: uniqueStrings(editedFiles),
+					Evidence:    evidence,
+				},
+			)
+			if outcome.Snapshot.Version != 0 {
+				recordCompaction(opts.Recorder, outcome.Snapshot)
+				eventCh <- Event{Type: "compaction_snapshot", Data: outcome.Snapshot}
+			}
+			if outcome.Blocked || outcome.Err != nil {
+				message := "The completed request remains over the selected model context budget after structured compaction."
+				if outcome.Err != nil {
+					message = "Structured context compaction could not produce a valid request: " + outcome.Err.Error()
+				}
+				emitContextBlocked(
+					eventCh,
+					terminal,
+					opts.Recorder,
+					outcome.Planned.Plan,
+					outcome.BlockCode,
+					message,
+				)
+				return
+			}
+			planned = outcome.Planned
+			eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+				"Compacted to %d messages (%s)",
+				len(planned.Messages),
+				outcome.Snapshot.Strategy,
+			)}
+		}
+
+		// Commit exactly the catalog/messages/system that were budgeted. The tool
+		// dispatch allow-list below derives from this same tools slice.
+		messages = planned.Messages
+		tools = planned.Tools
+		allowedTools = toolCatalogNamesForRun(tools)
+		if _, catalogErr := snapshotForAllowedTools(allowedTools); catalogErr != nil {
+			message := "Tool catalog construction failed: " + sanitizeSnapshotText(catalogErr.Error(), 1000)
+			terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		memoryContext = planned.System.MemoryContext
+		req := planned.Request
+		tokenEstimate := planned.Plan.EstimatedInputTokens
+		addRunModeTokenEstimate(&runModeEstimatedTokens, tokenEstimate)
+		recordContextPlan(opts.Recorder, planned.Plan)
+		eventCh <- Event{Type: "context_plan", Data: planned.Plan}
 
 		// Call LLM (with retry)
 		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Thinking... (iteration %d/%d, ~%dk tokens)", i+1, maxIterations, tokenEstimate/1000)}
@@ -711,7 +1449,11 @@ func RunLoopWithOptions(
 				case <-ctx.Done():
 					stopHeartbeat()
 					finishMakerSpan("failed", map[string]string{"error": ctx.Err().Error()})
-					failRun(opts.Recorder, ctx.Err().Error())
+					cancelReason := "cancelled"
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						cancelReason = "deadline_exceeded"
+					}
+					terminal.Fail(RunTerminalCancelled, cancelReason, ctx.Err().Error(), nil)
 					return
 				case <-time.After(2 * time.Second):
 				}
@@ -720,8 +1462,9 @@ func RunLoopWithOptions(
 		if err != nil {
 			stopHeartbeat()
 			finishMakerSpan("failed", map[string]string{"error": err.Error()})
-			failRun(opts.Recorder, fmt.Sprintf("Failed after 3 retries: %s", err.Error()))
-			eventCh <- Event{Type: "error", Data: fmt.Sprintf("Failed after 3 retries: %s", err.Error())}
+			message := fmt.Sprintf("Failed after 3 retries: %s", err.Error())
+			terminal.Fail(RunTerminalFailed, "provider_retry_exhausted", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
 			return
 		}
 
@@ -730,9 +1473,12 @@ func RunLoopWithOptions(
 		var toolUses []toolUseBlock
 		currentText := ""
 		var currentTool *toolUseBlock
+		var reasoningContent boundedReasoningBuffer
 		stopReason := ""
+		sawProviderEvent := false
 
 		for event := range ch {
+			sawProviderEvent = true
 			switch event.Type {
 			case "content_block_start":
 				var block struct {
@@ -770,12 +1516,12 @@ func RunLoopWithOptions(
 					json.Unmarshal(event.Delta, &thinkDelta)
 					if thinkDelta.Thinking != "" {
 						atomic.AddInt64(&outChars, int64(len(thinkDelta.Thinking)))
+						reasoningContent.Append(thinkDelta.Thinking)
 						eventCh <- Event{Type: "thinking", Data: thinkDelta.Thinking}
 					}
 				} else if delta.Type == "text_delta" {
 					currentText += delta.Text
 					atomic.AddInt64(&outChars, int64(len(delta.Text)))
-					eventCh <- Event{Type: "text", Data: delta.Text}
 				} else if delta.Type == "input_json_delta" && currentTool != nil {
 					currentTool.InputRaw += delta.PartialJSON
 				}
@@ -810,31 +1556,102 @@ func RunLoopWithOptions(
 		// before tool execution (tools emit their own progress) and before any
 		// return path that would close eventCh.
 		stopHeartbeat()
-
-		// Recover tool calls the model leaked as plain text instead of the
-		// parseable format the backend expects (observed with qwen via Ollama) —
-		// so a formatting slip doesn't silently end the turn with nothing done.
-		if len(toolUses) == 0 {
-			if recovered, cleaned := recoverLeakedToolCalls(textContent); len(recovered) > 0 {
-				var valid []toolUseBlock
-				for _, c := range recovered {
-					for _, t := range tools {
-						if t.Name == c.Name {
-							valid = append(valid, c)
-							break
-						}
-					}
-				}
-				if len(valid) > 0 {
-					log.Printf("[Agent] recovered %d leaked tool call(s) from text", len(valid))
-					toolUses = valid
-					textContent = cleaned
-					for _, c := range valid {
-						eventCh <- Event{Type: "status", Data: "Recovered a tool call written as text: " + c.Name}
-						eventCh <- Event{Type: "tool_start", Data: map[string]string{"id": c.ID, "name": c.Name}}
-					}
-				}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			cancelReason := "cancelled"
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				cancelReason = "deadline_exceeded"
 			}
+			terminal.Fail(RunTerminalCancelled, cancelReason, ctxErr.Error(), nil)
+			return
+		}
+		if !sawProviderEvent {
+			message := "Provider stream closed without a terminal event"
+			eventCh <- Event{Type: "error", Data: message}
+			terminal.Fail(RunTerminalNoTerminal, "provider_stream_closed", message, nil)
+			return
+		}
+
+		hadNativeCalls := len(toolUses) > 0
+		responseDecision := applyToolResponsePolicy(
+			compiledHarness.ResponsePolicy(),
+			textContent,
+			reasoningContent.String(),
+			toolUses,
+			tools,
+		)
+		recordToolParseResult(eventCh, opts.Recorder, fmt.Sprintf("tool_parse_%02d", i+1), responseDecision.Parse)
+		toolUses = responseDecision.Calls
+		textContent = responseDecision.VisibleText
+
+		if responseDecision.NeedsCorrection {
+			correction, terminalErr := responseCorrections.next(responseDecision.Parse)
+			if terminalErr != nil {
+				terminal.Fail(RunTerminalFailed, "parser_correction_exhausted", terminalErr.Error(), nil)
+				eventCh <- Event{Type: "error", Data: terminalErr}
+				return
+			}
+			messages = append(messages, types.Message{Role: "user", Content: mustJSON(correction)})
+			eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+				"Tool response correction requested (%d/%d): %s",
+				responseCorrections.attempts,
+				responseCorrections.limit,
+				responseDecision.Parse.Reason,
+			)}
+			continue
+		}
+
+		if !hadNativeCalls && len(toolUses) > 0 {
+			log.Printf("[Agent] recovered %d tool call(s) with response policy %s", len(toolUses), compiledHarness.ResponsePolicy())
+			for _, call := range toolUses {
+				eventCh <- Event{Type: "tool_start", Data: map[string]string{"id": call.ID, "name": call.Name}}
+			}
+		}
+		selectorBypass := routing.awaitingSelector() && completionControlOnlyCalls(toolUses)
+		if handled, assistantMessage, resultMessage, routeErr := routing.consumeSelector(
+			func() []toolUseBlock {
+				if selectorBypass {
+					return nil
+				}
+				return toolUses
+			}(),
+			textContent,
+		); handled {
+			if routeErr != nil {
+				selectorCorrections++
+				if selectorCorrections > defaultToolResponseCorrectionLimit {
+					message := "Tool routing selector failed after bounded correction attempts"
+					terminal.Fail(RunTerminalFailed, "selector_correction_exhausted", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				messages = append(messages, types.Message{Role: "user", Content: mustJSON(routing.selectorCorrection())})
+				eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+					"Tool routing selector correction requested (%d/%d)",
+					selectorCorrections,
+					defaultToolResponseCorrectionLimit,
+				)}
+				continue
+			}
+			if textContent != "" && completionContract == nil {
+				eventCh <- Event{Type: "text", Data: textContent}
+			}
+			messages = append(messages, assistantMessage, resultMessage)
+			tools, err = pinCompletionControlTool(routing.tools(), completionContract)
+			if err != nil {
+				message := "Tool routing configuration failed"
+				terminal.Fail(RunTerminalFailed, "tool_routing_failed", message, nil)
+				eventCh <- Event{Type: "error", Data: message}
+				return
+			}
+			allowedTools = toolCatalogNamesForRun(tools)
+			record := routing.record()
+			record.Exposed = len(tools)
+			eventCh <- Event{Type: "tool_route", Data: record}
+			continue
+		}
+		strictNoToolResponse := completionContract != nil && len(toolUses) == 0
+		if textContent != "" && completionContract == nil {
+			eventCh <- Event{Type: "text", Data: textContent}
 		}
 
 		// Context-exhaustion guard: a "max_tokens" stop with almost no output
@@ -849,12 +1666,44 @@ func RunLoopWithOptions(
 
 		// ── No tool calls → done ──
 		if len(toolUses) == 0 {
+			if opts.RunMode != nil {
+				directive, modeErr := opts.RunMode.Advance(RunModeTurn{
+					Text:      textContent,
+					Iteration: i + 1,
+					Now:       time.Now(),
+				})
+				if modeErr != nil || validateRunModeDirective(directive, false) != nil {
+					message := "Run mode transition failed"
+					terminal.Fail(RunTerminalFailed, "run_mode_transition_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				for _, status := range directive.Status {
+					eventCh <- Event{Type: "status", Data: status}
+				}
+				if directive.Continue {
+					if textContent != "" {
+						messages = append(messages, types.Message{
+							Role: "assistant",
+							Content: mustJSON([]map[string]interface{}{{
+								"type": "text", "text": textContent,
+							}}),
+						})
+					}
+					messages = appendRunModeDirective(messages, directive)
+					continue
+				}
+				runModeStopReason = directive.StopReason
+				runModeTerminalText = directive.TerminalText
+			}
 			// ── Auto-verify: before declaring done, run the project's tests if
 			//    the model edited files (the Claude-Code "edit → test → fix"
 			//    loop). On failure, feed the output back so the model fixes it —
 			//    bounded by maxVerifyAttempts so an unrelated/pre-existing failure
 			//    cannot loop forever. Skips silently when there is no test runner.
-			if didEdit && autoVerifyEnabled() && verifyAttempts < maxVerifyAttempts {
+			contractBlockedBeforeVerify := completionContract != nil &&
+				completionContract.Status() == CompletionStatusBlocked
+			if !contractBlockedBeforeVerify && didEdit && autoVerifyEnabled() && verifyAttempts < maxVerifyAttempts {
 				eventCh <- Event{Type: "status", Data: "Auto-verify: running tests after edits…"}
 				finishCheckSpan := startRunSpan(opts.Recorder, fmt.Sprintf("checker_%02d_%02d", i+1, verifyAttempts+1), "checker.auto_verify", map[string]string{
 					"iteration": fmt.Sprintf("%d", i+1),
@@ -889,8 +1738,58 @@ func RunLoopWithOptions(
 				}
 			}
 
+			var completionSnapshot *CompletionContractSnapshot
+			completionBlocked := false
+			completionIncompleteExhausted := false
+			if completionContract != nil {
+				snapshot, snapshotErr := completionContract.Snapshot()
+				if snapshotErr != nil {
+					message := "CompletionContract snapshot failed"
+					terminal.Fail(RunTerminalFailed, "completion_contract_snapshot_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				completionSnapshot = &snapshot
+				switch snapshot.Status {
+				case CompletionStatusIncomplete:
+					if completionCorrections < maxCompletionCorrectionAttempts {
+						completionCorrections++
+						if textContent != "" {
+							messages = append(messages, types.Message{
+								Role: "assistant",
+								Content: mustJSON([]map[string]interface{}{{
+									"type": "text", "text": textContent,
+								}}),
+							})
+						}
+						messages = append(messages, types.Message{
+							Role:    "user",
+							Content: mustJSON(completionCorrectionMessage(snapshot)),
+						})
+						eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+							"Completion contract correction requested (%d/%d)",
+							completionCorrections,
+							maxCompletionCorrectionAttempts,
+						)}
+						continue
+					}
+					completionBlocked = true
+					completionIncompleteExhausted = true
+				case CompletionStatusBlocked:
+					completionBlocked = true
+				case CompletionStatusComplete:
+					// The machine-readable completion contract is satisfied. The
+					// independent evidence policy below still owns verification.
+				default:
+					message := "CompletionContract status is invalid"
+					terminal.Fail(RunTerminalFailed, "completion_contract_status_invalid", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+			}
+
 			gate := evidence.Evaluate()
-			if gate.Decision == EvidenceGateBlock {
+			if !completionBlocked && gate.Decision == EvidenceGateBlock {
 				evidence.MarkStopBlock()
 				eventCh <- Event{Type: "status", Data: "Evidence gate blocked completion: verification evidence required"}
 				if textContent != "" {
@@ -902,6 +1801,43 @@ func RunLoopWithOptions(
 			}
 			if gate.Decision != EvidenceGateAllow {
 				eventCh <- Event{Type: "status", Data: fmt.Sprintf("Evidence gate: %s — %s", gate.Decision, gate.Summary)}
+			}
+			completionVerification := evidence.ApplyToReceipt(receiptVerification(testResult))
+			if completionBlocked {
+				completionVerification.TerminalState = EvidenceTerminalBlocked
+				eventCh <- Event{Type: "status", Data: "Completion contract blocked the run terminal"}
+			}
+			var runModeSnapshot *RunModeSnapshot
+			if opts.RunMode != nil {
+				sandboxRecordsMu.Lock()
+				modeSandbox := append([]SandboxExecutionRecord(nil), sandboxRecords...)
+				sandboxRecordsMu.Unlock()
+				snapshot := opts.RunMode.Snapshot(RunModeMetrics{
+					TotalTools:      runModeTotalTools,
+					EstimatedTokens: runModeEstimatedTokens,
+					Sandbox:         modeSandbox,
+				})
+				if snapshotErr := validateRunModeSnapshot(opts.RunMode, snapshot); snapshotErr != nil {
+					message := "Run mode snapshot failed"
+					terminal.Fail(RunTerminalFailed, "run_mode_snapshot_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				runModeSnapshot = &snapshot
+			}
+			if strictNoToolResponse && textContent != "" {
+				if !completionIncompleteExhausted {
+					eventCh <- Event{Type: "text", Data: textContent}
+				}
+			}
+			if completionIncompleteExhausted {
+				eventCh <- Event{Type: "text", Data: fmt.Sprintf(
+					"Completion blocked: the Definition of Done remained incomplete after %d correction attempts.",
+					maxCompletionCorrectionAttempts,
+				)}
+			}
+			if !completionBlocked && runModeTerminalText != "" {
+				eventCh <- Event{Type: "text", Data: runModeTerminalText}
 			}
 
 			// Completion summary: a one-line recap of what changed this session,
@@ -920,7 +1856,8 @@ func RunLoopWithOptions(
 			}
 
 			receiptPath := ""
-			if didEdit || planMode {
+			recovery := recoverySnapshot()
+			if didEdit || planMode || completionSnapshot != nil || recovery != nil {
 				receipt := AgentReceipt{
 					Provider:     provider.Name(),
 					Model:        model,
@@ -928,16 +1865,15 @@ func RunLoopWithOptions(
 					PlanMode:     planMode,
 					Iterations:   i + 1,
 					EditedFiles:  uniqueStrings(editedFiles),
-					Verification: evidence.ApplyToReceipt(receiptVerification(testResult)),
+					Verification: completionVerification,
+					Completion:   completionSnapshot,
+					Recovery:     recovery,
 				}
-				if path, err := writeAgentReceipt(workDir, receipt); err != nil {
+				if path, err := terminal.WriteReceipt(workDir, receipt); err != nil {
 					log.Printf("[Agent] receipt write failed: %v", err)
 				} else {
 					receiptPath = path
 					eventCh <- Event{Type: "status", Data: "Receipt saved: " + path}
-					if opts.Recorder != nil {
-						opts.Recorder.ReceiptWritten(path, receipt)
-					}
 				}
 			}
 
@@ -947,35 +1883,91 @@ func RunLoopWithOptions(
 			//    never surfaced to the user. We only hook normal
 			//    termination — the max-iterations branch below is a
 			//    failure mode that would feed noisy data to extraction.
-			ExtractMemoriesAsync(ctx, provider, model, workDir, messages)
-			MaybeConsolidateAsync(ctx, provider, model, workDir)
-			// Auto-skill creation (opt-in via ANICLEW_AUTOSKILL): if this was
+			if !completionBlocked {
+				ExtractMemoriesAsync(ctx, provider, model, workDir, messages)
+				MaybeConsolidateAsync(ctx, provider, model, workDir)
+			}
+			// Auto-skill creation (opt-in via CORELAY_AUTOSKILL): if this was
 			// a complex, repeatable workflow, author a reusable SKILL.md in
 			// the background. Gated and best-effort like the memory hooks.
-			CreateSkillAsync(ctx, provider, model, workDir, messages)
+			if !completionBlocked {
+				CreateSkillAsync(ctx, provider, model, workDir, messages)
+			}
 
 			if planMode {
 				eventCh <- Event{Type: "status", Data: "Plan ready — review it above, then reply to proceed with implementation."}
 			}
 
-			eventCh <- Event{Type: "done", Data: map[string]interface{}{
+			terminalStopReason := stopReason
+			if runModeStopReason != "" {
+				terminalStopReason = runModeStopReason
+			}
+			if completionBlocked {
+				terminalStopReason = "completion_blocked"
+			}
+			doneData := map[string]interface{}{
 				"iterations":    i + 1,
 				"tokenEstimate": tokenEstimate,
 				"project":       project.Type,
 				"planMode":      planMode,
 				"receipt":       receiptPath,
-			}}
-			if opts.Recorder != nil {
-				opts.Recorder.RunCompleted(RunSummary{
-					Provider:     provider.Name(),
-					Model:        model,
-					ProjectType:  project.Type,
-					PlanMode:     planMode,
-					Iterations:   i + 1,
-					EditedFiles:  uniqueStrings(editedFiles),
-					Verification: evidence.ApplyToReceipt(receiptVerification(testResult)),
-					ReceiptPath:  receiptPath,
-				})
+				"stopReason":    terminalStopReason,
+				"terminalState": completionVerification.TerminalState,
+			}
+			for key, value := range completionDoneMetadata(completionSnapshot) {
+				doneData[key] = value
+			}
+			if runModeSnapshot != nil {
+				doneData["runMode"] = *runModeSnapshot
+			}
+			if recovery != nil {
+				doneData["recovery"] = *recovery
+			}
+			sandboxRecordsMu.Lock()
+			runSandboxRecords := append([]SandboxExecutionRecord(nil), sandboxRecords...)
+			sandboxRecordsMu.Unlock()
+			mcpReportsMu.Lock()
+			runMCPReports := append([]processsupervisor.Report(nil), mcpReports...)
+			mcpReportsMu.Unlock()
+			runSummary := RunSummary{
+				Provider:      provider.Name(),
+				Model:         model,
+				ProjectType:   project.Type,
+				PlanMode:      planMode,
+				Iterations:    i + 1,
+				EditedFiles:   uniqueStrings(editedFiles),
+				Verification:  completionVerification,
+				ReceiptPath:   receiptPath,
+				Sandbox:       runSandboxRecords,
+				MCP:           runMCPReports,
+				MCPGeneration: mcpGeneration,
+				Completion:    completionSnapshot,
+				RunMode:       runModeSnapshot,
+				Recovery:      recovery,
+			}
+			switch {
+			case completionBlocked:
+				terminal.Fail(
+					RunTerminalFailed,
+					"completion_blocked",
+					"Completion contract blocked the run terminal",
+					doneData,
+				)
+			case runModeStopReason == "max_cycles":
+				terminal.Fail(
+					RunTerminalMaxCycles,
+					"max_cycles",
+					"Run mode reached its maximum cycle limit",
+					doneData,
+				)
+			default:
+				terminal.Complete(
+					RunTerminalCompleted,
+					terminalStopReason,
+					RunTerminalDurableCommit,
+					doneData,
+					runSummary,
+				)
 			}
 			return
 		}
@@ -983,13 +1975,7 @@ func RunLoopWithOptions(
 		// Advance the read-only exploration budget, weighting content reads above
 		// navigation (see exploreScore / iterationWeight).
 		exploreScore += iterationWeight(toolUses)
-
-		// Note file edits so auto-verify knows to run tests at completion.
-		for _, tu := range toolUses {
-			if isEditTool(tu.Name) {
-				didEdit = true
-			}
-		}
+		runModeTotalTools += len(toolUses)
 
 		// ── Build assistant message with tool_use blocks ──
 		var assistantContent []map[string]interface{}
@@ -1008,184 +1994,200 @@ func RunLoopWithOptions(
 			Content: mustJSON(assistantContent),
 		})
 
-		// ── Partition tools into concurrent-safe vs serial ──
-		var concurrentTools, serialTools []toolUseBlock
-		for _, tu := range toolUses {
-			inputMap := make(map[string]interface{})
-			json.Unmarshal(tu.Input, &inputMap)
-			if IsConcurrencySafe(tu.Name, inputMap) {
-				concurrentTools = append(concurrentTools, tu)
-			} else {
-				serialTools = append(serialTools, tu)
-			}
-		}
-		if len(concurrentTools) > 1 {
-			log.Printf("[Agent] Parallel: %d concurrent + %d serial", len(concurrentTools), len(serialTools))
-		}
-
-		// ── Execute tools and collect results ──
-		var toolResults []map[string]interface{}
-		// First: run concurrent-safe tools in parallel
-		if len(concurrentTools) > 1 {
-			type toolResultEntry struct {
-				idx    int
-				result map[string]interface{}
-				event  Event
-				tool   toolUseBlock
-				output string
-				isErr  bool
-			}
-			resultCh := make(chan toolResultEntry, len(concurrentTools))
-
-			for idx, tu := range concurrentTools {
-				go func(i int, t toolUseBlock) {
-					hookRegistry.Execute(hooks.HookPreToolUse, map[string]string{
-						"TOOL_NAME": t.Name, "WORK_DIR": workDir,
-					})
-					r, isErr := ExecuteToolWithOptions(t.Name, t.Input, workDir, toolExecOptions)
-					hookRegistry.Execute(hooks.HookPostToolUse, map[string]string{
-						"TOOL_NAME": t.Name, "WORK_DIR": workDir,
-						"TOOL_ERROR": fmt.Sprintf("%v", isErr),
-					})
-					resultCh <- toolResultEntry{
-						idx:    i,
-						tool:   t,
-						output: r,
-						isErr:  isErr,
-						result: map[string]interface{}{
-							"type": "tool_result", "tool_use_id": t.ID,
-							"content": r, "is_error": isErr,
-						},
-						event: Event{Type: "tool_result", Data: map[string]interface{}{
-							"id": t.ID, "name": t.Name, "result": truncateStr(r, 2000), "isError": isErr,
-						}},
-					}
-				}(idx, tu)
-			}
-
-			// Collect parallel results
-			collected := make([]toolResultEntry, len(concurrentTools))
-			for i := 0; i < len(concurrentTools); i++ {
-				entry := <-resultCh
-				collected[entry.idx] = entry
-			}
-			for _, entry := range collected {
-				evidence.ObserveToolResult(entry.tool.Name, entry.tool.Input, entry.output, entry.isErr)
-				eventCh <- entry.event
-				toolResults = append(toolResults, entry.result)
-			}
-		} else {
-			// Run single concurrent tool normally (falls through to serial loop)
-			serialTools = append(concurrentTools, serialTools...)
-		}
-
-		// Then: run serial tools one by one
-		for _, tu := range serialTools {
-			log.Printf("[Agent] Executing: %s", tu.Name)
-
-			// ── Pre-tool hook ──
-			hookRegistry.Execute(hooks.HookPreToolUse, map[string]string{
-				"TOOL_NAME": tu.Name, "WORK_DIR": workDir,
-			})
-
-			// ── Permission check (snapshot + legacy) ──
-			permDecision := permissions.Decide(tu.Name, string(tu.InputRaw))
-
-			permCfg := DefaultPermissionConfig()
-			permCfg.AutoApprove = "moderate"
-			allowed, permReason, dangerLevel := CheckPermission(tu.Name, tu.Input, workDir, permCfg)
-
-			// Snapshot decision overrides if explicit
-			if permDecision == "deny" {
-				allowed = false
-				permReason = "Denied by permission rule"
-			} else if permDecision == "allow" {
-				allowed = true
-			} else if permDecision == "ask" && allowed {
-				// Tool was allowed by legacy check but snapshot says "ask"
-				// Persist this as an allow rule for future sessions
-				hooks.PersistAllowRule(workDir, tu.Name, "")
-				// Announce the first time we create .claude/settings.json so the
-				// user knows a permission file was written to their workspace.
-				if !permFileExisted && !permFileNotified && fileExists(claudeSettings) {
-					permFileNotified = true
-					eventCh <- Event{Type: "status", Data: "[Note] Created .claude/settings.json in this workspace to remember allowed tool permissions."}
+		permissionConfig := DefaultPermissionConfig()
+		permissionConfig.AutoApprove = "moderate"
+		dispatchResults := dispatchToolCalls(toolUses, toolDispatchOptions{
+			Context:           ctx,
+			WorkDir:           workDir,
+			AllowedTools:      allowedTools,
+			PlanMode:          planMode,
+			PermissionConfig:  permissionConfig,
+			ApprovalRequester: opts.ApprovalRequester,
+			SessionID:         opts.SessionID,
+			RunID:             activeRunID,
+			ReadBeforeWrite:   compiledHarness.ReadBeforeWrite(),
+			ReadLedger:        readLedger,
+			RunGuard:          runGuard,
+			PlanStep:          runModePlanStep(opts.RunMode, activePlanStep),
+			SnapshotDecision: func(call toolUseBlock) string {
+				return permissions.Decide(call.Name, call.InputRaw)
+			},
+			ScopeCheck: func(call toolUseBlock) (bool, string) {
+				checker := opts.OwnershipChecker
+				if checker == nil {
+					checker = FileOwnershipChecker
 				}
-			}
-
-			// Show tool input to client
-			var inputPreview interface{}
-			json.Unmarshal(tu.Input, &inputPreview)
-			eventCh <- Event{Type: "tool_input", Data: map[string]interface{}{
-				"id": tu.ID, "name": tu.Name, "input": inputPreview,
-				"danger": string(dangerLevel),
-			}}
-
-			// Plan mode hard-enforces read-only: block any non-read-only tool the
-			// model emitted (the backend can parse a tool call that was withheld
-			// from the tools list), so plan mode never edits or runs commands.
-			if planMode && !planModeTools[tu.Name] {
-				allowed = false
-				permReason = "Plan mode is read-only — describe this change in your plan instead of editing or running commands"
-			}
-
-			if !allowed {
-				eventCh <- Event{Type: "tool_result", Data: map[string]interface{}{
-					"id": tu.ID, "name": tu.Name,
-					"result": fmt.Sprintf("[BLOCKED] %s", permReason), "isError": true,
-				}}
-				toolResults = append(toolResults, map[string]interface{}{
-					"type": "tool_result", "tool_use_id": tu.ID,
-					"content": fmt.Sprintf("Permission denied: %s", permReason), "is_error": true,
+				workerID := strings.TrimSpace(opts.WorkerID)
+				if workerID == "" {
+					workerID = activeWorkerID
+				}
+				if checker == nil || workerID == "" ||
+					(call.Name != "Write" && call.Name != "Edit") {
+					return true, ""
+				}
+				return checker(workerID, dispatchFilePath(call.Input))
+			},
+			PreHook: func(call toolUseBlock) (bool, string) {
+				for _, result := range executeHooks(
+					hooks.HookPreToolUse,
+					map[string]string{
+						"TOOL_NAME": call.Name,
+						"WORK_DIR":  workDir,
+					},
+				) {
+					if result.Blocked {
+						reason := result.Output
+						if reason == "" {
+							reason = result.Error
+						}
+						if reason == "" {
+							reason = "Project hook rejected the tool call"
+						}
+						return true, reason
+					}
+				}
+				return false, ""
+			},
+			PostHook: func(call toolUseBlock, result string, isError bool) {
+				executeHooks(hooks.HookPostToolUse, map[string]string{
+					"TOOL_NAME":   call.Name,
+					"WORK_DIR":    workDir,
+					"TOOL_RESULT": result,
+					"TOOL_ERROR":  fmt.Sprintf("%v", isError),
 				})
-				continue
-			}
-
-			// Capture pre-edit state so the user can be shown a diff of the change
-			// (Write reads the old file now; Edit uses its old_string).
-			var diffFile, diffBefore string
-			if tu.Name == "Edit" || tu.Name == "Write" {
-				diffFile = editFilePath(tu.Input)
-				diffBefore = editFileBefore(tu.Name, tu.Input, workDir)
-				// Snapshot the file's prior state for /undo (new generation on the
-				// turn's first edit).
+			},
+			BeforeExecute: func(call toolUseBlock) toolMutationPreview {
+				if call.Name != "Write" && call.Name != "Edit" {
+					return toolMutationPreview{}
+				}
+				file := editFilePath(call.Input)
+				preview := toolMutationPreview{
+					File:   file,
+					Before: editFileBefore(call.Name, call.Input, workDir),
+				}
 				if !checkpointStarted {
 					startCheckpoint(workDir)
 					checkpointStarted = true
 				}
-				checkpointFile(workDir, diffFile, resolvePath(diffFile, workDir))
-			}
-
-			result, isError := ExecuteToolWithOptions(tu.Name, tu.Input, workDir, toolExecOptions)
-			evidence.ObserveToolResult(tu.Name, tu.Input, result, isError)
-
-			// ── Post-tool hook ──
-			hookRegistry.Execute(hooks.HookPostToolUse, map[string]string{
-				"TOOL_NAME": tu.Name, "WORK_DIR": workDir,
-				"TOOL_RESULT": truncateStr(result, 500),
-				"TOOL_ERROR":  fmt.Sprintf("%v", isError),
-			})
-
-			// Send result to client
-			eventCh <- Event{Type: "tool_result", Data: map[string]interface{}{
-				"id": tu.ID, "name": tu.Name, "result": truncateStr(result, 2000), "isError": isError,
-			}}
-
-			// Show the edit as a before/after diff so the user sees exactly what
-			// changed — the Claude-Code-style edit preview.
-			if diffFile != "" && !isError {
-				if d := unifiedLineDiff(diffBefore, editFileAfter(tu.Name, tu.Input)); d != "" {
-					eventCh <- Event{Type: "diff", Data: map[string]string{"file": diffFile, "diff": d}}
+				checkpointFile(workDir, file, resolvePath(file, workDir))
+				return preview
+			},
+			PreExecutionJournal: opts.PreExecutionJournal,
+			Execute: func(call toolUseBlock) (string, bool) {
+				log.Printf("[Agent] Executing: %s", call.Name)
+				execOptions := toolExecOptions
+				execOptions.ObserveSandbox = func(report sandbox.Report) {
+					sandboxReports.Store(call.ID, report)
 				}
-				editedFiles = append(editedFiles, diffFile) // deduped in the summary
+				content, isError := ExecuteToolWithOptions(
+					call.Name,
+					call.Input,
+					workDir,
+					execOptions,
+				)
+				if !isError && call.Name != loadToolResultToolName && opts.ToolResultStore != nil {
+					content, isError = persistSuccessfulToolResult(opts.ToolResultStore, call.Name, content)
+				}
+				return content, isError
+			},
+			Emit: func(event Event) {
+				eventCh <- event
+			},
+		})
+
+		concurrentExecuted := 0
+		var toolResults []map[string]interface{}
+		for _, result := range dispatchResults {
+			if result.Concurrent && result.Executed {
+				concurrentExecuted++
+			}
+			evidence.ObserveToolResult(
+				result.Tool.Name,
+				result.Tool.Input,
+				result.Content,
+				result.IsError,
+			)
+			if completionContract != nil {
+				if _, evidenceErr := evidence.ObserveCompletionToolOutcome(CompletionToolOutcome{
+					ToolName:  result.Tool.Name,
+					Input:     result.Tool.Input,
+					Result:    result.Content,
+					IsError:   result.IsError,
+					Executed:  result.Executed,
+					Synthetic: result.Synthetic,
+					Denied:    !result.Executed,
+				}); evidenceErr != nil {
+					message := "Completion evidence indexing failed"
+					terminal.Fail(RunTerminalFailed, "completion_evidence_index_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+			}
+			toolEvent := map[string]interface{}{
+				"id":       result.Tool.ID,
+				"name":     result.Tool.Name,
+				"result":   truncateStr(result.Display, 2000),
+				"isError":  result.IsError,
+				"executed": result.Executed,
+			}
+			if value, ok := sandboxReports.LoadAndDelete(result.Tool.ID); ok {
+				report := value.(sandbox.Report)
+				record := SandboxExecutionRecord{
+					ToolID:   result.Tool.ID,
+					ToolName: result.Tool.Name,
+					Report:   report,
+				}
+				toolEvent["sandbox"] = report
+				recordSandboxExecution(opts.Recorder, record)
+				sandboxRecordsMu.Lock()
+				sandboxRecords = append(sandboxRecords, record)
+				sandboxRecordsMu.Unlock()
+			}
+			eventCh <- Event{Type: "tool_result", Data: toolEvent}
+
+			if result.Executed && !result.IsError && isEditTool(result.Tool.Name) {
+				didEdit = true
+				file := result.Mutation.File
+				if file == "" {
+					file = dispatchFilePath(result.Tool.Input)
+				}
+				if file != "" {
+					editedFiles = append(editedFiles, file)
+				}
+				if result.Mutation.File != "" {
+					if diff := unifiedLineDiff(
+						result.Mutation.Before,
+						editFileAfter(result.Tool.Name, result.Tool.Input),
+					); diff != "" {
+						eventCh <- Event{Type: "diff", Data: map[string]string{
+							"file": result.Mutation.File,
+							"diff": diff,
+						}}
+					}
+				}
 			}
 
 			toolResults = append(toolResults, map[string]interface{}{
 				"type":        "tool_result",
-				"tool_use_id": tu.ID,
-				"content":     result,
-				"is_error":    isError,
+				"tool_use_id": result.Tool.ID,
+				"content":     result.Content,
+				"is_error":    result.IsError,
 			})
+		}
+		if concurrentExecuted > 1 {
+			log.Printf("[Agent] Parallel: %d authorized tools", concurrentExecuted)
+		}
+		if routing.observeDispatch(completionExecutionResults(dispatchResults)) {
+			tools, err = pinCompletionControlTool(routing.tools(), completionContract)
+			if err != nil {
+				message := "Tool routing configuration failed"
+				terminal.Fail(RunTerminalFailed, "tool_routing_failed", message, nil)
+				eventCh <- Event{Type: "error", Data: message}
+				return
+			}
+			record := routing.record()
+			record.Exposed = len(tools)
+			eventCh <- Event{Type: "tool_route", Data: record}
 		}
 
 		// ── Add tool results as user message ──
@@ -1209,18 +2211,59 @@ func RunLoopWithOptions(
 				"Stopped after %d consecutive failed tool rounds — the model appears "+
 					"stuck repeating a failing action. Try rephrasing the request.",
 				consecutiveErrorRounds)
+			recovery := recoverySnapshot()
+			data := map[string]interface{}{}
+			if recovery != nil {
+				data["recovery"] = *recovery
+				data["receipt"] = writeRecoveryReceipt(i+1, recovery)
+			}
 			eventCh <- Event{Type: "error", Data: msg}
-			failRun(opts.Recorder, msg)
-			hookRegistry.Execute(hooks.HookSessionEnd, map[string]string{"WORK_DIR": workDir})
+			terminal.Fail(RunTerminalFailed, "consecutive_tool_failures", msg, data)
 			return
 		}
 
 		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Iteration %d/%d — %d tools executed", i+1, maxIterations, len(toolUses))}
 	}
 
-	hookRegistry.Execute(hooks.HookSessionEnd, map[string]string{"WORK_DIR": workDir})
+	recovery := recoverySnapshot()
+	data := map[string]interface{}{}
+	if recovery != nil {
+		data["recovery"] = *recovery
+		data["receipt"] = writeRecoveryReceipt(maxIterations, recovery)
+	}
 	eventCh <- Event{Type: "error", Data: "Max iterations reached"}
-	failRun(opts.Recorder, "Max iterations reached")
+	terminal.Fail(RunTerminalMaxIterations, "max_iterations", "Max iterations reached", data)
+}
+
+const toolResultPersistenceFailureMessage = "tool result unavailable: durable persistence failed"
+
+// persistSuccessfulToolResult runs inside the dispatch Execute callback, so
+// its output is the first form visible to post-hooks, events, recorders, the
+// durable observer, or the next provider request. Any failed large write is
+// replaced with a fixed tool error; the raw payload is never returned.
+func persistSuccessfulToolResult(store ToolResultStore, toolName, content string) (string, bool) {
+	if checked, ok := store.(CheckedToolResultStore); ok {
+		reference, disposition, err := checked.StoreResultChecked(toolName, content)
+		if err != nil {
+			return toolResultPersistenceFailureMessage, true
+		}
+		if disposition == ToolResultPersisted {
+			return reference, false
+		}
+		if len(content) > maxInlineToolResultBytes {
+			return toolResultPersistenceFailureMessage, true
+		}
+		return content, false
+	}
+
+	reference, replaced := store.StoreResult(toolName, content)
+	if replaced {
+		return reference, false
+	}
+	if len(content) > maxInlineToolResultBytes {
+		return toolResultPersistenceFailureMessage, true
+	}
+	return content, false
 }
 
 type toolUseBlock struct {

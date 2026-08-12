@@ -120,7 +120,7 @@ func TestUpdateIndex_PreservesHandEditedSections(t *testing.T) {
 
 	// User-authored MEMORY.md with a top section and markers already in place.
 	initial := "# MEMORY.md\n\n" +
-		"## Project Goals\n- Ship AniClew v1.1\n- Long-term memory working\n\n" +
+		"## Project Goals\n- Ship Corelay Code v1.1\n- Long-term memory working\n\n" +
 		autoStartMarker + "\n" +
 		"_No extracted memories yet._\n" +
 		autoEndMarker + "\n"
@@ -149,7 +149,7 @@ func TestUpdateIndex_PreservesHandEditedSections(t *testing.T) {
 	if !strings.Contains(content, "## Project Goals") {
 		t.Error("hand-edited Project Goals section was lost")
 	}
-	if !strings.Contains(content, "Ship AniClew v1.1") {
+	if !strings.Contains(content, "Ship Corelay Code v1.1") {
 		t.Error("hand-edited bullet was lost")
 	}
 	if !strings.Contains(content, "### User") {

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/types"
-	"github.com/aniclew/aniclew/internal/workstream"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 func TestServerTeamTaskFilesDefaultsLegacyScope(t *testing.T) {
@@ -56,8 +56,8 @@ func TestHandleTeamExecuteRejectsInvalidPlan(t *testing.T) {
 }
 
 func TestHandleTeamExecuteRecordsTraceAndWorkstream(t *testing.T) {
-	t.Setenv("ANICLEW_MEMORY", "off")
-	t.Setenv("ANICLEW_AUTOSKILL", "off")
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
 
 	workDir := t.TempDir()
 	provider := &agentLoopFakeProvider{text: "team ok"}

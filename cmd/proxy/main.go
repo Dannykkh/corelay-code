@@ -4,32 +4,46 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/config"
-	"github.com/aniclew/aniclew/internal/gateway"
-	"github.com/aniclew/aniclew/internal/kairos"
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/providers"
-	"github.com/aniclew/aniclew/internal/router"
-	"github.com/aniclew/aniclew/internal/server"
-	"github.com/aniclew/aniclew/internal/translate"
-	"github.com/aniclew/aniclew/internal/tray"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/gateway"
+	"github.com/Dannykkh/corelay-code/internal/kairos"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/providers"
+	"github.com/Dannykkh/corelay-code/internal/router"
+	"github.com/Dannykkh/corelay-code/internal/server"
+	"github.com/Dannykkh/corelay-code/internal/translate"
+	"github.com/Dannykkh/corelay-code/internal/tray"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 func main() {
-	// Subcommand: `aniclew chat` runs the built-in terminal client (connects to
-	// a running server's /api/agent). Everything else starts the server.
+	providerName := flag.String("provider", "", "Provider name")
+	model := flag.String("model", "", "Model ID")
+	port := flag.Int("port", 0, "Listen port (default 4000)")
+	enableRouter := flag.Bool("router", false, "Enable smart router")
+	flag.Usage = func() { printRootUsage(flag.CommandLine.Output()) }
+
+	// Subcommand: `corelaycode chat` runs the built-in terminal client (connects to
+	// a running server's /api/agent). `corelaycode tui` is an explicit alias for
+	// the full-screen client. Everything else starts the server.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "chat":
 			runChat(os.Args[2:])
+			return
+		case "tui":
+			runChat(append([]string{"-tui"}, os.Args[2:]...))
+			return
+		case "help":
+			printRootUsage(os.Stdout)
 			return
 		case "worker":
 			runWorker(os.Args[2:])
@@ -40,10 +54,6 @@ func main() {
 		}
 	}
 
-	providerName := flag.String("provider", "", "Provider name")
-	model := flag.String("model", "", "Model ID")
-	port := flag.Int("port", 0, "Listen port (default 4000)")
-	enableRouter := flag.Bool("router", false, "Enable smart router")
 	flag.Parse()
 
 	// Load saved config
@@ -159,9 +169,9 @@ func main() {
 	runtimeQuotaCollectors := srv.StartRuntimeQuotaCollectors(cfg.RuntimeQuotaSources)
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "  ╔══════════════════════════════════════╗\n")
-	fmt.Fprintf(os.Stderr, "  ║   AniClew v1.0 — Any Model, One Agent   ║\n")
-	fmt.Fprintf(os.Stderr, "  ╚══════════════════════════════════════╝\n")
+	fmt.Fprintf(os.Stderr, "  ╔══════════════════════════════════════════╗\n")
+	fmt.Fprintf(os.Stderr, "  ║ Corelay Code v1.0 — Any Model, One Agent ║\n")
+	fmt.Fprintf(os.Stderr, "  ╚══════════════════════════════════════════╝\n")
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "  Proxy:     http://localhost:%d\n", *port)
 	fmt.Fprintf(os.Stderr, "  Dashboard: http://localhost:%d/dashboard\n", *port)
@@ -172,10 +182,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  Quota:     collector polling %d source(s)\n", runtimeQuotaCollectors)
 	}
 	if agent.OfflineMode() {
-		fmt.Fprintf(os.Stderr, "  Network:   AIR-GAP (ANICLEW_OFFLINE) — WebSearch/WebFetch/HTTPRequest disabled\n")
+		fmt.Fprintf(os.Stderr, "  Network:   AIR-GAP (CORELAY_OFFLINE) — WebSearch/WebFetch/HTTPRequest disabled\n")
 	}
 	if budget := translate.ToolBudget(); budget > 0 {
-		fmt.Fprintf(os.Stderr, "  Tools:     budget %d (ANICLEW_MAX_TOOLS) — large tool lists pruned for weak models\n", budget)
+		fmt.Fprintf(os.Stderr, "  Tools:     budget %d (CORELAY_MAX_TOOLS) — large tool lists pruned for weak models\n", budget)
 	}
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "  Usage:\n")
@@ -194,7 +204,7 @@ func main() {
 	go tray.OpenBrowser(*port)
 
 	// System tray icon (Windows only; no-op elsewhere). Right-click → Open
-	// Dashboard / Quit AniClew. Quit pushes os.Interrupt into sigCh so the
+	// Dashboard / Quit Corelay Code. Quit pushes os.Interrupt into sigCh so the
 	// existing graceful drain path handles tear-down.
 	if err := tray.Run(*port,
 		func() { tray.OpenBrowser(*port) },
@@ -244,8 +254,22 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  Goodbye.\n")
 }
 
+func printRootUsage(out io.Writer) {
+	fmt.Fprintln(out, "Usage:")
+	fmt.Fprintln(out, "  corelaycode [server flags]        Start the Corelay Code server")
+	fmt.Fprintln(out, "  corelaycode chat [flags]          Interactive TUI with automatic line fallback")
+	fmt.Fprintln(out, "  corelaycode tui [flags]           Require the full-screen TUI")
+	fmt.Fprintln(out, "  corelaycode chat -plain           Line-oriented terminal client")
+	fmt.Fprintln(out, "  corelaycode chat -p <prompt>      One-shot terminal client")
+	fmt.Fprintln(out, "  corelaycode worker [flags]        Run a worker client")
+	fmt.Fprintln(out, "  corelaycode team [flags]          Run a team client")
+	fmt.Fprintln(out, "\nServer flags:")
+	flag.CommandLine.SetOutput(out)
+	flag.CommandLine.PrintDefaults()
+}
+
 func interactiveSelect() (string, string) {
-	fmt.Fprintf(os.Stderr, "\n  AniClew\n")
+	fmt.Fprintf(os.Stderr, "\n  Corelay Code\n")
 	fmt.Fprintf(os.Stderr, "  ═══════════════════════\n\n")
 	fmt.Fprintf(os.Stderr, "  Select provider:\n")
 

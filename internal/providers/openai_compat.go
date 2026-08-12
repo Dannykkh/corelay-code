@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/aniclew/aniclew/internal/stream"
-	"github.com/aniclew/aniclew/internal/translate"
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/stream"
+	"github.com/Dannykkh/corelay-code/internal/translate"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // OpenAICompat is the base for all OpenAI-compatible providers.
@@ -19,6 +19,7 @@ type OpenAICompat struct {
 	ModelList    []types.ModelInfo
 	BaseURL      string
 	AuthHeader   func() (string, string) // returns (headerName, headerValue)
+	HTTPDoer     HTTPDoer
 }
 
 func (p *OpenAICompat) Name() string              { return p.ProviderName }
@@ -37,7 +38,7 @@ func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesReq
 	url := p.BaseURL + "/v1/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s request construction failed", p.ProviderName)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -56,7 +57,7 @@ func (p *OpenAICompat) StreamMessage(ctx context.Context, req *types.MessagesReq
 		}
 	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := httpDoerOrDefault(p.HTTPDoer).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("%s connection failed: %w", p.ProviderName, err)
 	}

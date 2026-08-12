@@ -1,4 +1,4 @@
-# Contributing to AniClew
+# Contributing to Corelay Code
 
 Thank you for your interest in contributing!
 
@@ -6,12 +6,12 @@ Thank you for your interest in contributing!
 
 ```bash
 # Clone
-git clone https://github.com/Dannykkh/Ani-Clew.git
-cd Ani-Clew
+git clone https://github.com/Dannykkh/corelay-code.git
+cd corelay-code
 
-# Backend (Go)
-go build -o aniclew ./cmd/proxy/
-./aniclew --provider ollama --model qwen3:14b
+# Backend (Go; builds corelaycode and both helper executables)
+make go
+./corelaycode --provider ollama --model qwen3:14b
 
 # Frontend (React)
 cd web

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/agent"
-	"github.com/aniclew/aniclew/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/config"
 )
 
 type evidencePolicyResponse struct {

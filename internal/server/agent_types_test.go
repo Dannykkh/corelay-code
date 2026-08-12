@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/aniclew/aniclew/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/agent"
 )
 
 func TestHandleAgentTypesIncludesCustomAgents(t *testing.T) {

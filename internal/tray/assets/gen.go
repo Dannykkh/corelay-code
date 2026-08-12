@@ -1,6 +1,6 @@
 //go:build ignore
 
-// One-shot generator for the AniClew tray icon. Produces aniclew.ico with two
+// One-shot generator for the Corelay Code tray icon. Produces corelaycode.ico with two
 // PNG-encoded sizes (16x16, 32x32) — Windows Vista+ accepts PNG inside ICO.
 // Run with:  go run gen.go
 // Stdlib only; no design assets needed.
@@ -23,7 +23,7 @@ var (
 	accent = color.RGBA{0x7a, 0xa2, 0xf7, 0xff} // bright cyan-blue
 )
 
-// makeIcon draws a stylized "A" mark scaled to the given pixel size. The
+// makeIcon draws a stylized "C" mark scaled to the given pixel size. The
 // shape is rendered geometrically (no font) so the binary keeps zero deps.
 func makeIcon(size int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -32,63 +32,19 @@ func makeIcon(size int) *image.RGBA {
 	// Coordinates normalized to a 32-unit grid, then scaled.
 	s := func(v int) int { return v * size / 32 }
 
-	// Outer triangle (A silhouette): apex at top center.
-	fillPoly(img, accent, []point{
-		{s(16), s(4)}, {s(4), s(28)}, {s(28), s(28)},
-	})
-
-	// Inner "letterhole" — fills the upper triangular notch with background
-	// so we get the open-top look of an A.
-	fillPoly(img, bg, []point{
-		{s(16), s(12)}, {s(10), s(22)}, {s(22), s(22)},
-	})
-
-	// Crossbar of the A — short accent rectangle cutting across the hole.
-	fillRect(img, accent, s(11), s(18), s(21), s(20))
+	// A ring with a right-side opening stays legible as a C at both 16px and 32px.
+	fillCircle(img, accent, s(16), s(16), s(12))
+	fillCircle(img, bg, s(16), s(16), s(7))
+	fillRect(img, bg, s(16), s(11), s(31), s(21))
 
 	return img
 }
 
-type point struct{ x, y int }
-
-// fillPoly is a simple scanline polygon fill (good enough for convex triangles
-// at icon resolution — no anti-aliasing, which actually looks cleaner at 16px).
-func fillPoly(img *image.RGBA, c color.Color, pts []point) {
-	if len(pts) < 3 {
-		return
-	}
-	minY, maxY := pts[0].y, pts[0].y
-	for _, p := range pts[1:] {
-		if p.y < minY {
-			minY = p.y
-		}
-		if p.y > maxY {
-			maxY = p.y
-		}
-	}
-	for y := minY; y <= maxY; y++ {
-		var xs []int
-		for i := 0; i < len(pts); i++ {
-			a, b := pts[i], pts[(i+1)%len(pts)]
-			if (a.y <= y && b.y > y) || (b.y <= y && a.y > y) {
-				// Edge crosses this scanline; compute x intercept.
-				x := a.x + (y-a.y)*(b.x-a.x)/(b.y-a.y)
-				xs = append(xs, x)
-			}
-		}
-		if len(xs) < 2 {
-			continue
-		}
-		// Even-odd fill between sorted x pairs.
-		for i := 0; i+1 < len(xs); i++ {
-			for j := i + 1; j < len(xs); j++ {
-				if xs[j] < xs[i] {
-					xs[i], xs[j] = xs[j], xs[i]
-				}
-			}
-		}
-		for k := 0; k+1 < len(xs); k += 2 {
-			for x := xs[k]; x <= xs[k+1]; x++ {
+func fillCircle(img *image.RGBA, c color.Color, centerX, centerY, radius int) {
+	for y := centerY - radius; y <= centerY+radius; y++ {
+		for x := centerX - radius; x <= centerX+radius; x++ {
+			dx, dy := x-centerX, y-centerY
+			if dx*dx+dy*dy <= radius*radius {
 				img.Set(x, y, c)
 			}
 		}
@@ -126,9 +82,9 @@ func writeICO(path string, pngs map[int][]byte) error {
 
 	var out bytes.Buffer
 	// ICONDIR header
-	binary.Write(&out, binary.LittleEndian, uint16(0))            // reserved
-	binary.Write(&out, binary.LittleEndian, uint16(1))            // type = icon
-	binary.Write(&out, binary.LittleEndian, uint16(len(sizes)))   // count
+	binary.Write(&out, binary.LittleEndian, uint16(0))          // reserved
+	binary.Write(&out, binary.LittleEndian, uint16(1))          // type = icon
+	binary.Write(&out, binary.LittleEndian, uint16(len(sizes))) // count
 
 	dirSize := 6 + 16*len(sizes)
 	offset := dirSize
@@ -159,8 +115,8 @@ func main() {
 		16: encodePNG(makeIcon(16)),
 		32: encodePNG(makeIcon(32)),
 	}
-	if err := writeICO("aniclew.ico", pngs); err != nil {
+	if err := writeICO("corelaycode.ico", pngs); err != nil {
 		log.Fatal(err)
 	}
-	log.Println("wrote aniclew.ico")
+	log.Println("wrote corelaycode.ico")
 }

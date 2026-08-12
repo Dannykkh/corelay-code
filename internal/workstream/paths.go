@@ -1,12 +1,15 @@
 package workstream
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
 
 const (
-	stateDirName       = ".aniclew"
+	stateDirName       = ".corelay"
+	legacyStateDirName = ".aniclew"
+	proxyStateDirName  = ".claude-proxy"
 	workstreamsDir     = "workstreams"
 	workstreamJSONName = "workstream.json"
 	timelineName       = "timeline.jsonl"
@@ -14,7 +17,22 @@ const (
 )
 
 func Root(workspace string) string {
-	return filepath.Join(workspace, stateDirName, workstreamsDir)
+	current := filepath.Join(workspace, stateDirName, workstreamsDir)
+	if pathExists(current) {
+		return current
+	}
+	for _, name := range []string{legacyStateDirName, proxyStateDirName} {
+		legacy := filepath.Join(workspace, name, workstreamsDir)
+		if pathExists(legacy) {
+			return legacy
+		}
+	}
+	return current
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil || !os.IsNotExist(err)
 }
 
 func Dir(workspace, id string) string {

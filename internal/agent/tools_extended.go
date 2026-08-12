@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
-	"github.com/aniclew/aniclew/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
 // ExtendedToolDefs returns additional tool definitions beyond the base 6.
@@ -69,13 +68,12 @@ func ExtendedToolDefs() []types.ToolDef {
 		// ── Git Tools ──
 		{
 			Name:        "Git",
-			Description: "Run git commands. Safe commands (status, diff, log, branch, show, blame) run directly. Mutating commands (add, commit, push, reset) require confirm:true.",
+			Description: "Run git commands. Read-only commands may run automatically; mutating commands require explicit permission approval.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"command": {"type": "string", "description": "Git subcommand: status, diff, log, branch, add, commit, push, show, blame, stash"},
-					"args": {"type": "string", "description": "Additional arguments"},
-					"confirm": {"type": "boolean", "description": "Required true for mutating commands"}
+					"args": {"type": "string", "description": "Additional arguments"}
 				},
 				"required": ["command"]
 			}`),
@@ -136,24 +134,17 @@ func ExtendedToolDefs() []types.ToolDef {
 				"required": ["file_path"]
 			}`),
 		},
-		{
-			Name:        "NotebookEdit",
-			Description: "Edit a cell in a Jupyter notebook.",
-			InputSchema: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"file_path": {"type": "string", "description": "Path to .ipynb file"},
-					"cell_index": {"type": "integer", "description": "Cell index (0-based)"},
-					"new_source": {"type": "string", "description": "New cell content"}
-				},
-				"required": ["file_path", "cell_index", "new_source"]
-			}`),
-		},
 	}
 }
 
 // ExecuteExtendedTool handles the extended tools.
 func ExecuteExtendedTool(name string, input json.RawMessage, workDir string) (string, bool, bool) {
+	return ExecuteExtendedToolWithOptions(name, input, workDir, ToolExecutionOptions{})
+}
+
+// ExecuteExtendedToolWithOptions preserves the common process execution
+// contract for extended tools that start a child process.
+func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool, bool) {
 	switch name {
 	case "WebSearch":
 		r, e := executeWebSearch(input, workDir)
@@ -165,7 +156,7 @@ func ExecuteExtendedTool(name string, input json.RawMessage, workDir string) (st
 		r, e := executeWebResearch(input, workDir)
 		return r, e, true
 	case "Git":
-		r, e := executeGit(input, workDir)
+		r, e := executeGit(input, workDir, opts)
 		return r, e, true
 	case "LS":
 		r, e := executeLS(input, workDir)
@@ -194,59 +185,51 @@ func ExecuteExtendedTool(name string, input json.RawMessage, workDir string) (st
 
 // ── Git ──
 
-var safeGitCommands = map[string]bool{
-	"status": true, "diff": true, "log": true, "branch": true,
-	"show": true, "blame": true, "stash": true, "remote": true, "tag": true,
-}
-
-func executeGit(input json.RawMessage, workDir string) (string, bool) {
+func executeGit(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
+	paths, err := executionToolWorkspacePaths("Git", input, workDir)
+	if err != nil {
+		return "Git blocked: " + err.Error(), true
+	}
 	var args struct {
 		Command string `json:"command"`
 		Args    string `json:"args"`
-		Confirm bool   `json:"confirm"`
 	}
-	json.Unmarshal(input, &args)
-
-	if !safeGitCommands[args.Command] && !args.Confirm {
-		return fmt.Sprintf("Git '%s' is a mutating command. Set confirm:true to execute.", args.Command), true
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "Git blocked: invalid input: " + err.Error(), true
 	}
-
-	cmdArgs := []string{args.Command}
-	if args.Args != "" {
-		cmdArgs = append(cmdArgs, strings.Fields(args.Args)...)
-	}
+	cmdArgs := paths.many("arguments")
 
 	// Safety: block force push and destructive resets
-	fullCmd := args.Command + " " + args.Args
+	fullCmd := strings.Join(cmdArgs, " ")
 	if strings.Contains(fullCmd, "--force") || strings.Contains(fullCmd, "reset --hard") {
 		return "Blocked: force push and hard reset are not allowed for safety.", true
 	}
 
-	cmd := exec.Command("git", cmdArgs...)
-	cmd.Dir = workDir
-	out, err := cmd.CombinedOutput()
-	result := string(out)
-	if err != nil {
-		result += "\n[git error: " + err.Error() + "]"
+	process := runToolProcess(opts, "Git", workDir, "git", cmdArgs, defaultToolProcessTimeout)
+	result := process.combinedOutput()
+	if process.policyOrContextFailure() || !process.Started || process.ExitCode != 0 || process.Err != nil {
+		result = process.setupOrExecutionError("git command failed") + "\n[git error]"
 	}
 	if len(result) > 30000 {
 		result = result[:30000] + "\n... (truncated)"
 	}
-	return result, err != nil
+	return result, process.policyOrContextFailure() || !process.Started || process.ExitCode != 0 || process.Err != nil
 }
 
 // ── LS ──
 
 func executeLS(input json.RawMessage, workDir string) (string, bool) {
+	paths, err := executionToolWorkspacePaths("LS", input, workDir)
+	if err != nil {
+		return "LS blocked: " + err.Error(), true
+	}
 	var args struct {
 		Path string `json:"path"`
 	}
-	json.Unmarshal(input, &args)
-
-	dir := workDir
-	if args.Path != "" {
-		dir = resolvePath(args.Path, workDir)
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "LS blocked: invalid input: " + err.Error(), true
 	}
+	dir := paths.one("path")
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -343,12 +326,18 @@ type notebookCell struct {
 }
 
 func executeNotebookRead(input json.RawMessage, workDir string) (string, bool) {
+	paths, err := executionToolWorkspacePaths("NotebookRead", input, workDir)
+	if err != nil {
+		return "Notebook read blocked: " + err.Error(), true
+	}
 	var args struct {
 		FilePath string `json:"file_path"`
 	}
-	json.Unmarshal(input, &args)
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "Notebook read blocked: invalid input: " + err.Error(), true
+	}
 
-	path := resolvePath(args.FilePath, workDir)
+	path := paths.one("file_path")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("Error reading notebook: %v", err), true
@@ -368,40 +357,13 @@ func executeNotebookRead(input json.RawMessage, workDir string) (string, bool) {
 }
 
 func executeNotebookEdit(input json.RawMessage, workDir string) (string, bool) {
-	var args struct {
-		FilePath  string `json:"file_path"`
-		CellIndex int    `json:"cell_index"`
-		NewSource string `json:"new_source"`
+	// Forced or cached calls fail closed too. Notebook mutation must be expressed
+	// through the ordinary Read + Edit tools, which bind execution to a read
+	// ledger revision and use the staged transactional mutation pipeline.
+	if _, err := executionToolWorkspacePaths("NotebookEdit", input, workDir); err != nil {
+		return "Notebook edit blocked: " + err.Error(), true
 	}
-	json.Unmarshal(input, &args)
-
-	path := resolvePath(args.FilePath, workDir)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Sprintf("Error reading notebook: %v", err), true
-	}
-
-	var nb notebookFile
-	if err := json.Unmarshal(data, &nb); err != nil {
-		return fmt.Sprintf("Error parsing notebook: %v", err), true
-	}
-
-	if args.CellIndex < 0 || args.CellIndex >= len(nb.Cells) {
-		return fmt.Sprintf("Cell index %d out of range (0-%d)", args.CellIndex, len(nb.Cells)-1), true
-	}
-
-	// Split source into lines (ipynb stores source as array of lines)
-	lines := strings.Split(args.NewSource, "\n")
-	for i := range lines {
-		if i < len(lines)-1 {
-			lines[i] += "\n"
-		}
-	}
-	nb.Cells[args.CellIndex].Source = lines
-
-	out, _ := json.MarshalIndent(nb, "", " ")
-	os.WriteFile(path, out, 0644)
-	return fmt.Sprintf("Cell %d updated in %s", args.CellIndex, args.FilePath), false
+	return "Notebook edit blocked: NotebookEdit is disabled; use Read followed by Edit", true
 }
 
 // ── Helpers ──

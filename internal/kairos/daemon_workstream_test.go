@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aniclew/aniclew/internal/observability"
-	"github.com/aniclew/aniclew/internal/types"
-	"github.com/aniclew/aniclew/internal/workstream"
+	"github.com/Dannykkh/corelay-code/internal/observability"
+	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 func TestDaemonExecuteTaskRecordsWorkstream(t *testing.T) {
