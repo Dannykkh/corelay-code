@@ -46,6 +46,7 @@ type ProbeExecution struct {
 	Target        TargetIdentity
 	PlanVersion   string
 	PlanDigest    string
+	Variant       HarnessVariant
 	Case          ProbeCase
 	Attempt       int
 	WorkspaceRoot string
@@ -147,7 +148,7 @@ func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePla
 
 			observed, executeErr := p.executor.Execute(ctx, ProbeExecution{
 				Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(),
-				Case: probeCase, Attempt: attempt, WorkspaceRoot: lease.Root(),
+				Variant: plan.Variant(), Case: probeCase, Attempt: attempt, WorkspaceRoot: lease.Root(),
 			})
 			record := normalizeObservation(probeCase, attempt, proof.WorkspaceDigest, observed, executeErr != nil)
 			observations = append(observations, record)
@@ -190,6 +191,7 @@ func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePla
 		Provenance: ProfileProvenance{
 			ProfilerVersion: ProfilerImplementationVersion,
 			PlanVersion:     plan.Version(), PlanDigest: plan.Digest(),
+			FixtureDigest: plan.FixtureDigest(), Variant: plan.Variant(),
 			ExpectedAttempts: plan.Attempts(),
 			Scoring: ScoringPolicySnapshot{
 				ConfidenceThresholdBasisPoints: p.config.ConfidenceThresholdBasisPoints,

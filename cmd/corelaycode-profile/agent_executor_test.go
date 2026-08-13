@@ -12,6 +12,7 @@ import (
 
 	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/capabilityprofile"
+	"github.com/Dannykkh/corelay-code/internal/harness"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -129,7 +130,7 @@ func TestAgentProbeExecutorObservesActualSafetyDenialAndCanary(t *testing.T) {
 	}
 	observation, err := executor.Execute(context.Background(), capabilityprofile.ProbeExecution{
 		Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(),
-		Case: probeCase, Attempt: 1, WorkspaceRoot: workspace,
+		Variant: plan.Variant(), Case: probeCase, Attempt: 1, WorkspaceRoot: workspace,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +161,7 @@ func TestAgentProbeExecutorUsesRealAgentLoopAndReturnsBoundedEvidence(t *testing
 	probeCase := plan.Cases()[0]
 	observation, err := executor.Execute(context.Background(), capabilityprofile.ProbeExecution{
 		Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(),
-		Case: probeCase, Attempt: 1, WorkspaceRoot: t.TempDir(),
+		Variant: plan.Variant(), Case: probeCase, Attempt: 1, WorkspaceRoot: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -179,6 +180,115 @@ func TestAgentProbeExecutorUsesRealAgentLoopAndReturnsBoundedEvidence(t *testing
 	for _, forbidden := range []string{"endpoint.invalid", "sk-not-retained", provider.marker} {
 		if string(encoded) != "" && forbidden != "" && containsText(string(encoded), forbidden) {
 			t.Fatalf("observation leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestAgentProbeExecutorMeasuresRepositoryMapThroughRealAgentLoop(t *testing.T) {
+	provider := &profileTestProvider{
+		name:      "profile-test",
+		toolName:  "RepoMap",
+		toolInput: `{"path":".","include_signatures":true,"max_files":10}`,
+	}
+	target, err := capabilityprofile.NewTargetIdentity(capabilityprofile.TargetSpec{
+		Provider: provider.name, Model: "profile-model", Endpoint: "https://endpoint.invalid",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newAgentProbeExecutor(provider, "profile-model", target, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := capabilityprofile.DefaultProbePlan()
+	var probeCase capabilityprofile.ProbeCase
+	for _, candidate := range plan.Cases() {
+		if candidate.Category == capabilityprofile.CategoryRepositoryMap {
+			probeCase = candidate
+			break
+		}
+	}
+	observation, err := executor.Execute(context.Background(), capabilityprofile.ProbeExecution{
+		Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(),
+		Variant: plan.Variant(), Case: probeCase, Attempt: 1, WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observation.Success || observation.Malformed || observation.FalseDone {
+		t.Fatalf("repository-map observation = %+v", observation)
+	}
+}
+
+func TestAgentProbeExecutorBuildsMinimalAblationWithoutWeakeningKernelSafety(t *testing.T) {
+	provider := &profileTestProvider{name: "profile-test"}
+	target, err := capabilityprofile.NewTargetIdentity(capabilityprofile.TargetSpec{
+		Provider: provider.name, Model: "profile-model", Endpoint: "https://endpoint.invalid",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newAgentProbeExecutor(provider, "profile-model", target, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := capabilityprofile.ProbePlanForVariant(capabilityprofile.HarnessVariantMinimal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probeCase capabilityprofile.ProbeCase
+	for _, candidate := range plan.Cases() {
+		if candidate.Category == capabilityprofile.CategoryPlanAnchor {
+			probeCase = candidate
+			break
+		}
+	}
+	execution := capabilityprofile.ProbeExecution{
+		Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(), Variant: plan.Variant(),
+		Case: probeCase, Attempt: 1, WorkspaceRoot: t.TempDir(),
+	}
+	fixture := agentProbeFixture{marker: "CORELAY_PROBE_TEST"}
+	profile, anchor, err := executor.harnessFor(execution, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anchor != nil || profile.PlanAnchorMode() != harness.PlanAnchorOff ||
+		profile.ResponsePolicy() != harness.ResponseNative || profile.EditPolicy() != harness.EditExact ||
+		profile.ToolRouting() != harness.ToolRoutingDirect || !profile.ReadBeforeWrite() {
+		t.Fatalf("minimal variant escaped its bounded ablation contract: profile=%+v anchor=%+v", profile, anchor)
+	}
+}
+
+func TestReferenceFormatCasesBindFixturesToExpectedParsers(t *testing.T) {
+	plan := capabilityprofile.DefaultProbePlan()
+	want := map[capabilityprofile.ProbeCategory]string{
+		capabilityprofile.CategoryFormatCodeblock: string(agent.ToolCallFormatCodeblock),
+		capabilityprofile.CategoryFormatTokenized: string(agent.ToolCallFormatTokenized),
+	}
+	seen := make(map[capabilityprofile.ProbeCategory]bool)
+	for _, probeCase := range plan.Cases() {
+		expected, ok := want[probeCase.Category]
+		if !ok {
+			continue
+		}
+		seen[probeCase.Category] = true
+		if got := expectedToolFormat(probeCase.Category); got != expected {
+			t.Fatalf("category %q format=%q want=%q", probeCase.Category, got, expected)
+		}
+		fixture, err := prepareAgentProbeFixture(capabilityprofile.ProbeExecution{
+			PlanDigest: plan.Digest(), Variant: plan.Variant(), Case: probeCase,
+			Attempt: 1, WorkspaceRoot: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !containsText(fixture.prompt, "probe.txt") || fixture.marker == "" {
+			t.Fatalf("category %q fixture is incomplete", probeCase.Category)
+		}
+	}
+	for category := range want {
+		if !seen[category] {
+			t.Fatalf("missing reference format case %q", category)
 		}
 	}
 }

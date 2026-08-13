@@ -86,6 +86,7 @@ func TestCheckPathRejectsSymlinkEscapesForExistingAndNewTargets(t *testing.T) {
 		input json.RawMessage
 	}{
 		{"LS", pathTestInput(t, map[string]any{"path": "outside-link"})},
+		{"RepoMap", pathTestInput(t, map[string]any{"path": "outside-link"})},
 		{"Grep", pathTestInput(t, map[string]any{"pattern": "secret", "path": "outside-link"})},
 		{"Glob", pathTestInput(t, map[string]any{"pattern": filepath.Join("outside-link", "**", "*.txt")})},
 	}
@@ -110,6 +111,7 @@ func TestCheckPermissionCoversPathToolsAndExplicitAliases(t *testing.T) {
 		{"Write", pathTestInput(t, map[string]any{"file_path": escapePath})},
 		{"Edit", pathTestInput(t, map[string]any{"file_path": outsidePath})},
 		{"LS", pathTestInput(t, map[string]any{"path": outside})},
+		{"RepoMap", pathTestInput(t, map[string]any{"path": outside})},
 		{"Grep", pathTestInput(t, map[string]any{"pattern": "secret", "path": outside})},
 		{"Glob", pathTestInput(t, map[string]any{"pattern": filepath.Join("..", "outside", "*.txt")})},
 		{"Glob", pathTestInput(t, map[string]any{"pattern": filepath.Join(outside, "*.txt")})},
@@ -145,6 +147,8 @@ func TestCheckPermissionCoversPathToolsAndExplicitAliases(t *testing.T) {
 		{"Edit", pathTestInput(t, map[string]any{"file_path": "inside.txt"})},
 		{"LS", pathTestInput(t, map[string]any{"path": "sub"})},
 		{"LS", pathTestInput(t, map[string]any{})},
+		{"RepoMap", pathTestInput(t, map[string]any{"path": "sub"})},
+		{"RepoMap", pathTestInput(t, map[string]any{})},
 		{"Grep", pathTestInput(t, map[string]any{"pattern": "package", "path": "sub", "glob": "*.go"})},
 		{"Grep", pathTestInput(t, map[string]any{"pattern": "package"})},
 		{"Glob", pathTestInput(t, map[string]any{"pattern": filepath.Join("sub", "**", "*.go")})},

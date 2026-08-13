@@ -69,6 +69,8 @@ const (
 	ToolCallFormatDeclared     ToolCallFormat = "declared_profile"
 	ToolCallFormatHermes       ToolCallFormat = "hermes"
 	ToolCallFormatLiquid       ToolCallFormat = "liquid"
+	ToolCallFormatCodeblock    ToolCallFormat = "tool_codeblock"
+	ToolCallFormatTokenized    ToolCallFormat = "tokenized"
 	ToolCallFormatFencedJSON   ToolCallFormat = "fenced_json"
 	ToolCallFormatBareJSON     ToolCallFormat = "bare_json"
 	ToolCallFormatSuffixRepair ToolCallFormat = "suffix_repair"
@@ -459,6 +461,8 @@ func decodeToolCallCascade(text string, native []toolUseBlock, opts ToolRecovery
 		{ToolCallFormatDeclared, parseDeclaredToolText},
 		{ToolCallFormatHermes, parseHermesToolText},
 		{ToolCallFormatLiquid, parseLiquidToolText},
+		{ToolCallFormatCodeblock, parseToolCodeblockText},
+		{ToolCallFormatTokenized, parseTokenizedToolText},
 		{ToolCallFormatFencedJSON, parseFencedToolText},
 		{ToolCallFormatBareJSON, parseBareToolText},
 		{ToolCallFormatSuffixRepair, parseSuffixRepairToolText},
@@ -1241,6 +1245,232 @@ func isLiquidIdentStart(value byte) bool {
 
 func isLiquidIdentContinue(value byte) bool {
 	return isLiquidIdentStart(value) || value >= '0' && value <= '9'
+}
+
+const (
+	toolCodeblockOpening = "```tool"
+	toolCodeblockClosing = "```"
+	toolCodeblockName    = "TOOL_NAME:"
+	toolCodeblockArg     = "BEGIN_ARG:"
+	toolCodeblockArgEnd  = "END_ARG"
+
+	tokenizedSectionBegin  = "<|tool_calls_section_begin|>"
+	tokenizedSectionEnd    = "<|tool_calls_section_end|>"
+	tokenizedCallBegin     = "<|tool_call_begin|>"
+	tokenizedArgumentBegin = "<|tool_call_argument_begin|>"
+	tokenizedArgumentEnd   = "<|tool_call_argument_end|>"
+	tokenizedCallEnd       = "<|tool_call_end|>"
+)
+
+// parseToolCodeblockText accepts Continue's system-message tool codeblock
+// format. The complete block must be the final non-whitespace content and may
+// contain one call only. Argument values are strict JSON values when possible;
+// otherwise they remain strings, matching the observable format contract.
+func parseToolCodeblockText(text string, _ ToolRecoveryOptions, limits toolParseLimits, digest string) ToolParseResult {
+	start, bodyStart, openingCount := findToolCodeblockOpening(text)
+	if start < 0 {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseNotApplicable, ToolParseReasonNone, digest, nil, nil)
+	}
+	if openingCount != 1 {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	end := strings.Index(text[bodyStart:], toolCodeblockClosing)
+	if end < 0 {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	end += bodyStart
+	blockEnd := end + len(toolCodeblockClosing)
+	if strings.TrimSpace(text[blockEnd:]) != "" {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+
+	body := text[bodyStart:end]
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	lines := strings.Split(body, "\n")
+	if len(lines) == 0 || !strings.HasPrefix(lines[0], toolCodeblockName) {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	name := strings.TrimSpace(strings.TrimPrefix(lines[0], toolCodeblockName))
+	if name == "" {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+
+	arguments := make(map[string]any)
+	for line := 1; line < len(lines); {
+		if strings.TrimSpace(lines[line]) == "" {
+			line++
+			continue
+		}
+		if !strings.HasPrefix(lines[line], toolCodeblockArg) {
+			return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		argumentName := strings.TrimSpace(strings.TrimPrefix(lines[line], toolCodeblockArg))
+		if argumentName == "" {
+			return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		if _, duplicate := arguments[argumentName]; duplicate {
+			return toolParseResult(ToolCallFormatCodeblock, ToolParseRejected, ToolParseReasonInvalidArguments, digest, nil, nil)
+		}
+		valueStart := line + 1
+		line = valueStart
+		for line < len(lines) && strings.TrimSpace(lines[line]) != toolCodeblockArgEnd {
+			line++
+		}
+		if line >= len(lines) {
+			return toolParseResult(ToolCallFormatCodeblock, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		rawValue := strings.TrimSpace(strings.Join(lines[valueStart:line], "\n"))
+		value, err := decodeStrictJSON([]byte(rawValue), limits.depth)
+		if err != nil {
+			value = rawValue
+		}
+		arguments[argumentName] = value
+		line++
+	}
+	raw, err := json.Marshal(arguments)
+	if err != nil || len(raw) > limits.argumentBytes {
+		return toolParseResult(ToolCallFormatCodeblock, ToolParseRejected, ToolParseReasonArgumentLimit, digest, nil, nil)
+	}
+	result := toolParseResult(ToolCallFormatCodeblock, ToolParseParsed, ToolParseReasonNone, digest, []toolUseBlock{{Name: name, Input: raw}}, nil)
+	result.Ranges = []ToolTextRange{{Start: start, End: blockEnd}}
+	return result
+}
+
+func findToolCodeblockOpening(text string) (lastStart, lastBodyStart, count int) {
+	lastStart = -1
+	for offset := 0; offset < len(text); {
+		index := strings.Index(text[offset:], toolCodeblockOpening)
+		if index < 0 {
+			break
+		}
+		index += offset
+		after := index + len(toolCodeblockOpening)
+		atLineStart := index == 0 || text[index-1] == '\n'
+		bodyStart := -1
+		if atLineStart && strings.HasPrefix(text[after:], "\r\n") {
+			bodyStart = after + 2
+		} else if atLineStart && strings.HasPrefix(text[after:], "\n") {
+			bodyStart = after + 1
+		}
+		if bodyStart >= 0 {
+			lastStart, lastBodyStart = index, bodyStart
+			count++
+		}
+		offset = after
+	}
+	return lastStart, lastBodyStart, count
+}
+
+// parseTokenizedToolText accepts the directly-decodable marker format used by
+// goose's Tool Shim before it invokes an interpreter model. Only a complete
+// final section is executable; malformed or orphaned markers fail closed.
+func parseTokenizedToolText(text string, _ ToolRecoveryOptions, limits toolParseLimits, digest string) ToolParseResult {
+	start := strings.LastIndex(text, tokenizedSectionBegin)
+	if start < 0 {
+		if containsTokenizedToolMarker(text) {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		return toolParseResult(ToolCallFormatTokenized, ToolParseNotApplicable, ToolParseReasonNone, digest, nil, nil)
+	}
+	if strings.Count(text, tokenizedSectionBegin) != 1 || strings.Count(text, tokenizedSectionEnd) != 1 {
+		return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	sectionEndOffset := strings.Index(text[start+len(tokenizedSectionBegin):], tokenizedSectionEnd)
+	if sectionEndOffset < 0 {
+		return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	sectionEndOffset += start + len(tokenizedSectionBegin)
+	blockEnd := sectionEndOffset + len(tokenizedSectionEnd)
+	if strings.TrimSpace(text[blockEnd:]) != "" || containsTokenizedToolMarker(text[:start]) {
+		return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	body := text[start+len(tokenizedSectionBegin) : sectionEndOffset]
+	calls := make([]toolUseBlock, 0)
+	for {
+		body = strings.TrimSpace(body)
+		if body == "" {
+			break
+		}
+		if !strings.HasPrefix(body, tokenizedCallBegin) {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		body = body[len(tokenizedCallBegin):]
+		callEnd := strings.Index(body, tokenizedCallEnd)
+		if callEnd < 0 {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		callBody := strings.TrimSpace(body[:callEnd])
+		body = body[callEnd+len(tokenizedCallEnd):]
+		argumentStart := strings.Index(callBody, tokenizedArgumentBegin)
+		if argumentStart < 0 {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		name, ok := normalizeTokenizedToolName(callBody[:argumentStart])
+		if !ok {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+		}
+		rawArguments := strings.TrimSpace(callBody[argumentStart+len(tokenizedArgumentBegin):])
+		if strings.HasSuffix(rawArguments, tokenizedArgumentEnd) {
+			rawArguments = strings.TrimSpace(strings.TrimSuffix(rawArguments, tokenizedArgumentEnd))
+		}
+		value, err := decodeStrictJSON([]byte(rawArguments), limits.depth)
+		if err != nil {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, strictJSONReason(err, ToolParseReasonInvalidJSON), digest, nil, nil)
+		}
+		object, ok := value.(map[string]any)
+		if !ok {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseRejected, ToolParseReasonInvalidArguments, digest, nil, nil)
+		}
+		raw, err := json.Marshal(object)
+		if err != nil || len(raw) > limits.argumentBytes {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseRejected, ToolParseReasonArgumentLimit, digest, nil, nil)
+		}
+		calls = append(calls, toolUseBlock{Name: name, Input: raw})
+		if len(calls) > limits.calls {
+			return toolParseResult(ToolCallFormatTokenized, ToolParseRejected, ToolParseReasonCallLimit, digest, nil, nil)
+		}
+	}
+	if len(calls) == 0 {
+		return toolParseResult(ToolCallFormatTokenized, ToolParseMalformed, ToolParseReasonMalformedEnvelope, digest, nil, nil)
+	}
+	result := toolParseResult(ToolCallFormatTokenized, ToolParseParsed, ToolParseReasonNone, digest, calls, nil)
+	result.Ranges = []ToolTextRange{{Start: start, End: blockEnd}}
+	return result
+}
+
+func containsTokenizedToolMarker(text string) bool {
+	for _, marker := range []string{
+		tokenizedSectionBegin, tokenizedSectionEnd, tokenizedCallBegin,
+		tokenizedArgumentBegin, tokenizedArgumentEnd, tokenizedCallEnd,
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeTokenizedToolName(value string) (string, bool) {
+	name := strings.TrimSpace(value)
+	if strings.HasPrefix(name, "functions.") {
+		name = strings.TrimPrefix(name, "functions.")
+	}
+	if separator := strings.LastIndexByte(name, ':'); separator >= 0 {
+		index := name[separator+1:]
+		if index == "" {
+			return "", false
+		}
+		for _, digit := range index {
+			if digit < '0' || digit > '9' {
+				return "", false
+			}
+		}
+		name = name[:separator]
+	}
+	if name == "" || strings.TrimSpace(name) != name || strings.ContainsAny(name, " \t\r\n<>") {
+		return "", false
+	}
+	return name, true
 }
 
 func parseFencedToolText(text string, _ ToolRecoveryOptions, limits toolParseLimits, digest string) ToolParseResult {

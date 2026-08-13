@@ -59,7 +59,7 @@ const (
 
 // isNavTool reports whether a tool only navigates (lists/finds) rather than
 // reading file content.
-func isNavTool(name string) bool { return name == "LS" || name == "Glob" }
+func isNavTool(name string) bool { return name == "LS" || name == "Glob" || name == "RepoMap" }
 
 // iterationWeight scores one tool-using round for the read-only budget: a round
 // that called any content tool counts full; a navigation-only round counts half.
@@ -75,7 +75,7 @@ func iterationWeight(toolUses []toolUseBlock) float64 {
 // planModeTools is the read-only tool surface allowed in plan mode: the agent
 // explores but cannot change anything, so it produces a plan instead of acting.
 var planModeTools = map[string]bool{
-	"Read": true, "Glob": true, "Grep": true, "LS": true,
+	"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true,
 	loadToolResultToolName: true, reportCompletionToolName: true,
 }
 
@@ -270,11 +270,11 @@ The ONLY way to change the filesystem, run code, or inspect the project is to em
 - Prefer acting over explaining. Make the tool call first; keep any prose short. After tools report success, give a brief confirmation of what the tools actually did.
 - If a task needs several steps, call tools across multiple turns until it is genuinely done.
 
-## Tools: Bash, Read, Write, Edit, Glob, Grep, Git, LS, WebSearch, WebFetch, WebResearch, TaskCreate/Update/List, NotebookRead/Edit, Screenshot, MouseClick, TypeText, OpenApp, FileManager, Clipboard
+## Tools: Bash, Read, Write, Edit, Glob, Grep, Git, LS, RepoMap, WebSearch, WebFetch, WebResearch, TaskCreate/Update/List, NotebookRead/Edit, Screenshot, MouseClick, TypeText, OpenApp, FileManager, Clipboard
 
 ## Rules
 - To create a new file, call Write. To change an existing file, Read it first, then call Edit.
-- Use Glob/Grep to find files instead of guessing paths
+- Use RepoMap for a bounded structural overview and Glob/Grep to find files instead of guessing paths
 - Run tests after changes when possible
 - For git: use Git tool (not Bash)
 - Keep changes minimal and focused

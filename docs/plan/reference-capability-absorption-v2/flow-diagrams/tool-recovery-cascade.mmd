@@ -1,0 +1,22 @@
+flowchart TD
+    A([Model response]) --> B{Provider-native calls present?}
+    B -->|Yes| C[Validate exact catalog name and schema]
+    B -->|No| D[Run pure fixed-order text parsers]
+    D --> E[Declared profile]
+    D --> F[Hermes and Liquid]
+    D --> G[Continue tool codeblock]
+    D --> H[goose tokenized markers]
+    D --> I[Fenced and bare JSON]
+    D --> J[Bounded suffix repair]
+    E --> K{One unambiguous interpretation?}
+    F --> K
+    G --> K
+    H --> K
+    I --> K
+    J --> K
+    K -->|No or rejected| L[Typed correction without raw content]
+    K -->|Yes| C
+    C --> M{Identity schema and limits valid?}
+    M -->|No| L
+    M -->|Yes| N[Common approval journal and dispatch pipeline]
+    N --> O([Tool execution result])

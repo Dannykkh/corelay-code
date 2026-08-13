@@ -1,0 +1,19 @@
+flowchart TD
+    A([Exact provider and model target]) --> B[Select immutable HarnessVariant]
+    B --> C[Build variant-bound ProbePlan]
+    C --> D{Target-bound isolation ready?}
+    D -->|No| X[Block without provider execution]
+    D -->|Yes| E[Run identical calibration and holdout fixtures]
+    E --> F[Persist immutable content-free CapabilityProfile]
+    F --> G{Both variant profiles available?}
+    G -->|No| Y[Report missing comparison input]
+    G -->|Yes| H{Target plan and observation shapes match?}
+    H -->|No| Z[Reject incompatible comparison]
+    H -->|Yes| I[Aggregate category and total deltas]
+    I --> J{Candidate safety regressed?}
+    J -->|Yes| K([Verdict unsafe-regression])
+    J -->|No| L{Candidate score improved?}
+    L -->|Yes| M([Verdict candidate])
+    L -->|No| N{Baseline score improved?}
+    N -->|Yes| O([Verdict baseline])
+    N -->|No| P([Verdict tie])

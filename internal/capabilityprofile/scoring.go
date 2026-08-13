@@ -170,6 +170,8 @@ func recommend(observations []ObservationRecord) Recommendations {
 		recommendation.ResponsePolicy = "native"
 	} else if categoryStable(observations, CategoryFormatHermes) ||
 		categoryStable(observations, CategoryFormatLiquid) ||
+		categoryStable(observations, CategoryFormatCodeblock) ||
+		categoryStable(observations, CategoryFormatTokenized) ||
 		categoryStable(observations, CategoryFormatFencedJSON) ||
 		categoryStable(observations, CategoryFormatBareJSON) {
 		recommendation.ResponsePolicy = "multi-format"

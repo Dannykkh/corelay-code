@@ -181,19 +181,19 @@ func maxFloat(a, b float64) float64 {
 
 var toolsByCategory = map[ToolCategory]map[string]struct{}{
 	ToolCategoryRead: toolNameSet(
-		"Read", "Glob", "LS", "Grep", "NotebookRead", "PDFRead", "ImageRead", "GitDiff",
+		"Read", "Glob", "LS", "Grep", "RepoMap", "NotebookRead", "PDFRead", "ImageRead", "GitDiff",
 	),
 	ToolCategoryWrite: toolNameSet(
-		"Read", "Glob", "Grep", "Write", "Edit", "Lint", "Test", "Diff", "GitDiff", "Bash",
+		"Read", "Glob", "Grep", "RepoMap", "Write", "Edit", "Lint", "Test", "Diff", "GitDiff", "Bash",
 	),
 	ToolCategorySearch: toolNameSet(
-		"Grep", "Glob", "LS", "Read", "GitDiff", "TaskList",
+		"Grep", "Glob", "LS", "Read", "RepoMap", "GitDiff", "TaskList",
 	),
 	ToolCategoryRun: toolNameSet(
 		"Bash", "Test", "Lint", "Git", "GitDiff", "GitCommit", "Read",
 	),
 	ToolCategoryPlan: toolNameSet(
-		"Read", "Glob", "Grep", "LS", "Write", "Edit", "Bash", "TaskCreate", "TaskUpdate", "TaskList", "GitDiff", "Diff",
+		"Read", "Glob", "Grep", "LS", "RepoMap", "Write", "Edit", "Bash", "TaskCreate", "TaskUpdate", "TaskList", "GitDiff", "Diff",
 	),
 	ToolCategoryWeb: toolNameSet(
 		"WebSearch", "WebFetch", "WebResearch", "HTTPRequest", "Read",

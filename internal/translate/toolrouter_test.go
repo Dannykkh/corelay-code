@@ -73,13 +73,14 @@ func TestFilterToolsForCategoryPreservesOrderAndDependencies(t *testing.T) {
 		{Name: "WebSearch"},
 		{Name: "Write"},
 		{Name: "Read"},
+		{Name: "RepoMap"},
 		{Name: "Edit"},
 		{Name: "Bash"},
 		{Name: "Grep"},
 		{Name: "Screenshot"},
 	}
 	got := FilterToolsForCategory(tools, ToolCategoryWrite)
-	want := []string{"Write", "Read", "Edit", "Bash", "Grep"}
+	want := []string{"Write", "Read", "RepoMap", "Edit", "Bash", "Grep"}
 	if !reflect.DeepEqual(toolNamesInOrder(got), want) {
 		t.Fatalf("names = %v, want %v", toolNamesInOrder(got), want)
 	}

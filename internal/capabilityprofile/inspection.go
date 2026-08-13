@@ -14,6 +14,7 @@ import (
 // observations, endpoints, credentials, prompts, and manual-override text.
 type ProfileStatus struct {
 	ProfileID             string             `json:"profileId"`
+	Variant               HarnessVariant     `json:"variant"`
 	CreatedAt             time.Time          `json:"createdAt"`
 	ExpiresAt             time.Time          `json:"expiresAt"`
 	Verified              bool               `json:"verified"`
@@ -61,6 +62,7 @@ func (s *Store) List(target TargetIdentity) ([]ProfileStatus, error) {
 		snapshot := profile.Snapshot()
 		statuses = append(statuses, ProfileStatus{
 			ProfileID: snapshot.ProfileID, CreatedAt: snapshot.CreatedAt,
+			Variant:   profileVariant(snapshot),
 			ExpiresAt: snapshot.ExpiresAt, Verified: snapshot.Verified,
 			ConfidenceBasisPoints: snapshot.ConfidenceBasisPoints,
 			QuarantineReasons:     append([]QuarantineReason(nil), snapshot.QuarantineReasons...),

@@ -1,0 +1,15 @@
+flowchart TD
+    A([Model requests RepoMap]) --> B[Decode unique JSON object]
+    B --> C{Path resolves inside canonical workspace?}
+    C -->|No| X[Typed content-free denial]
+    C -->|Yes| D[Common catalog permission and routing checks]
+    D --> E[Walk recognized source files without following links]
+    E --> F[Skip hidden generated dependency recovery and state trees]
+    F --> G{Declaration signatures requested?}
+    G -->|No| H[Collect relative source paths]
+    G -->|Yes| I[Parse names and type shapes without bodies or values]
+    H --> J[Sort deterministically]
+    I --> J
+    J --> K[Apply candidate file symbol signature and 64 KiB bounds]
+    K --> L([Bounded repository map result])
+    L --> M[Profiler verifies one real call and declaration marker]

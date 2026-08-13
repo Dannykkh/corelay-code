@@ -27,7 +27,7 @@ func toolCallMessageInput(call toolUseBlock) json.RawMessage {
 func IsConcurrencySafe(toolName string, input map[string]interface{}) bool {
 	switch toolName {
 	// Always safe: read-only tools
-	case "Read", "Glob", "Grep", loadToolResultToolName:
+	case "Read", "Glob", "Grep", "RepoMap", loadToolResultToolName:
 		return true
 
 	// Never safe: write tools

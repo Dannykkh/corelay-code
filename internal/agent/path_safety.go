@@ -92,7 +92,7 @@ func resolveToolWorkspacePaths(
 ) (resolvedToolWorkspacePaths, bool, error) {
 	toolName = canonicalPermissionToolName(toolName)
 	switch toolName {
-	case "Read", "Write", "Edit", "Glob", "Grep", "LS",
+	case "Read", "Write", "Edit", "Glob", "Grep", "LS", "RepoMap",
 		"NotebookRead", "NotebookEdit", "ImageRead", "PDFRead",
 		"Lint", "Test", "Git", "GitDiff", "GitCommit", "Diff":
 	default:
@@ -141,7 +141,7 @@ func resolveToolWorkspacePaths(
 		}
 		return resolved, true, errors.New("NotebookEdit is disabled; use Read followed by Edit so the mutation pipeline can verify the artifact revision")
 
-	case "LS", "Lint", "Test":
+	case "LS", "RepoMap", "Lint", "Test":
 		path, err := oneStringField(object, false, "path")
 		if err != nil {
 			return resolved, true, fmt.Errorf("Invalid path: %w", err)

@@ -11,6 +11,8 @@ type RunManifest struct {
 	TargetDigest        string          `json:"targetDigest"`
 	PlanVersion         string          `json:"planVersion"`
 	PlanDigest          string          `json:"planDigest"`
+	FixtureDigest       string          `json:"fixtureDigest"`
+	Variant             HarnessVariant  `json:"variant"`
 	Attempts            int             `json:"attempts"`
 	CalibrationAttempts int             `json:"calibrationAttempts"`
 	HoldoutAttempts     int             `json:"holdoutAttempts"`
@@ -64,11 +66,13 @@ func DescribeRun(target TargetIdentity, plan ProbePlan) (RunManifest, error) {
 		return RunManifest{}, ErrInvalidPlan
 	}
 	manifest := RunManifest{
-		TargetDigest: target.Digest(),
-		PlanVersion:  plan.Version(),
-		PlanDigest:   plan.Digest(),
-		Attempts:     plan.Attempts(),
-		Categories:   plan.SortedCategories(),
+		TargetDigest:  target.Digest(),
+		PlanVersion:   plan.Version(),
+		PlanDigest:    plan.Digest(),
+		FixtureDigest: plan.FixtureDigest(),
+		Variant:       plan.Variant(),
+		Attempts:      plan.Attempts(),
+		Categories:    plan.SortedCategories(),
 	}
 	for _, probeCase := range plan.Cases() {
 		attempts := probeCase.Repeats

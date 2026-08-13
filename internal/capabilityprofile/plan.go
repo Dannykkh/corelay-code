@@ -11,10 +11,35 @@ import (
 )
 
 const (
-	CurrentProbePlanSchemaVersion = 1
-	DefaultProbePlanVersion       = "corelay-capability-probes-v1"
+	CurrentProbePlanSchemaVersion = 2
+	LegacyProbePlanVersion        = "corelay-capability-probes-v1"
+	DefaultProbePlanVersion       = "corelay-capability-probes-v2"
 	maxProbeRepeats               = 20
 )
+
+// HarnessVariant identifies the immutable assistance policy used for every
+// attempt in a ProbePlan. Variants share the Agent Kernel and safety pipeline;
+// they differ only in the adaptive harness capabilities under measurement.
+type HarnessVariant string
+
+const (
+	HarnessVariantCorelay HarnessVariant = "corelay"
+	HarnessVariantMinimal HarnessVariant = "minimal"
+)
+
+func (v HarnessVariant) valid() bool {
+	return v == HarnessVariantCorelay || v == HarnessVariantMinimal
+}
+
+func (v HarnessVariant) Valid() bool { return v.valid() }
+
+func ParseHarnessVariant(value string) (HarnessVariant, error) {
+	variant := HarnessVariant(strings.ToLower(strings.TrimSpace(value)))
+	if !variant.valid() {
+		return "", fmt.Errorf("%w: invalid harness variant", ErrInvalidPlan)
+	}
+	return variant, nil
+}
 
 type ProbeStage string
 
@@ -31,10 +56,13 @@ const (
 	CategoryProtocolNative   ProbeCategory = "protocol-native"
 	CategoryFormatHermes     ProbeCategory = "format-hermes"
 	CategoryFormatLiquid     ProbeCategory = "format-liquid"
+	CategoryFormatCodeblock  ProbeCategory = "format-tool-codeblock"
+	CategoryFormatTokenized  ProbeCategory = "format-tokenized"
 	CategoryFormatFencedJSON ProbeCategory = "format-fenced-json"
 	CategoryFormatBareJSON   ProbeCategory = "format-bare-json"
 	CategoryToolCatalog      ProbeCategory = "tool-catalog"
 	CategoryTwoStageRouting  ProbeCategory = "two-stage-routing"
+	CategoryRepositoryMap    ProbeCategory = "repository-map"
 	CategoryContextCeiling   ProbeCategory = "context-ceiling"
 	CategoryEditPatch        ProbeCategory = "edit-patch"
 	CategoryEditExact        ProbeCategory = "edit-exact"
@@ -49,8 +77,9 @@ const (
 func (c ProbeCategory) valid() bool {
 	switch c {
 	case CategoryProtocolNative, CategoryFormatHermes, CategoryFormatLiquid,
-		CategoryFormatFencedJSON, CategoryFormatBareJSON, CategoryToolCatalog,
-		CategoryTwoStageRouting, CategoryContextCeiling, CategoryEditPatch,
+		CategoryFormatCodeblock, CategoryFormatTokenized, CategoryFormatFencedJSON,
+		CategoryFormatBareJSON, CategoryToolCatalog,
+		CategoryTwoStageRouting, CategoryRepositoryMap, CategoryContextCeiling, CategoryEditPatch,
 		CategoryEditExact, CategoryEditFuzzy, CategoryRepetition,
 		CategoryTruncation, CategoryPlanAnchor, CategorySafetyBoundary,
 		CategorySafetyToolDenial:
@@ -76,21 +105,31 @@ type ProbeCase struct {
 
 type ProbePlanSpec struct {
 	Version string
+	Variant HarnessVariant
 	Cases   []ProbeCase
 }
 
 type ProbePlan struct {
-	version string
-	cases   []ProbeCase
-	digest  string
+	version       string
+	variant       HarnessVariant
+	cases         []ProbeCase
+	digest        string
+	fixtureDigest string
 }
 
 var safeIdentifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 
 func NewProbePlan(spec ProbePlanSpec) (ProbePlan, error) {
 	version := strings.TrimSpace(spec.Version)
+	variant := spec.Variant
+	if variant == "" {
+		variant = HarnessVariantCorelay
+	}
 	if !safeIdentifier.MatchString(version) || credentialLikeIdentityLabel(version) {
 		return ProbePlan{}, fmt.Errorf("%w: invalid version", ErrInvalidPlan)
+	}
+	if !variant.valid() {
+		return ProbePlan{}, fmt.Errorf("%w: invalid harness variant", ErrInvalidPlan)
 	}
 	if len(spec.Cases) == 0 || len(spec.Cases) > 128 {
 		return ProbePlan{}, fmt.Errorf("%w: case count must be between 1 and 128", ErrInvalidPlan)
@@ -131,24 +170,46 @@ func NewProbePlan(spec ProbePlanSpec) (ProbePlan, error) {
 		return ProbePlan{}, fmt.Errorf("%w: calibration, holdout, and holdout-safety cases are required", ErrInvalidPlan)
 	}
 
-	payload := probePlanPayload{SchemaVersion: CurrentProbePlanSchemaVersion, Version: version, Cases: cases}
+	payload := probePlanPayload{SchemaVersion: CurrentProbePlanSchemaVersion, Version: version, Variant: variant, Cases: cases}
 	encoded, _ := json.Marshal(payload)
 	sum := sha256.Sum256(encoded)
-	return ProbePlan{version: version, cases: cases, digest: hex.EncodeToString(sum[:])}, nil
+	fixtureEncoded, _ := json.Marshal(probeFixturePayload{
+		SchemaVersion: CurrentProbePlanSchemaVersion, Version: version, Cases: cases,
+	})
+	fixtureSum := sha256.Sum256(fixtureEncoded)
+	return ProbePlan{
+		version: version, variant: variant, cases: cases,
+		digest: hex.EncodeToString(sum[:]), fixtureDigest: hex.EncodeToString(fixtureSum[:]),
+	}, nil
 }
 
 func DefaultProbePlan() ProbePlan {
+	plan, err := ProbePlanForVariant(HarnessVariantCorelay)
+	if err != nil {
+		panic(err)
+	}
+	return plan
+}
+
+// ProbePlanForVariant returns the fixed production probe matrix for one
+// immutable harness variant. All variants intentionally share the exact same
+// fixture shapes, seeds, repeats, and holdouts.
+func ProbePlanForVariant(variant HarnessVariant) (ProbePlan, error) {
 	plan, err := NewProbePlan(ProbePlanSpec{
 		Version: DefaultProbePlanVersion,
+		Variant: variant,
 		Cases: []ProbeCase{
 			probe("native-call", StageCalibration, CategoryProtocolNative, 101, 3, 0, 8, false, false),
 			probe("hermes-call", StageCalibration, CategoryFormatHermes, 102, 3, 0, 8, false, false),
 			probe("liquid-call", StageCalibration, CategoryFormatLiquid, 103, 3, 0, 8, false, false),
-			probe("fenced-json-call", StageCalibration, CategoryFormatFencedJSON, 104, 3, 0, 8, false, false),
-			probe("bare-json-call", StageCalibration, CategoryFormatBareJSON, 105, 3, 0, 8, false, false),
+			probe("tool-codeblock-call", StageCalibration, CategoryFormatCodeblock, 104, 3, 0, 8, false, false),
+			probe("tokenized-call", StageCalibration, CategoryFormatTokenized, 105, 3, 0, 8, false, false),
+			probe("fenced-json-call", StageCalibration, CategoryFormatFencedJSON, 106, 3, 0, 8, false, false),
+			probe("bare-json-call", StageCalibration, CategoryFormatBareJSON, 107, 3, 0, 8, false, false),
 			probe("tool-catalog-16", StageCalibration, CategoryToolCatalog, 201, 3, 0, 16, false, false),
 			probe("tool-catalog-48", StageCalibration, CategoryToolCatalog, 202, 3, 0, 48, false, false),
 			probe("routing-small-context", StageCalibration, CategoryTwoStageRouting, 203, 3, 16_000, 48, false, false),
+			probe("repository-map", StageCalibration, CategoryRepositoryMap, 204, 3, 0, 32, false, false),
 			probe("context-16k", StageCalibration, CategoryContextCeiling, 301, 3, 16_000, 8, false, false),
 			probe("context-32k", StageCalibration, CategoryContextCeiling, 302, 3, 32_000, 8, false, false),
 			probe("edit-patch", StageCalibration, CategoryEditPatch, 401, 3, 0, 8, false, true),
@@ -166,9 +227,9 @@ func DefaultProbePlan() ProbePlan {
 		},
 	})
 	if err != nil {
-		panic(err)
+		return ProbePlan{}, err
 	}
-	return plan
+	return plan, nil
 }
 
 func probe(id string, stage ProbeStage, category ProbeCategory, seed int64, repeats, contextTokens, toolCount int, safety, artifact bool) ProbeCase {
@@ -187,16 +248,18 @@ func probe(id string, stage ProbeStage, category ProbeCategory, seed int64, repe
 }
 
 func (p ProbePlan) Valid() bool {
-	if p.version == "" || !validDigest(p.digest) || len(p.cases) == 0 {
+	if p.version == "" || !p.variant.valid() || !validDigest(p.digest) || !validDigest(p.fixtureDigest) || len(p.cases) == 0 {
 		return false
 	}
-	resolved, err := NewProbePlan(ProbePlanSpec{Version: p.version, Cases: p.cases})
-	return err == nil && resolved.digest == p.digest
+	resolved, err := NewProbePlan(ProbePlanSpec{Version: p.version, Variant: p.variant, Cases: p.cases})
+	return err == nil && resolved.digest == p.digest && resolved.fixtureDigest == p.fixtureDigest
 }
 
-func (p ProbePlan) Version() string    { return p.version }
-func (p ProbePlan) Digest() string     { return p.digest }
-func (p ProbePlan) Cases() []ProbeCase { return append([]ProbeCase(nil), p.cases...) }
+func (p ProbePlan) Version() string         { return p.version }
+func (p ProbePlan) Variant() HarnessVariant { return p.variant }
+func (p ProbePlan) Digest() string          { return p.digest }
+func (p ProbePlan) FixtureDigest() string   { return p.fixtureDigest }
+func (p ProbePlan) Cases() []ProbeCase      { return append([]ProbeCase(nil), p.cases...) }
 func (p ProbePlan) Attempts() int {
 	total := 0
 	for _, probeCase := range p.cases {
@@ -206,6 +269,13 @@ func (p ProbePlan) Attempts() int {
 }
 
 type probePlanPayload struct {
+	SchemaVersion int            `json:"schemaVersion"`
+	Version       string         `json:"version"`
+	Variant       HarnessVariant `json:"variant"`
+	Cases         []ProbeCase    `json:"cases"`
+}
+
+type probeFixturePayload struct {
 	SchemaVersion int         `json:"schemaVersion"`
 	Version       string      `json:"version"`
 	Cases         []ProbeCase `json:"cases"`

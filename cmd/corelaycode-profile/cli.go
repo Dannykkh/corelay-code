@@ -120,6 +120,8 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 		return runStatus(args[1:], stdout, stderr, dependencies)
 	case "run":
 		return runProfile(ctx, args[1:], stdout, stderr, dependencies)
+	case "compare":
+		return runCompare(args[1:], stdout, stderr, dependencies)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -131,16 +133,24 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 }
 
 func runDryRun(args []string, stdout, stderr io.Writer, dependencies cliDependencies) int {
-	options, ok := parseTargetOptions("dry-run", args, stderr, dependencies.loadConfig())
-	if !ok {
+	flags := flag.NewFlagSet("dry-run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := bindTargetFlags(flags, dependencies.loadConfig())
+	variant := flags.String("variant", string(capabilityprofile.HarnessVariantCorelay), "harness variant: corelay or minimal")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return 2
 	}
-	resolved, err := resolveTarget(options, dependencies)
+	resolved, err := resolveTarget(*options, dependencies)
 	if err != nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: exact target identity is unavailable")
 		return 1
 	}
-	manifest, err := capabilityprofile.DescribeRun(resolved.identity, capabilityprofile.DefaultProbePlan())
+	plan, err := resolveProbePlan(*variant)
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: harness variant is invalid")
+		return 2
+	}
+	manifest, err := capabilityprofile.DescribeRun(resolved.identity, plan)
 	if err != nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: probe plan is invalid")
 		return 1
@@ -245,7 +255,9 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 	flags.SetOutput(stderr)
 	cfg := dependencies.loadConfig()
 	options := bindTargetFlags(flags, cfg)
+	variant := flags.String("variant", string(capabilityprofile.HarnessVariantCorelay), "harness variant: corelay or minimal")
 	confirm := flags.Bool("confirm", false, "confirm the bounded but potentially costly empirical probe run")
+	measurementOnly := flags.Bool("measurement-only", false, "return success after publishing a quarantined comparison input; never makes it selectable")
 	timeout := flags.Duration("timeout", defaultProfileRunTimeout, "total profiling timeout")
 	probeTimeout := flags.Duration("probe-timeout", 5*time.Minute, "timeout for each probe attempt")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -263,6 +275,11 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 	if err != nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: exact target identity is unavailable")
 		return 1
+	}
+	plan, err := resolveProbePlan(*variant)
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: harness variant is invalid")
+		return 2
 	}
 	bound, err := dependencies.createTarget(ctx, resolved.providerName, &resolved.providerConfig)
 	if err != nil || bound.provider == nil || !validTargetBindingProof(bound.proof) ||
@@ -299,7 +316,7 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 		fmt.Fprintln(stderr, "corelaycode-profile: profiler composition failed")
 		return 1
 	}
-	runner, err := capabilityprofile.NewRunner(profiler, store, capabilityprofile.DefaultProbePlan())
+	runner, err := capabilityprofile.NewRunner(profiler, store, plan)
 	if err != nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: runtime composition failed")
 		return 1
@@ -325,7 +342,11 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 	if code := writeJSON(stdout, output); code != 0 {
 		return code
 	}
-	if !result.Profile.Verified() {
+	return profilePublicationExitCode(result.Profile.Verified(), *measurementOnly)
+}
+
+func profilePublicationExitCode(verified, measurementOnly bool) int {
+	if !verified && !measurementOnly {
 		return 1
 	}
 	return 0
@@ -348,6 +369,52 @@ func bindTargetFlags(flags *flag.FlagSet, cfg config.Config) *targetOptions {
 	flags.StringVar(&options.endpoint, "endpoint", "", "exact provider endpoint (never persisted raw)")
 	flags.StringVar(&options.store, "store", config.CapabilityProfileDir(), "immutable profile store")
 	return options
+}
+
+func resolveProbePlan(value string) (capabilityprofile.ProbePlan, error) {
+	variant, err := capabilityprofile.ParseHarnessVariant(value)
+	if err != nil {
+		return capabilityprofile.ProbePlan{}, err
+	}
+	return capabilityprofile.ProbePlanForVariant(variant)
+}
+
+func runCompare(args []string, stdout, stderr io.Writer, dependencies cliDependencies) int {
+	flags := flag.NewFlagSet("compare", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := bindTargetFlags(flags, dependencies.loadConfig())
+	baselineID := flags.String("baseline", "", "immutable baseline profile ID")
+	candidateID := flags.String("candidate", "", "immutable candidate profile ID")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
+		strings.TrimSpace(*baselineID) == "" || strings.TrimSpace(*candidateID) == "" {
+		return 2
+	}
+	resolved, err := resolveTarget(*options, dependencies)
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: exact target identity is unavailable")
+		return 1
+	}
+	_, store, err := loadProfileInventory(resolved.store, resolved.identity)
+	if err != nil || store == nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: comparison profiles are unavailable")
+		return 1
+	}
+	baseline, err := store.Load(resolved.identity, strings.TrimSpace(*baselineID))
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: comparison profiles are unavailable")
+		return 1
+	}
+	candidate, err := store.Load(resolved.identity, strings.TrimSpace(*candidateID))
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: comparison profiles are unavailable")
+		return 1
+	}
+	report, err := capabilityprofile.CompareProfiles(baseline, candidate)
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-profile: profiles are not comparable")
+		return 1
+	}
+	return writeJSON(stdout, report)
 }
 
 func resolveTarget(options targetOptions, dependencies cliDependencies) (resolvedTarget, error) {
@@ -441,6 +508,6 @@ func writeJSON(writer io.Writer, value any) int {
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: corelaycode-profile <dry-run|list|status|run> [options]")
+	fmt.Fprintln(writer, "usage: corelaycode-profile <dry-run|list|status|run|compare> [options]")
 	fmt.Fprintln(writer, "run requires --confirm and a target-bound provider transport")
 }

@@ -110,7 +110,7 @@ func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string
 	case "Edit":
 		return DangerSafe, ""
 
-	case "Read", "Glob", "Grep", "LS", loadToolResultToolName, reportCompletionToolName, "WebSearch", "WebFetch", "WebResearch",
+	case "Read", "Glob", "Grep", "LS", "RepoMap", loadToolResultToolName, reportCompletionToolName, "WebSearch", "WebFetch", "WebResearch",
 		"TaskCreate", "TaskUpdate", "TaskList",
 		"NotebookRead":
 		return DangerSafe, ""

@@ -89,6 +89,19 @@ func ExtendedToolDefs() []types.ToolDef {
 				}
 			}`),
 		},
+		{
+			Name:        "RepoMap",
+			Description: "Return a bounded repository map of source-file paths and declaration signatures. The map excludes file bodies, values, symlinks, generated trees, and workspace state directories.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"path": {"type": "string", "description": "Workspace-relative directory to map (default: workspace root)"},
+					"include_signatures": {"type": "boolean", "description": "Include bounded declaration signatures (default: true)"},
+					"max_files": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum source files to include (default: 400)"}
+				},
+				"additionalProperties": false
+			}`),
+		},
 		// ── Task Management ──
 		{
 			Name:        "TaskCreate",
@@ -160,6 +173,9 @@ func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir 
 		return r, e, true
 	case "LS":
 		r, e := executeLS(input, workDir)
+		return r, e, true
+	case "RepoMap":
+		r, e := executeRepoMap(input, workDir, opts)
 		return r, e, true
 	case "TaskCreate":
 		r, e := executeTaskCreate(input)

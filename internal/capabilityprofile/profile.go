@@ -113,6 +113,8 @@ type ProfileProvenance struct {
 	ProfilerVersion  string                `json:"profilerVersion"`
 	PlanVersion      string                `json:"planVersion"`
 	PlanDigest       string                `json:"planDigest"`
+	FixtureDigest    string                `json:"fixtureDigest,omitempty"`
+	Variant          HarnessVariant        `json:"variant,omitempty"`
 	ExpectedAttempts int                   `json:"expectedAttempts"`
 	Scoring          ScoringPolicySnapshot `json:"scoring"`
 }
@@ -260,6 +262,14 @@ func validateProfileSnapshot(snapshot ProfileSnapshot) error {
 		snapshot.Provenance.Scoring.ConfidenceThresholdBasisPoints > 10_000 ||
 		snapshot.Provenance.Scoring.MinimumObservations <= 0 {
 		return fmt.Errorf("%w: invalid provenance", ErrInvalidProfile)
+	}
+	legacyPlan := snapshot.Provenance.Variant == "" && snapshot.Provenance.FixtureDigest == ""
+	if legacyPlan {
+		if snapshot.Provenance.PlanVersion != LegacyProbePlanVersion {
+			return fmt.Errorf("%w: missing harness variant", ErrInvalidProfile)
+		}
+	} else if !snapshot.Provenance.Variant.valid() || !validDigest(snapshot.Provenance.FixtureDigest) {
+		return fmt.Errorf("%w: invalid harness variant or fixture digest", ErrInvalidProfile)
 	}
 	if snapshot.ConfidenceBasisPoints < 0 || snapshot.ConfidenceBasisPoints > 10_000 {
 		return fmt.Errorf("%w: invalid confidence", ErrInvalidProfile)

@@ -15,31 +15,31 @@ type PlanModeState int
 
 const (
 	PlanModeNone     PlanModeState = iota
-	PlanModeExplore            // read-only exploration phase
-	PlanModeDesign             // writing the plan
-	PlanModePending            // waiting for approval
-	PlanModeApproved           // approved, ready to implement
-	PlanModeRejected           // rejected, back to explore
+	PlanModeExplore                // read-only exploration phase
+	PlanModeDesign                 // writing the plan
+	PlanModePending                // waiting for approval
+	PlanModeApproved               // approved, ready to implement
+	PlanModeRejected               // rejected, back to explore
 )
 
 // PlanMode represents a structured implementation plan.
 type PlanMode struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
 	Steps       []PlanModeStep `json:"steps"`
-	State       PlanModeState `json:"state"`
-	CreatedAt   time.Time `json:"createdAt"`
-	ApprovedAt  time.Time `json:"approvedAt,omitempty"`
-	FilePath    string    `json:"filePath"` // where plan is saved on disk
+	State       PlanModeState  `json:"state"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	ApprovedAt  time.Time      `json:"approvedAt,omitempty"`
+	FilePath    string         `json:"filePath"` // where plan is saved on disk
 }
 
 // PlanModeStep is a single step in the plan.
 type PlanModeStep struct {
 	ID          string   `json:"id"`
 	Description string   `json:"description"`
-	Files       []string `json:"files"`       // files to modify
-	Status      string   `json:"status"`      // pending, in_progress, completed
+	Files       []string `json:"files"`  // files to modify
+	Status      string   `json:"status"` // pending, in_progress, completed
 }
 
 // PlanModeManager manages the plan mode lifecycle.
@@ -162,8 +162,8 @@ func (pm *PlanModeManager) IsToolAllowed(toolName string) (bool, string) {
 	// In explore/design phase: only read-only tools
 	if pm.current.State == PlanModeExplore || pm.current.State == PlanModeDesign {
 		readOnly := map[string]bool{
-			"Read": true, "Glob": true, "Grep": true, "LS": true,
-			"Bash": false, // bash needs further check
+			"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true,
+			"Bash":  false, // bash needs further check
 			"Write": false, "Edit": false,
 		}
 		if allowed, ok := readOnly[toolName]; ok {

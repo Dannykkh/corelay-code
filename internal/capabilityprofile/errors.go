@@ -15,6 +15,7 @@ var (
 	ErrUnsafeStorePath      = errors.New("unsafe capability-profile store path")
 	ErrIsolationUnavailable = errors.New("capability-profile isolation is unavailable")
 	ErrInvalidRuntime       = errors.New("invalid capability-profile runtime")
+	ErrIncompatibleProfiles = errors.New("incompatible capability profiles")
 )
 
 // QuarantineReason is a stable, machine-readable reason that prevents a

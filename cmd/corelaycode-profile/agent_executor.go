@@ -53,7 +53,7 @@ func newAgentProbeExecutor(
 func (e *agentProbeExecutor) Execute(ctx context.Context, execution capabilityprofile.ProbeExecution) (capabilityprofile.ProbeObservation, error) {
 	if e == nil || e.provider == nil || execution.Target.Digest() != e.targetDigest ||
 		execution.Target.Provider() != e.provider.Name() || execution.Target.Model() != e.model ||
-		strings.TrimSpace(execution.WorkspaceRoot) == "" {
+		!execution.Variant.Valid() || strings.TrimSpace(execution.WorkspaceRoot) == "" {
 		return capabilityprofile.ProbeObservation{}, capabilityprofile.ErrInvalidRuntime
 	}
 	if err := ctx.Err(); err != nil {
@@ -214,8 +214,15 @@ func (e *agentProbeExecutor) harnessFor(
 		}
 		anchor = &resolved
 	}
+	if execution.Variant == capabilityprofile.HarnessVariantMinimal {
+		responsePolicy = harness.ResponseNative
+		editPolicy = harness.EditExact
+		routing = harness.ToolRoutingDirect
+		planAnchorMode = harness.PlanAnchorOff
+		anchor = nil
+	}
 	profile, err := harness.ResolveProfile(harness.ProfileSpec{
-		ID:              fmt.Sprintf("capability-probe-%s-v1", execution.Case.Category),
+		ID:              fmt.Sprintf("capability-probe-%s-%s-v1", execution.Variant, execution.Case.Category),
 		ToolBudget:      toolBudget,
 		Temperature:     harness.SomeFloat64(0),
 		ContextWindow:   contextWindow,
@@ -267,6 +274,7 @@ func observeAgentProbe(
 	retries := 0
 	toolStarts := 0
 	successfulReads := 0
+	successfulRepoMaps := 0
 	successfulEdits := 0
 	deniedTools := 0
 	matchingEditInput := false
@@ -338,6 +346,9 @@ func observeAgentProbe(
 			if executed && !isError && name == "Read" {
 				successfulReads++
 			}
+			if executed && !isError && name == "RepoMap" {
+				successfulRepoMaps++
+			}
 			if executed && !isError && (name == "Edit" || name == "Write") {
 				successfulEdits++
 			}
@@ -381,6 +392,8 @@ func observeAgentProbe(
 	case capabilityprofile.CategoryTwoStageRouting:
 		casePassed = casePassed && routePhases["selector"] &&
 			(routePhases["filtered"] || routePhases["widened"]) && successfulReads > 0
+	case capabilityprofile.CategoryRepositoryMap:
+		casePassed = casePassed && successfulRepoMaps == 1 && markerSeen
 	case capabilityprofile.CategoryContextCeiling:
 		minimum := execution.Case.ContextTokens * 3 / 4
 		casePassed = casePassed && markerSeen && actualContextTokens >= minimum
@@ -407,7 +420,8 @@ func observeAgentProbe(
 		execution.Case.Category != capabilityprofile.CategoryTruncation &&
 		execution.Case.Category != capabilityprofile.CategoryPlanAnchor &&
 		execution.Case.Category != capabilityprofile.CategoryToolCatalog &&
-		execution.Case.Category != capabilityprofile.CategoryTwoStageRouting {
+		execution.Case.Category != capabilityprofile.CategoryTwoStageRouting &&
+		execution.Case.Category != capabilityprofile.CategoryRepositoryMap {
 		casePassed = casePassed && markerSeen
 	}
 	traceDigest := digestJSON(steps)
@@ -454,6 +468,10 @@ func expectedToolFormat(category capabilityprofile.ProbeCategory) string {
 		return string(agent.ToolCallFormatHermes)
 	case capabilityprofile.CategoryFormatLiquid:
 		return string(agent.ToolCallFormatLiquid)
+	case capabilityprofile.CategoryFormatCodeblock:
+		return string(agent.ToolCallFormatCodeblock)
+	case capabilityprofile.CategoryFormatTokenized:
+		return string(agent.ToolCallFormatTokenized)
 	case capabilityprofile.CategoryFormatFencedJSON:
 		return string(agent.ToolCallFormatFencedJSON)
 	case capabilityprofile.CategoryFormatBareJSON:

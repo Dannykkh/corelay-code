@@ -23,9 +23,9 @@ func BuiltinAgentTypes() map[string]AgentType {
 			Name:        "explorer",
 			Description: "Fast codebase exploration — finds files, reads code, searches patterns",
 			SystemPrompt: `You are an Explorer agent. Your job is to quickly find information in the codebase.
-Use Glob to find files, Grep to search content, Read to read files.
+Use RepoMap for a structural overview, Glob to find files, Grep to search content, and Read to read files.
 Do NOT modify any files. Report findings concisely.`,
-			Tools:    []string{"Read", "Glob", "Grep", "Bash", "LS"},
+			Tools:    []string{"Read", "Glob", "Grep", "RepoMap", "Bash", "LS"},
 			ReadOnly: true,
 		},
 		"researcher": {
@@ -34,7 +34,7 @@ Do NOT modify any files. Report findings concisely.`,
 			SystemPrompt: `You are a Researcher agent. Deeply analyze code architecture, trace data flows, and understand design patterns.
 Read multiple files to understand relationships. Report with file paths and line numbers.
 Do NOT modify any files.`,
-			Tools:    []string{"Read", "Glob", "Grep", "Bash", "LS"},
+			Tools:    []string{"Read", "Glob", "Grep", "RepoMap", "Bash", "LS"},
 			ReadOnly: true,
 		},
 		"planner": {
@@ -46,7 +46,7 @@ Do NOT modify any files.`,
 3. Define step-by-step implementation plan
 4. Note potential risks and dependencies
 Do NOT modify any files. Output a structured plan.`,
-			Tools:    []string{"Read", "Glob", "Grep", "Bash", "LS"},
+			Tools:    []string{"Read", "Glob", "Grep", "RepoMap", "Bash", "LS"},
 			ReadOnly: true,
 		},
 		"coder": {
@@ -70,7 +70,7 @@ Do NOT modify any files. Output a structured plan.`,
 5. Tests — adequate coverage?
 Report issues with file paths and line numbers. Suggest fixes.
 Do NOT modify any files.`,
-			Tools:    []string{"Read", "Glob", "Grep", "Bash"},
+			Tools:    []string{"Read", "Glob", "Grep", "RepoMap", "Bash"},
 			ReadOnly: true,
 		},
 		"tester": {

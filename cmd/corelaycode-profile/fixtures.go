@@ -57,6 +57,10 @@ func prepareAgentProbeFixture(execution capabilityprofile.ProbeExecution) (agent
 		fixture.prompt = fmt.Sprintf("Do not use native tool calling. Emit exactly one Hermes call <tool_call>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"probe.txt\"}}</tool_call>. After the result, answer exactly %s.", marker)
 	case capabilityprofile.CategoryFormatLiquid:
 		fixture.prompt = fmt.Sprintf("Do not use native tool calling. Emit exactly <|tool_call_start|>[read_file(file_path='probe.txt')]<|tool_call_end|>. After the result, answer exactly %s.", marker)
+	case capabilityprofile.CategoryFormatCodeblock:
+		fixture.prompt = fmt.Sprintf("Do not use native tool calling. Emit exactly this tool codeblock as the final content of your response:\n```tool\nTOOL_NAME: Read\nBEGIN_ARG: file_path\n\"probe.txt\"\nEND_ARG\n```\nAfter the tool result, answer exactly %s.", marker)
+	case capabilityprofile.CategoryFormatTokenized:
+		fixture.prompt = fmt.Sprintf("Do not use native tool calling. Emit exactly <|tool_calls_section_begin|><|tool_call_begin|>functions.Read:0<|tool_call_argument_begin|>{\"file_path\":\"probe.txt\"}<|tool_call_end|><|tool_calls_section_end|>. After the tool result, answer exactly %s.", marker)
 	case capabilityprofile.CategoryFormatFencedJSON:
 		fixture.prompt = fmt.Sprintf("Do not use native tool calling. Emit one fenced JSON tool call: ```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"probe.txt\"}}\n```. After the result, answer exactly %s.", marker)
 	case capabilityprofile.CategoryFormatBareJSON:
@@ -65,6 +69,12 @@ func prepareAgentProbeFixture(execution capabilityprofile.ProbeExecution) (agent
 		fixture.prompt = fmt.Sprintf("From the complete available catalog, select Read and read probe.txt exactly once. Then answer exactly %s.", marker)
 	case capabilityprofile.CategoryTwoStageRouting:
 		fixture.prompt = fmt.Sprintf("Select the read tool category, use Read on probe.txt exactly once, then answer exactly %s.", marker)
+	case capabilityprofile.CategoryRepositoryMap:
+		declaration := []byte("package probe\n\nfunc " + marker + "() {}\n")
+		if err := os.WriteFile(filepath.Join(root, "probe.go"), declaration, 0o600); err != nil {
+			return agentProbeFixture{}, err
+		}
+		fixture.prompt = fmt.Sprintf("Use RepoMap exactly once on path . with include_signatures true. Find the declaration marker, then answer exactly %s.", marker)
 	case capabilityprofile.CategoryContextCeiling:
 		fixture.prompt = contextProbePrompt(execution.Case.ContextTokens, marker)
 	case capabilityprofile.CategoryEditPatch:

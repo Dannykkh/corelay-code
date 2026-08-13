@@ -146,12 +146,17 @@ verification evidence, teams, memory, activity, and KAIROS background work.
   bound before execution.
 - Failed edits return useful nearby lines; syntax-breaking edits can be rolled
   back and reported as failures instead of silent success.
+- Provider-native calls stay authoritative; bounded text recovery also handles
+  Hermes, Liquid, Continue tool codeblocks, goose tokenized markers, and strict
+  JSON before revalidating every candidate against the live catalog.
 - Tool output and transport errors are bounded and terminal control sequences
   are sanitized before rendering.
 
 ### Context and model breadth
 
 - Context planning preserves required control tools while pruning optional ones.
+- `RepoMap` provides an on-demand, workspace-scoped view of source paths and
+  declaration signatures without exposing file bodies or stored values.
 - Long runs compact through bounded summarization with a deterministic fallback.
 - Local model execution respects model, tool, web, and test capacity instead of
   multiplying requests beyond the machine's useful concurrency.
@@ -290,6 +295,31 @@ The server has narrower endpoints for projects, files, permissions, MCP,
 plugins, memory, workstreams, hooks, commands, skills, usage, feedback, KAIROS,
 and worktrees. The Web UI is the easiest way to explore them.
 
+### Compare the harness against its minimal ablation
+
+`corelaycode-profile` can run the same isolated fixtures with adaptive
+assistance enabled or disabled. Both variants retain the Agent Kernel,
+approval, target binding, sandboxing, and safety probes.
+
+```bash
+# Inspect the bounded plans before spending model time
+corelaycode-profile dry-run --variant minimal
+corelaycode-profile dry-run --variant corelay
+
+# Publish immutable profiles for the exact same provider/model target
+corelaycode-profile run --variant minimal --confirm --measurement-only
+corelaycode-profile run --variant corelay --confirm --measurement-only
+
+# Compare the profile IDs returned by the two runs
+corelaycode-profile compare --baseline <minimal-profile-id> --candidate <corelay-profile-id>
+```
+
+The comparison is content-free and fails closed unless target, plan version,
+case shape, and safety evidence are compatible. A safety regression overrides
+all apparent performance gains. `--measurement-only` changes only the process
+exit code after immutable publication; quarantined profiles remain ineligible
+for automatic harness selection.
+
 ## Design boundaries
 
 Corelay Code does not make a model more capable. It removes execution failures
@@ -306,6 +336,7 @@ For the detailed contracts, see:
 - [Agent Operating Model](docs/agent-operating-model.md)
 - [Domain Dictionary](docs/domain-dictionary.md)
 - [Capability architecture and flows](docs/plan/agent-capability-absorption/)
+- [Reference capability absorption v2](docs/plan/reference-capability-absorption-v2/)
 - [Local-model edit-repair measurement](docs/measurements/local-model-edit-hint.md)
 - [IP provenance and limitations](docs/ip-provenance.md)
 

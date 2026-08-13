@@ -91,7 +91,25 @@ func TestDefaultPlanIsValidAndVersioned(t *testing.T) {
 	if !plan.Valid() || plan.Version() != DefaultProbePlanVersion || plan.Attempts() == 0 {
 		t.Fatalf("invalid default plan: version=%q attempts=%d", plan.Version(), plan.Attempts())
 	}
-	if got, want := plan.Version(), "corelay-capability-probes-v1"; got != want {
+	if got, want := plan.Version(), "corelay-capability-probes-v2"; got != want {
 		t.Fatalf("default plan version=%q want=%q", got, want)
+	}
+	categories := make(map[ProbeCategory]bool)
+	for _, probeCase := range plan.Cases() {
+		categories[probeCase.Category] = true
+	}
+	for _, category := range []ProbeCategory{CategoryFormatCodeblock, CategoryFormatTokenized, CategoryRepositoryMap} {
+		if !categories[category] {
+			t.Fatalf("default plan omitted %q", category)
+		}
+	}
+}
+
+func TestProbePlanRejectsUnknownHarnessVariant(t *testing.T) {
+	if _, err := ProbePlanForVariant(HarnessVariant("unsafe")); err == nil {
+		t.Fatal("unknown harness variant was accepted")
+	}
+	if _, err := ParseHarnessVariant(" MINIMAL "); err != nil {
+		t.Fatalf("normalized minimal variant rejected: %v", err)
 	}
 }
