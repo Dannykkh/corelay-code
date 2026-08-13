@@ -31,6 +31,7 @@ config.json
 /.corelay/
 # Legacy state directory retained to avoid exposing local migration data.
 /.aniclew/
+/.termsnap/
 
 # IDE
 .idea/
