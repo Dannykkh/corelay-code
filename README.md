@@ -1,441 +1,313 @@
-# Corelay Code
+<p align="center">
+  <img src="docs/images/corelay-execution-layer.png" alt="A model signal passing through the Corelay Code execution layer and leaving as verified code" width="100%" />
+</p>
 
-**Small models, finished work.**
+<h1 align="center">Corelay Code</h1>
 
-Corelay Code is a coding agent and control plane for models you run yourself. It is
-also a proxy: point an existing CLI at it to reach any provider through one
-endpoint, with account pooling and quota windows for hosted models.
+<p align="center"><strong>Relay model intent into verified code.</strong></p>
 
-## Why it exists
+<p align="center">
+  One agent kernel for Web, TUI, HTTP, ACP, teams, and background runs.<br />
+  One compatibility gateway for the CLIs you already use.
+</p>
 
-Run a 12B model against a real coding task and it will usually answer well and
-still fail to finish. Not from lack of reasoning — from the mechanics around it.
-It misquotes the line it means to edit. It forgets the change it made two steps
-ago. It returns a tool call in the wrong shape, or one the runtime silently
-accepts as success. Any one of those ends the run, and none of them is about
-whether the model understood the problem.
+## What it is
 
-The usual answer is a bigger model. The other answer is to fix the layer the
-model is running inside, and that is what this is. When an edit misses, hand
-back the lines it probably meant, with numbers. When a test command cannot run,
-say so instead of reporting nothing as a pass. When an edit breaks syntax, roll
-it back and return the actual error. The model does not get smarter; it stops
-losing runs to things that were never its judgement.
+Corelay Code is an execution control plane for coding agents. It sits between a
+model and a real workspace and owns the mechanics that models should not have to
+get right by accident: tool contracts, permissions, context, durable sessions,
+verification, recovery, and completion.
 
-Four months of using it daily is what produced that list. Every entry came from
-watching a run stall, not from designing in advance.
+The name describes the boundary:
 
-## What came of it
+| Layer | Meaning |
+|---|---|
+| **Core** | One agent kernel gives every native ingress the same tool, safety, evidence, and terminal semantics. |
+| **Relay** | Models, accounts, and compatible CLIs can change without changing the execution contract. |
+| **Code** | A run is not finished because it produced prose; workspace changes must be executed, checked, and recorded. |
 
-`gemma4:12b-it-qat`, ten runs against the same task: two bugs across two files,
-the second hidden behind the first, and a prompt that names no file and gives no
-order. **Ten completions.** Half the runs contained a failed edit — the model
-quoting text that was no longer in the file — and finished anyway, because the
-failure came back with somewhere to look rather than a dead end.
+The model still supplies judgement. Corelay Code supplies the conditions under
+which that judgement can survive stale edits, malformed calls, context pressure,
+process death, and ambiguous side effects.
 
-Measurement method, the A/B against a build without that repair, and the limits
-of a five-run sample: [docs/measurements](docs/measurements/local-model-edit-hint.md).
+## Two paths, one runtime plane
 
-The boundary is worth stating. This layer absorbs failures of execution —
-malformed calls, stale quotes, lost state, silent tool errors. It does not
-supply judgement. A model that misreads the problem or cannot devise the
-algorithm will fail here too, and no amount of runtime repair changes that.
-What it buys is that models which *do* know the answer stop losing to the
-plumbing.
+```mermaid
+flowchart LR
+    Dev[Developer] --> Native{Native agent ingress}
+    Dev --> Existing{Existing coding CLI}
 
-## Screenshots
+    Native -->|Web, TUI, API, ACP| Kernel[One Agent Kernel]
+    Existing -->|Anthropic or OpenAI wire| Gateway[Compatibility Gateway]
 
-| Chat (Thinking model) | Project Browser |
-|------|----------------|
-| ![Chat](docs/screenshots/chat.png) | ![Projects](docs/screenshots/project-browser.png) |
+    Kernel --> Context[Context and tool catalog]
+    Context --> Runtime[Provider, account, and model runtime]
+    Gateway --> Translate[Translate, route, retry]
+    Translate --> Runtime
 
-| KAIROS Daemon | Activity |
-|--------------|----------|
-| ![Kairos](docs/screenshots/kairos.png) | ![Activity](docs/screenshots/costs.png) |
+    Runtime --> Models[Local and hosted models]
+    Kernel --> Tools[Workspace and MCP tools]
+    Tools --> Evidence[Evidence, verification, receipts]
+    Evidence --> Terminal[Typed terminal state]
+```
 
-## Two ways to use it
+The distinction is deliberate:
 
-The two entry points do not share a loop, and that distinction matters more than
-any feature below.
-
-| | Own agent | Proxy |
+| | Native agent | Compatibility gateway |
 |---|---|---|
-| Entry | Web UI, built-in TUI (`corelaycode chat`), `/api/agent` | `/v1/messages`, your CLI |
-| Owns the loop | Corelay Code | your CLI |
-| Built for | models you host | any provider |
-| Gets the hardening below | yes | partly — request shaping and routing only |
+| Entry points | Web, `corelaycode chat`, `/api/agent`, ACP | `/v1/messages`, OpenAI-compatible endpoints |
+| Owns the agent loop | Corelay Code | The external CLI |
+| Full tool and completion hardening | Yes | No; request shaping, translation, routing, and retry only |
+| Best for | Local or hosted models that should execute inside Corelay Code | Keeping an existing CLI while changing its provider path |
 
-Everything in **Agent Hardening** happens inside Corelay Code's own loop. A CLI
-pointed at the proxy runs its own loop, so it sees translation, routing, tool
-pruning and retries — but not the edit repair or compaction.
+## How a run reaches done
 
-## Features
+```mermaid
+sequenceDiagram
+    participant D as Developer
+    participant K as Agent Kernel
+    participant S as Durable Session Store
+    participant M as Model
+    participant T as Tool Executor
 
-### Agent Hardening (own agent, local models)
+    D->>K: Request in a workspace
+    K->>S: Bind session and expected revision
+    K->>M: Context, tools, and completion contract
+    M-->>K: Text or tool call
+    K->>K: Validate identity, policy, and permission
+    K->>S: Persist pre-execution marker
+    K->>T: Execute authorized tool
+    T-->>K: Bounded result
+    K->>K: Index evidence and verify criteria
 
-Where most of this project's work went. Getting a local model to *answer* is a
-router's job; this is what it takes to get one to *finish*.
-
-- **Failure absorption**: malformed tool calls and truncated sequences are
-  repaired rather than passed along as success
-- **Edit repair**: a failed edit comes back with the lines it probably meant and
-  their numbers, so a misquote is correctable instead of a dead end
-- **Lint gate**: an edit that breaks syntax is rolled back and reported, and the
-  model retries against the real error
-- **Context auto-compaction**: LLM-based summarization with a snip fallback and a
-  circuit breaker, so a long run degrades instead of dying at the window edge
-- **Per-model profiles**: tool budget and temperature by model, with tool lists
-  pruned so a small model is not handed thirty options
-- **Capacity-aware execution**: local defaults hold Ollama/SGLang to a single
-  model worker while still allowing bounded tool and web fan-out — one 8B model
-  does not get eight concurrent requests
-- **Thinking models**: qwen3 and DeepSeek-R1 reasoning is parsed out of the
-  stream rather than leaking into the answer, and shown as collapsible blocks in
-  the web UI
-
-### Proxy (bring your own CLI)
-- **8 providers**: Anthropic, OpenAI, Gemini, Groq, Ollama, SGLang, GitHub Copilot, z.ai (Grok)
-- **Protocol translation**: Anthropic Messages and OpenAI-compatible shapes are
-  converted both ways, including streaming and tool-call frames
-- **Nothing else changes**: env vars are the only edit. Slash commands,
-  subagents, skills, hooks, and project memory keep working
-- **No silent hijack**: setting `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` makes the
-  CLI ignore provider settings left in its own config by other proxy tools, so a
-  stale base URL cannot quietly take routing back
-- **Auth passthrough**: CLI tools send their own API keys through Corelay Code transparently
-- **Runtime switching**: Change provider/model without restarting
-- **Smart retry**: Exponential backoff with jitter, 529 fallback model switching
-- **Smart router**: Auto-route requests by role (coding, review, chat)
-
-### Coding Agent
-- **Tool-using agent**: Bash, Read, Write, Edit, Glob, Grep
-- **22 security validators**: Shell injection detection, dangerous path blocking, sed/jq execution prevention
-- **115-command read-only allowlist**: Per-command flag validation for safe auto-approval
-- **Parallel tool execution**: Read-only tools run concurrently, write tools serial
-- **Verification receipts**: File-changing runs write compact JSON proof under `~/.corelay/receipts/`
-
-### Account & Quota Scheduling
-
-Applies to hosted accounts; local models skip most of it.
-
-- **Per-account quota windows**: five-hour and seven-day usage tracked separately
-  per account, not just a global rate limit
-- **Health-aware selection**: accounts are scored and only eligible ones are
-  picked; unhealthy accounts are skipped rather than retried into the ground
-- **Soft vs hard cooldown**: a 429 quota cooldown survives later successes; a
-  transient 5xx only triggers a short avoidance window
-- **Escalating backoff**: repeated transient failures step 30s to 2m to 10m to
-  30m, and an account recovers only after two consecutive successes
-- **Session leases**: a run sticks to its account for continuity and is
-  re-evaluated on a fixed interval instead of every request
-- **Deterministic rotation**: when every account is stale, selection round-robins
-  instead of hammering the same one
-- **Quota collectors**: file or HTTP snapshots update scheduler state without
-  hand-editing config
-
-### Multi-Agent Teams
-- **TeamPlan contract**: Provider-neutral Daedalus-style plan with AgentTask, AgentSpec, stages, dependencies, and evidence criteria
-- **Resource-aware waves**: Team waves are internally batched by model/tool/web/test slots and file-scope locks
-- **Task routing**: TeamPlan tasks can override provider/model for role-specific execution
-- **Team dashboard**: The web Team page submits objectives, verification commands, capacity, per-task kind/role/provider/model, read-only mode, dependencies, file scopes, and resource reservations
-- **Plan CLI**: `corelaycode team plan --objective "..." --out team-plan.json`, `corelaycode team validate --plan team-plan.json`
-- **CLI worker/team**: `corelaycode worker run --provider ollama --model qwen3:8b --task task.json` or `corelaycode team run --plan team-plan.json`
-- **Team receipts**: Team and worker runs write `team-*.json` receipts with task status, provider/model, verification state, and output file pointers
-- **Wave execution**: Topological sort (Kahn's algorithm) for dependency-based parallelism
-- **File ownership**: Hard enforcement at ExecuteTool level
-- **6 agent types**: Explorer, Researcher, Planner, Coder, Reviewer, Tester
-- **Mailbox**: File-based inter-agent messaging with locking + broadcast
-- **Message router**: Live channel delivery with mailbox fallback
-- **Plan mode**: Explore -> Design -> Approve -> Implement lifecycle
-- **Worktree isolation**: Git worktree per agent for conflict-free parallel work
-- **Idle detection**: Callback chain with timestamp tracking
-
-### Project Management
-- **Multi-project**: Register, switch, remove projects via folder browser
-- **File tree**: Recursive tree with click-to-view file content
-- **Session isolation**: Per-workspace chat history filtering
-- **Auto-detection**: Go, Node, Python, Rust, Java, .NET framework detection
-
-### KAIROS Daemon
-- **Background agent**: 2-minute tick cycle with cron scheduling
-- **Cron parser**: 5-field expressions + presets (@hourly, @daily, @every 5m)
-- **Git Watch**: Auto-monitors git status, detects changes, logs summaries
-- **Notifications**: SSE real-time stream + webhook integration
-- **Per-project**: Tasks and memory isolated per workspace
-
-### Observability
-- **Request tracing**: Per-request provider, model, latency, tokens (JSONL persistence)
-- **Agentic run traces**: Chronos and Team runs record durable run traces with spans, receipts, and workstream metadata
-- **Regression replay**: Failed Chronos/Team traces can be promoted into regression cases and replayed from captured task inputs or Team receipts
-- **Metrics**: Average/P95 latency, error rate, requests/min, per-provider breakdown
-- **Stream watchdog**: 90s idle timeout with context abort
-- **Response quality**: Thumbs up/down feedback with per-model scoring
-- **Prompt cache**: Strategy tracking, break detection, savings estimation
-
-### Hooks & Permissions
-- **Hook system**: CLI-aware loading (Claude/Codex/Gemini settings), pre/post tool use
-- **6-level permission cascade**: CLI flags > policy > local > user > project > defaults
-- **Immutable snapshots**: Captured at session start, no mid-session drift
-- **Denial tracking**: Auto-persist deny rule after 3 consecutive denials
-- **Permission persistence**: Allow/deny rules saved to .claude/settings.json
-
-### Security
-- **Token auth**: Optional `accessToken` in config
-- **Path sandboxing**: Tools restricted to workspace directory
-- **BashTool**: Quote-aware parser, compound command splitting, auto-backgrounding
-- **Exit code semantics**: grep 1 = no match (not error), diff 1 = files differ
-
-### Extensibility
-- **Plugin system**: JSON manifest with tools, hooks, commands, agent types
-- **MCP integration**: Stdio client with timeout, health check, auto-reconnect
-- **Bridge mode**: HTTP remote control for IDE/script integration
-- **Session memory**: Disk-backed large result storage (saves tokens)
-
-## Agent Operating Model
-
-The agent loop is organized around a compact operating model: chat, plan,
-execute, verify, team, memory, and skill extraction. See
-[docs/agent-operating-model.md](docs/agent-operating-model.md) for the
-invariants, receipt schema, and cleanup direction.
-
-## Installation
-
-### Option 1: Script (Mac/Linux)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dannykkh/corelay-code/main/install.sh | bash
+    alt Completion is verified
+        K->>S: Atomically commit transcript and terminal, clear marker
+        K-->>D: Complete with content-free receipt
+    else Work is incomplete
+        K->>M: Correction with current revision and evidence refs
+    else Run is interrupted or ambiguous
+        K->>S: Keep reconciliation marker
+        K-->>D: Block resume until explicit reconciliation
+    end
 ```
 
-### Option 2: Docker
+The important ordering is authorization, then a synchronous write-ahead marker,
+then execution. If the process dies after a side effect, a fresh process sees the
+marker and refuses to replay the run until an operator reconciles it.
+
+## Actual interfaces
+
+### Full-screen terminal workbench
+
+`corelaycode chat` opens the TUI when stdin and stdout are interactive.
+`corelaycode tui` requires it explicitly.
+
+![Corelay Code terminal workbench connected to a local Ollama model](docs/screenshots/workbench-tui.png)
+
+The TUI keeps the active runtime ID separate from the durable session ID,
+supports command search and session lifecycle actions, and treats approval and
+reconciliation as fail-closed states rather than confirmation prompts that can
+accidentally default to yes.
+
+### Web workbench
+
+![Corelay Code web workbench connected to the corelay-code project](docs/screenshots/workbench-web.png)
+
+The browser surface uses the same HTTP/SSE agent path and the same durable
+session contract as the TUI. It also exposes projects, routing, accounts,
+verification evidence, teams, memory, activity, and KAIROS background work.
+
+## What the runtime owns
+
+### Completion, evidence, and verification
+
+- A reserved completion tool transitions a revisioned completion contract.
+- Evidence references are digest-bound; raw assertions, tool inputs, and
+  resolver errors are not echoed through terminal results.
+- `done` is a typed terminal event, not a synonym for success.
+- File-changing runs emit compact receipts under `~/.corelay/receipts/`.
+- Failed agentic traces can be promoted to regression cases and replayed.
+
+### Durable execution and recovery
+
+- Sessions use revision CAS rather than last-write-wins updates.
+- Every authorized side effect is journaled before the start event and executor.
+- Successful completion atomically commits the transcript and terminal state
+  while clearing the exact interruption marker.
+- Cancel, crash, transport failure, or ambiguous persistence keeps the run
+  quarantined until explicit reconciliation.
+- Forked sessions preserve lineage without sharing mutable state.
+
+### Tool safety and repair
+
+- Bash, Read, Write, Edit, Glob, and Grep use workspace-scoped execution.
+- Read-only tools may run concurrently; mutations remain serialized.
+- Tool identity, permission, plugin, MCP, sandbox, and file-ownership checks are
+  bound before execution.
+- Failed edits return useful nearby lines; syntax-breaking edits can be rolled
+  back and reported as failures instead of silent success.
+- Tool output and transport errors are bounded and terminal control sequences
+  are sanitized before rendering.
+
+### Context and model breadth
+
+- Context planning preserves required control tools while pruning optional ones.
+- Long runs compact through bounded summarization with a deterministic fallback.
+- Local model execution respects model, tool, web, and test capacity instead of
+  multiplying requests beyond the machine's useful concurrency.
+- Thinking streams from supported models are separated from final answers.
+- The runtime can route across Ollama, SGLang, Anthropic, OpenAI, Gemini, Groq,
+  GitHub Copilot, and z.ai-compatible models.
+
+### Teams and autonomous work
+
+- Team plans describe tasks, dependencies, file scopes, provider/model choices,
+  resource reservations, and verification commands.
+- Dependency waves run with bounded capacity and hard file ownership.
+- Subagents, Team, Chronos, Bridge, profiler, HTTP, and ACP converge on the same
+  kernel and terminal finalizer rather than maintaining alternate loops.
+- KAIROS schedules background tasks, watches Git state, and emits notifications.
+
+## Quick start
+
+### Build from source
+
+Requirements: Go, Node.js, and npm.
 
 ```bash
-# With Ollama (local LLM)
-docker compose up -d
+git clone https://github.com/Dannykkh/corelay-code.git
+cd corelay-code
+make all
 
-# Corelay Code only (bring your own LLM)
-docker run -p 4000:4000 -v $(pwd):/workspace ghcr.io/dannykkh/corelaycode
+# Start the server with a local model
+./corelaycode -provider ollama -model qwen3:8b
 ```
 
-### Option 3: Build from source
+The browser opens at `http://localhost:4000/app`.
+
+In a second terminal, from the project the agent should edit:
 
 ```bash
-git clone https://github.com/Dannykkh/corelay-code.git && cd corelay-code
-make all    # builds frontend + backend
-./corelaycode   # interactive provider select
-```
-
-The build also produces the `corelaycode-acp` and `corelaycode-profile` helper
-executables.
-
-### Option 4: Download binary
-
-Go to [Releases](https://github.com/Dannykkh/corelay-code/releases) and download
-`corelaycode`, `corelaycode-acp`, and `corelaycode-profile` for your platform.
-The install script installs all three executables.
-
-## Quick Start
-
-```bash
-# Start with Ollama (local, free)
-./corelaycode -provider ollama -model qwen3:14b
-
-# Start with OpenAI
-OPENAI_API_KEY=sk-... ./corelaycode -provider openai -model gpt-4o
-
-# Start with Anthropic
-ANTHROPIC_API_KEY=sk-ant-... ./corelaycode -provider anthropic -model claude-sonnet-4-6-20250217
-```
-
-Browser opens at `http://localhost:4000/app`.
-
-### Built-in terminal UI
-
-Start Corelay Code in one terminal, then run the client from the project the agent
-should edit:
-
-```bash
-cd /path/to/project
 corelaycode chat
-# Explicit full-screen alias:
+
+# Require the full-screen TUI
 corelaycode tui
-# Windows:
-.\corelaycode.exe chat
+
+# Non-interactive use
+corelaycode chat -p "Find the failing test and fix it"
 ```
 
-On an interactive terminal, `corelaycode chat` opens the full-screen Agent
-Workbench. It falls back to the line-oriented client when stdin/stdout is not a
-TTY or `TERM=dumb`; use `corelaycode chat -plain` to select line mode explicitly.
-One-shot use remains available with `corelaycode chat -p "..."`.
+Windows uses the same commands with the `.exe` suffix.
 
-When server authentication is enabled, prefer the environment variable so the
-token is not placed in shell history:
+### Docker Compose
 
 ```bash
-CORELAY_ACCESS_TOKEN=... corelaycode chat
+docker compose up --build
 ```
 
-`ANICLEW_ACCESS_TOKEN` remains available as a legacy fallback during migration.
+The release workflow builds `corelaycode`, `corelaycode-acp`, and
+`corelaycode-profile` for the supported platforms. Tagged releases also publish
+the Corelay Code container image.
 
-Sessions are saved before each agent turn. Use `corelaycode chat -session <id>` to
-open one directly, or `/sessions`, `/load`, `/new`, `/fork`, `/rename`,
-`/reconcile`, `/close`, and `/delete` inside the TUI.
+## Use an existing CLI as the loop owner
 
-| Key | Action |
-|-----|--------|
-| `Enter` | Send or select |
-| `Ctrl+K` | Open the command palette |
-| `Ctrl+O` | List sessions |
-| `Ctrl+N` | Start a new session |
-| `PageUp` / `PageDown` | Scroll the transcript |
-| `End` | Follow the latest output |
-| `Esc` / `Ctrl+C` | Cancel the active run |
-| `Ctrl+Q` | Quit and restore the terminal |
-
-Approval requests are fail-closed: `A` allows once; `D`, `Esc`, or `Enter`
-denies. Interrupted sessions remain locked until their external side effects
-are explicitly reviewed and reconciled.
-
-### Connect your CLI tools
+Start the Corelay Code server, then point a compatible CLI at it:
 
 ```bash
-# Anthropic-compatible CLI → Corelay Code → any provider
-ANTHROPIC_BASE_URL=http://localhost:4000 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude
+# Anthropic-compatible CLI
+ANTHROPIC_BASE_URL=http://localhost:4000 \
+CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 \
+claude
 
-# OpenAI-compatible CLI → Corelay Code → any provider
+# OpenAI-compatible CLI
 OPENAI_BASE_URL=http://localhost:4000 codex
 ```
 
-## Configuration
+Your CLI retains its commands, subagents, skills, hooks, and memory because it
+still owns the loop. Corelay Code provides the provider relay, protocol
+translation, routing, account scheduling, tool-list shaping, and retry path.
 
-`~/.corelay/config.json`:
+## TUI controls
+
+| Key | Action |
+|---|---|
+| `Enter` | Send or select |
+| `Ctrl+K` | Open the command palette |
+| `Ctrl+O` | Open durable sessions |
+| `Ctrl+N` | Start a new session |
+| `PageUp` / `PageDown` | Scroll the transcript |
+| `End` | Follow new output |
+| `Esc` / `Ctrl+C` | Cancel the active run exactly once |
+| `Ctrl+Q` | Quit and restore the terminal |
+
+Inside the palette, session actions include `/sessions`, `/load`, `/new`,
+`/fork`, `/rename`, `/reconcile`, `/close`, and `/delete`. Approval is explicit:
+`A` allows once; `D`, `Esc`, or `Enter` denies.
+
+## Configuration and migration
+
+Corelay Code writes new state under `~/.corelay` and reads `CORELAY_*`
+environment variables first. Existing `~/.aniclew`, `~/.claude-proxy`, and
+`ANICLEW_*` values remain read-compatible migration fallbacks.
+
+Minimal `~/.corelay/config.json`:
 
 ```json
 {
   "port": 4000,
   "defaultProvider": "ollama",
-  "defaultModel": "qwen3:14b",
+  "defaultModel": "qwen3:8b",
   "accessToken": "",
   "projects": [
     { "path": "/path/to/project", "name": "My Project" }
-  ],
-  "providers": {
-    "ollama-remote": { "baseUrl": "http://192.168.1.100:11434" }
-  }
+  ]
 }
 ```
 
-Upgrades preserve existing state. Corelay Code prefers `~/.corelay` and
-`CORELAY_*` environment variables, while continuing to read the former
-`~/.aniclew`, `~/.claude-proxy`, and `ANICLEW_*` names as migration fallbacks.
-New installations and newly persisted protocol values use only the Corelay
-names.
+When server authentication is enabled, prefer an environment variable so the
+token does not enter shell history:
 
-## Architecture
-
-```
-  Web UI / API                      Your CLI (unchanged)
-       |                                  |
-       | /api/agent                       | /v1/messages
-       |                                  |   ANTHROPIC_BASE_URL / OPENAI_BASE_URL
-       v                                  v
-  +----------------------+     +----------------------+
-  |     Agent Loop       |     |      Translate       |
-  |  tools, permissions  |     | Anthropic <-> OpenAI |
-  |  edit repair, lint   |     |  streaming, tools    |
-  |  compaction, hooks   |     |  tool pruning        |
-  +----------------------+     +----------------------+
-       |                                  |
-       +----------------+-----------------+
-                        v
-          +-------------------------------+
-          |         Runtime Plane         |
-          | accounts, 5h/7d windows,      |
-          | cooldowns, leases, routing    |
-          +-------------------------------+
-                        |
-                        v
-           Ollama  SGLang  Anthropic  OpenAI  ...
-
-  Corelay Code also runs:
-   +-- KAIROS Daemon (cron, git-watch)
-   +-- Team (waves, mailbox, worktree)
-   +-- Observability (traces, metrics, feedback)
-   +-- Plugins (tools, hooks, commands)
+```bash
+CORELAY_ACCESS_TOKEN=... corelaycode chat
 ```
 
-## API
+## Main surfaces
 
-The server exposes 106 routes; these are the ones worth knowing. The rest are
-reachable and stable, just narrower — browse `internal/server` for the full set.
+| Surface | Purpose |
+|---|---|
+| `POST /api/agent` | Native coding agent over SSE |
+| `POST /api/team` | Dependency-aware team execution over SSE |
+| `POST /api/chronos` | Autonomous bounded run loop over SSE |
+| `POST /v1/messages` | Anthropic-compatible provider gateway |
+| `GET /api/runtime` | Providers, accounts, routes, quota windows, and telemetry |
+| `GET/POST /api/sessions` | Durable session lifecycle |
+| `GET /api/evidence/recent` | Verification policy and recent receipts |
+| `GET /api/run-traces` | Agentic run traces and regression promotion |
+| `corelaycode-acp` | Stable ACP adapter with the same durable execution rules |
+| `corelaycode-profile` | Repeatable model and capability profiling |
 
-**Entry points**
+The server has narrower endpoints for projects, files, permissions, MCP,
+plugins, memory, workstreams, hooks, commands, skills, usage, feedback, KAIROS,
+and worktrees. The Web UI is the easiest way to explore them.
 
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/messages` | Anthropic-compatible proxy — the CLI path |
-| `POST /api/agent` | Coding agent, SSE — the own-agent path |
-| `POST /api/team` | Team execution (SSE) |
-| `POST /api/chronos` | Autonomous loop (SSE) |
-| `GET /health` | Liveness, active provider and model |
-| `GET /app`, `GET /dashboard` | Web UI |
+## Design boundaries
 
-**Runtime plane**
+Corelay Code does not make a model more capable. It removes execution failures
+that are unrelated to the model's judgement. A model that misunderstands the
+task or cannot devise the algorithm can still fail.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/runtime` | Accounts, routing, quota windows |
-| `GET /api/runtime/telemetry` | Account health, cooldowns, selection telemetry |
-| `GET/POST/DELETE /api/runtime/quota-sources` | Quota collectors (file / HTTP) |
-| `POST /api/runtime/quota-sources/test` | Validate a collector before saving |
-| `GET /api/providers` | Available providers and models |
-| `GET /api/routes` | Router rules and previews |
+The compatibility gateway also cannot apply native-agent completion semantics
+to an external CLI's private loop. Use the native Web, TUI, API, or ACP path when
+you need Corelay Code to own tools, evidence, durable execution, and the meaning
+of done.
 
-**Workspace**
+For the detailed contracts, see:
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET/PUT /api/config` | Provider and settings |
-| `GET/POST/DELETE /api/projects` | Project management |
-| `GET/PUT /api/workspace` | Active workspace |
-| `GET /api/tree`, `GET /api/file` | File tree and contents |
-| `GET/POST /api/sessions` | Chat sessions |
-
-**Harness surfaces**
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/agent-types` | Available agent types |
-| `GET /api/commands` | Slash commands |
-| `GET /api/skills` | Loaded skills |
-| `GET /api/hooks` | Loaded hooks |
-| `GET /api/permissions` | Permission snapshot |
-| `GET /api/mcp` | MCP servers |
-| `GET /api/memory`, `GET /api/memory/search` | Project memory |
-| `GET /api/workstreams` | Workstreams and handoffs |
-| `GET /api/plan` | Plan-mode state |
-
-**Observability**
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/usage` | Requests and tokens per provider/model |
-| `GET /api/metrics` | Latency, error rate, per-provider breakdown |
-| `GET /api/traces` | Request traces |
-| `GET /api/run-traces` | Agentic run traces |
-| `POST /api/run-traces/{id}/regression` | Promote a failed run into a regression case |
-| `GET /api/regressions` | Regression cases |
-| `POST /api/regressions/{id}/run` | Replay a regression case |
-| `GET /api/regression-runs` | Replay attempts |
-| `GET /api/evidence/policy`, `GET /api/evidence/recent` | Evidence Gate policy and receipts |
-| `GET/POST /api/feedback` | Response quality |
-| `GET/POST /api/kairos/*` | Daemon control |
-| `GET /api/worktrees` | Git worktrees |
-
-## Stats
-
-- **43,385 lines** Go
-- **315 test functions** across 18 internal packages
-- `go build ./... && go vet ./... && go test ./...` green as of 2026-07-26
+- [Agent Operating Model](docs/agent-operating-model.md)
+- [Domain Dictionary](docs/domain-dictionary.md)
+- [Capability architecture and flows](docs/plan/agent-capability-absorption/)
+- [Local-model edit-repair measurement](docs/measurements/local-model-edit-hint.md)
+- [IP provenance and limitations](docs/ip-provenance.md)
 
 ## License
 
