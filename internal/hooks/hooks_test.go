@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
@@ -262,9 +263,13 @@ func TestDisabledPolicyRequiresExplicitUnconfinedRunner(t *testing.T) {
 	}
 
 	legacy := NewRegistryWithOptions(RegistryOptions{
-		Runner: sandbox.NewUnconfinedRunner(),
-		Policy: sandbox.Policy{Enforcement: sandbox.EnforcementDisabled},
+		Runner:          sandbox.NewUnconfinedRunner(),
+		Policy:          sandbox.Policy{Enforcement: sandbox.EnforcementDisabled},
+		ExecutionPolicy: executionpolicy.Snapshot{Mode: executionpolicy.ModeFull, Revision: 1, Source: executionpolicy.SourceUserSelected, FullSelectionRevision: 1},
 	})
+	if err := legacy.Load(t.TempDir(), "claude"); err != nil {
+		t.Fatal(err)
+	}
 	legacy.ensureRuntime()
 	if legacy.runtimeErr != HookFailureNone {
 		t.Fatalf("explicit legacy boundary rejected: %s", legacy.runtimeErr)
@@ -702,5 +707,130 @@ func TestCompatibilityExecuteStillUsesSecureDefaultPolicy(t *testing.T) {
 	calls := runner.callSnapshot()
 	if len(calls) != 1 || calls[0].policy.Enforcement != sandbox.EnforcementRequired || calls[0].command.Timeout != 30*time.Second {
 		t.Fatalf("compat call = %#v", calls)
+	}
+}
+
+func TestReadOnlyExecutionPolicySkipsEveryProjectHookProcess(t *testing.T) {
+	hookTypes := []HookType{HookPreToolUse, HookPostToolUse, HookSessionStart, HookSessionEnd}
+	for _, hookType := range hookTypes {
+		t.Run(string(hookType), func(t *testing.T) {
+			workDir := t.TempDir()
+			writeClaudeHooks(t, workDir, map[string][]map[string]any{
+				string(hookType): {{"command": "must-not-start"}},
+			})
+			runner := secureFakeHookRunner()
+			policy := executionpolicy.Snapshot{
+				Mode:                executionpolicy.ModeReadOnly,
+				Revision:            23,
+				RuntimeCapabilities: runner.caps, // must be discarded and reread from the registry runner
+			}
+			registry := NewRegistryWithOptions(RegistryOptions{
+				Runner:          runner,
+				ShellPath:       "hook-shell",
+				ExecutionPolicy: policy,
+			})
+			if err := registry.Load(workDir, "claude"); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			results := registry.ExecuteContext(context.Background(), hookType, map[string]string{"TOOL_NAME": "Read"})
+			if len(results) != 1 {
+				t.Fatalf("results = %#v, want one typed policy result", results)
+			}
+			got := results[0]
+			if got.Failure != HookFailureReadOnlyPolicy {
+				t.Fatalf("failure = %q, want %q", got.Failure, HookFailureReadOnlyPolicy)
+			}
+			if got.ExecutionPolicyMode != executionpolicy.ModeReadOnly || got.ExecutionPolicyRevision != 23 {
+				t.Fatalf("policy evidence = %q/%d, want read-only/23", got.ExecutionPolicyMode, got.ExecutionPolicyRevision)
+			}
+			if got.ExitCode != sandbox.ExitNotStarted || got.Sandbox.Started {
+				t.Fatalf("read-only result indicates process start: %#v", got)
+			}
+			if got.Blocked != (hookType == HookPreToolUse) {
+				t.Fatalf("Blocked = %t for %s", got.Blocked, hookType)
+			}
+			if calls := runner.callSnapshot(); len(calls) != 0 {
+				t.Fatalf("read-only mode invoked the project hook runner %d times", len(calls))
+			}
+		})
+	}
+}
+
+func TestExecutionPolicySnapshotIsCapturedAndUsesRegistryRunnerCapabilities(t *testing.T) {
+	for _, mode := range []executionpolicy.Mode{executionpolicy.ModeWorkspace, executionpolicy.ModeFull} {
+		t.Run(string(mode), func(t *testing.T) {
+			workDir := t.TempDir()
+			hookDefinition := map[string]any{"command": "run-in-supported-modes"}
+			var runner sandbox.Runner = secureFakeHookRunner()
+			runnerCapabilities := runner.Capabilities()
+			runnerPolicy := sandbox.Policy{}
+			executionPolicy := executionpolicy.Snapshot{
+				Mode:     mode,
+				Revision: 31,
+				// Deliberately claim no capabilities. Execution must use the real runner.
+				RuntimeCapabilities: sandbox.Capabilities{},
+			}
+			if mode == executionpolicy.ModeFull {
+				runner = sandbox.NewUnconfinedRunner()
+				runnerCapabilities = runner.Capabilities()
+				runnerPolicy = sandbox.Policy{Enforcement: sandbox.EnforcementDisabled}
+				executionPolicy.Source = executionpolicy.SourceUserSelected
+				executionPolicy.FullSelectionRevision = executionPolicy.Revision
+				if runtime.GOOS == "windows" {
+					hookDefinition = map[string]any{"command": "cmd.exe", "args": []string{"/c", "echo", "supported"}}
+				} else {
+					hookDefinition = map[string]any{"command": "/bin/echo", "args": []string{"supported"}}
+				}
+			}
+			writeClaudeHooks(t, workDir, map[string][]map[string]any{
+				string(HookPostToolUse): {hookDefinition},
+			})
+			registry := NewRegistryWithOptions(RegistryOptions{
+				Runner:          runner,
+				Policy:          runnerPolicy,
+				ShellPath:       defaultHookShell(),
+				ExecutionPolicy: executionPolicy,
+			})
+			executionPolicy.Mode = executionpolicy.ModeReadOnly // options and registry must not share mutable state
+			if err := registry.Load(workDir, "claude"); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			results := registry.ExecuteContext(context.Background(), HookPostToolUse, map[string]string{"TOOL_NAME": "Read"})
+			if len(results) != 1 || results[0].Failure != HookFailureNone {
+				t.Fatalf("workspace/full hook result = %#v", results)
+			}
+			if fake, ok := runner.(*fakeHookRunner); ok && len(fake.callSnapshot()) != 1 {
+				t.Fatalf("runner calls = %d, want 1", len(fake.callSnapshot()))
+			}
+			got := results[0]
+			if got.ExecutionPolicyMode != mode || got.ExecutionPolicyRevision != 31 {
+				t.Fatalf("policy evidence = %q/%d, want %q/31", got.ExecutionPolicyMode, got.ExecutionPolicyRevision, mode)
+			}
+			if got.Sandbox.Capabilities != runnerCapabilities {
+				t.Fatalf("reported capabilities = %#v, want concrete runner capabilities %#v", got.Sandbox.Capabilities, runnerCapabilities)
+			}
+		})
+	}
+}
+
+func TestSetExecutionPolicyBeforeLoadAppliesToSuppliedRegistry(t *testing.T) {
+	workDir := t.TempDir()
+	writeClaudeHooks(t, workDir, map[string][]map[string]any{
+		string(HookSessionStart): {{"command": "must-not-start"}},
+	})
+	runner := secureFakeHookRunner()
+	registry := NewRegistryWithOptions(RegistryOptions{Runner: runner, ShellPath: "hook-shell"})
+	registry.SetExecutionPolicy(executionpolicy.Snapshot{Mode: executionpolicy.ModeReadOnly, Revision: 44})
+	if err := registry.Load(workDir, "claude"); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	results := registry.ExecuteContext(context.Background(), HookSessionStart, nil)
+	if len(results) != 1 || results[0].Failure != HookFailureReadOnlyPolicy || results[0].ExecutionPolicyRevision != 44 {
+		t.Fatalf("session hook result = %#v", results)
+	}
+	if len(runner.callSnapshot()) != 0 {
+		t.Fatal("SetExecutionPolicy failed to suppress the lifecycle hook")
 	}
 }

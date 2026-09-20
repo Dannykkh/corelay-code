@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,14 +24,19 @@ import (
 
 const maxRunMCPServers = 64
 
-// MCPServerSpec is the in-memory, run-owned form of one stdio MCP server.
+// MCPServerSpec is the in-memory, run-owned form of one MCP server. Type is
+// empty for stdio or "http" for streamable HTTP. Legacy SSE is intentionally
+// not accepted by the runtime.
 // Command, arguments, and environment values must never be copied into a
 // durable Session, receipt, trace, or log record.
 type MCPServerSpec struct {
 	Name    string
+	Type    string
 	Command string
 	Args    []string
 	Env     map[string]string
+	URL     string
+	Headers map[string]string
 }
 
 // MCPRuntime is the narrow lifetime boundary consumed by RunLoop. A runtime
@@ -46,6 +53,20 @@ type MCPRuntime interface {
 	Close()
 }
 
+// MCPRuntimeExecutionCapabilityProvider reports the executor facts captured
+// before a borrowed runtime started. Workspace runs reject runtimes that
+// cannot prove filesystem isolation.
+type MCPRuntimeExecutionCapabilityProvider interface {
+	ExecutionCapabilities() sandbox.Capabilities
+}
+
+// MCPRuntimeFilesystemIsolationProvider distinguishes remote transports that
+// do not execute in the workspace from stdio children that require a
+// filesystem-isolated runner.
+type MCPRuntimeFilesystemIsolationProvider interface {
+	RequiresFilesystemIsolation() bool
+}
+
 // MCPRuntimeFactory permits protocol adapters to inject a testable factory
 // while keeping process creation inside the existing RunLoop composition.
 type MCPRuntimeFactory func(
@@ -56,15 +77,17 @@ type MCPRuntimeFactory func(
 ) (MCPRuntime, error)
 
 type runMCPRuntime struct {
-	id        string
-	workspace string
+	id           string
+	workspace    string
+	capabilities sandbox.Capabilities
 
-	mu      sync.RWMutex
-	clients map[string]*MCPClient
-	tools   []types.ToolDef
-	reports []processsupervisor.Report
-	closed  atomic.Bool
-	once    sync.Once
+	mu                          sync.RWMutex
+	clients                     map[string]*MCPClient
+	tools                       []types.ToolDef
+	reports                     []processsupervisor.Report
+	requiresFilesystemIsolation bool
+	closed                      atomic.Bool
+	once                        sync.Once
 }
 
 type mcpToolRuntimeMetadata struct {
@@ -104,14 +127,30 @@ func NewMCPRuntime(
 			clients:   make(map[string]*MCPClient),
 		}, nil
 	}
-	execution, err = bindRunMCPExecution(ctx, workspace, execution)
-	if err != nil {
-		return nil, err
+	requiresFilesystemIsolation := false
+	for _, spec := range specs {
+		if spec.Type == "" {
+			requiresFilesystemIsolation = true
+			break
+		}
+	}
+	if requiresFilesystemIsolation {
+		execution, err = bindRunMCPExecution(ctx, workspace, execution)
+		if err != nil {
+			return nil, err
+		}
 	}
 	runtimeState := &runMCPRuntime{
 		id:        newMCPExecutorID(),
 		workspace: workspace,
-		clients:   make(map[string]*MCPClient, len(specs)),
+		capabilities: func() sandbox.Capabilities {
+			if execution.Runner == nil {
+				return sandbox.Capabilities{}
+			}
+			return execution.Runner.Capabilities()
+		}(),
+		clients:                     make(map[string]*MCPClient, len(specs)),
+		requiresFilesystemIsolation: requiresFilesystemIsolation,
 	}
 	configuredObserver := execution.ObserveStart
 	execution.ObserveStart = func(report processsupervisor.Report) {
@@ -124,23 +163,25 @@ func NewMCPRuntime(
 	}
 	fail := func(serverName string) (MCPRuntime, error) {
 		runtimeState.Close()
-		return nil, fmt.Errorf("MCP server %q could not establish a secure stdio runtime", serverName)
+		return nil, fmt.Errorf("MCP server %q could not establish a secure runtime", serverName)
 	}
 	for _, server := range specs {
-		executable, resolveErr := resolveMCPExecutable(server.Command)
-		if resolveErr != nil {
-			return fail(server.Name)
+		var client *MCPClient
+		var connectErr error
+		if server.Type == "http" {
+			client, connectErr = newMCPRemoteClientWithInitializationContext(
+				server.Name, server.URL, server.Headers, execution, ctx, true,
+			)
+		} else {
+			executable, resolveErr := resolveMCPExecutable(server.Command)
+			if resolveErr != nil {
+				return fail(server.Name)
+			}
+			client, connectErr = newMCPClientWithInitializationContext(
+				server.Name, executable, server.Args, workspace, server.Env,
+				execution, ctx, true,
+			)
 		}
-		client, connectErr := newMCPClientWithInitializationContext(
-			server.Name,
-			executable,
-			server.Args,
-			workspace,
-			server.Env,
-			execution,
-			ctx,
-			true,
-		)
 		if connectErr != nil {
 			return fail(server.Name)
 		}
@@ -242,8 +283,31 @@ func normalizeMCPServerSpecs(servers []MCPServerSpec) ([]MCPServerSpec, error) {
 			return nil, fmt.Errorf("duplicate MCP server name %q", name)
 		}
 		seen[name] = struct{}{}
+		kind := strings.ToLower(strings.TrimSpace(source.Type))
+		if kind != "" && kind != "http" {
+			return nil, fmt.Errorf("MCP server %q transport %q is not supported", name, kind)
+		}
 		command := strings.TrimSpace(source.Command)
-		if command == "" || len(command) > 4096 || strings.IndexByte(command, 0) >= 0 {
+		remoteURL := strings.TrimSpace(source.URL)
+		headers := cloneMCPEnvironment(source.Headers)
+		if kind == "http" {
+			parsed, parseErr := url.Parse(remoteURL)
+			if parseErr != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+				return nil, fmt.Errorf("MCP server %q URL is invalid", name)
+			}
+			if command != "" || len(source.Args) != 0 || len(source.Env) != 0 || len(headers) > 128 {
+				return nil, fmt.Errorf("MCP server %q HTTP configuration is invalid", name)
+			}
+			for header, value := range headers {
+				if http.CanonicalHeaderKey(header) == "" || strings.ContainsAny(header, "\r\n") || strings.ContainsAny(value, "\r\n") || len(header) > 256 || len(value) > maxMCPProtocolTextBytes {
+					return nil, fmt.Errorf("MCP server %q HTTP header is invalid", name)
+				}
+				switch strings.ToLower(header) {
+				case "host", "content-length", "transfer-encoding", "connection", "upgrade":
+					return nil, fmt.Errorf("MCP server %q HTTP header is reserved", name)
+				}
+			}
+		} else if command == "" || len(command) > 4096 || strings.IndexByte(command, 0) >= 0 || remoteURL != "" || len(headers) != 0 {
 			return nil, fmt.Errorf("MCP server %q command is invalid", name)
 		}
 		if len(source.Args) > 256 || len(source.Env) > 256 {
@@ -256,11 +320,14 @@ func normalizeMCPServerSpecs(servers []MCPServerSpec) ([]MCPServerSpec, error) {
 			}
 		}
 		environment := cloneMCPEnvironment(source.Env)
-		if _, err := mcpEnvironmentSpec(environment); err != nil {
-			return nil, fmt.Errorf("MCP server %q environment is invalid", name)
+		if kind == "" {
+			if _, err := mcpEnvironmentSpec(environment); err != nil {
+				return nil, fmt.Errorf("MCP server %q environment is invalid", name)
+			}
 		}
 		normalized = append(normalized, MCPServerSpec{
-			Name: name, Command: command, Args: args, Env: environment,
+			Name: name, Type: kind, Command: command, Args: args, Env: environment,
+			URL: remoteURL, Headers: headers,
 		})
 	}
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
@@ -281,8 +348,9 @@ func cloneMCPServerSpecs(servers []MCPServerSpec) []MCPServerSpec {
 	cloned := make([]MCPServerSpec, len(servers))
 	for index, server := range servers {
 		cloned[index] = MCPServerSpec{
-			Name: server.Name, Command: server.Command,
+			Name: server.Name, Type: server.Type, Command: server.Command,
 			Args: append([]string(nil), server.Args...), Env: cloneMCPEnvironment(server.Env),
+			URL: server.URL, Headers: cloneMCPEnvironment(server.Headers),
 		}
 	}
 	return cloned
@@ -292,9 +360,19 @@ func cloneMCPServerSpecs(servers []MCPServerSpec) []MCPServerSpec {
 // immutable run-owned specs. The boolean reports whether any config source was
 // present, including a valid empty configuration.
 func WorkspaceMCPServerSpecs(workDir string) ([]MCPServerSpec, bool, error) {
-	raw := LoadMCPConfig(workDir)
+	return WorkspaceMCPServerSpecsWithPaths(workDir, configuredMCPConfigPaths())
+}
+
+// WorkspaceMCPServerSpecsWithPaths resolves the merged config into immutable
+// run-owned specs. Supplemental paths are evaluated for this workspace only;
+// no process-global MCP registry is consulted.
+func WorkspaceMCPServerSpecsWithPaths(workDir string, supplementalPaths []string) ([]MCPServerSpec, bool, error) {
+	raw, present, loadErr := LoadMCPConfigWithPaths(workDir, supplementalPaths)
+	if loadErr != nil {
+		return nil, false, loadErr
+	}
 	if strings.TrimSpace(raw) == "" {
-		return nil, false, nil
+		return nil, present, nil
 	}
 	config, err := ParseMCPConfig(raw)
 	if err != nil {
@@ -303,15 +381,16 @@ func WorkspaceMCPServerSpecs(workDir string) ([]MCPServerSpec, bool, error) {
 	servers := make([]MCPServerSpec, 0, len(config.MCPServers))
 	for name, server := range config.MCPServers {
 		servers = append(servers, MCPServerSpec{
-			Name: name, Command: server.Command,
+			Name: name, Type: server.Type, Command: server.Command,
 			Args: append([]string(nil), server.Args...), Env: cloneMCPEnvironment(server.Env),
+			URL: server.URL, Headers: cloneMCPEnvironment(server.Headers),
 		})
 	}
 	normalized, err := normalizeMCPServerSpecs(servers)
 	return normalized, true, err
 }
 
-func resolveRunMCPServerSpecs(opts RunOptions, workDir string) ([]MCPServerSpec, bool, error) {
+func resolveRunMCPServerSpecs(opts RunOptions, workDir string, supplementalPaths []string) ([]MCPServerSpec, bool, error) {
 	if opts.MCPServers != nil {
 		if !opts.DisableWorkspaceMCP {
 			return nil, true, errors.New("explicit MCP servers require workspace MCP to be disabled")
@@ -322,7 +401,7 @@ func resolveRunMCPServerSpecs(opts RunOptions, workDir string) ([]MCPServerSpec,
 	if opts.DisableWorkspaceMCP {
 		return nil, false, nil
 	}
-	return WorkspaceMCPServerSpecs(workDir)
+	return WorkspaceMCPServerSpecsWithPaths(workDir, supplementalPaths)
 }
 
 func (r *runMCPRuntime) buildCatalog() error {
@@ -417,6 +496,17 @@ func (r *runMCPRuntime) Reports() []processsupervisor.Report {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]processsupervisor.Report(nil), r.reports...)
+}
+
+func (r *runMCPRuntime) ExecutionCapabilities() sandbox.Capabilities {
+	if r == nil {
+		return sandbox.Capabilities{}
+	}
+	return r.capabilities
+}
+
+func (r *runMCPRuntime) RequiresFilesystemIsolation() bool {
+	return r != nil && r.requiresFilesystemIsolation
 }
 
 func (r *runMCPRuntime) Close() {

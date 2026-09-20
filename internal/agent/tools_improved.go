@@ -33,6 +33,10 @@ func executeBashV2WithOptions(
 // ── Improved Read: auto-detect binary, image info, better formatting ──
 
 func executeReadV2(input json.RawMessage, workDir string) (string, bool) {
+	return executeReadV2WithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeReadV2WithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	var args struct {
 		FilePath string `json:"file_path"`
 		Offset   int    `json:"offset"`
@@ -40,7 +44,11 @@ func executeReadV2(input json.RawMessage, workDir string) (string, bool) {
 	}
 	json.Unmarshal(input, &args)
 
-	path := resolvePath(args.FilePath, workDir)
+	paths, pathErr := executionToolWorkspacePathsWithPolicy("Read", input, workDir, opts.ExecutionPolicy)
+	if pathErr != nil {
+		return "Read blocked: " + pathErr.Error(), true
+	}
+	path := paths.one("file_path")
 
 	// File info
 	info, err := os.Stat(path)
@@ -120,16 +128,21 @@ func isBinaryFile(path string) bool {
 // ── Improved Glob: recursive ** support using filepath.Walk ──
 
 func executeGlobV2(input json.RawMessage, workDir string) (string, bool) {
+	return executeGlobV2WithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeGlobV2WithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	var args struct {
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
 	}
 	json.Unmarshal(input, &args)
 
-	dir := workDir
-	if args.Path != "" {
-		dir = resolvePath(args.Path, workDir)
+	paths, pathErr := executionToolWorkspacePathsWithPolicy("Glob", input, workDir, opts.ExecutionPolicy)
+	if pathErr != nil {
+		return "Glob blocked: " + pathErr.Error(), true
 	}
+	dir := paths.one("path")
 
 	var matches []string
 	pattern := args.Pattern
@@ -204,10 +217,11 @@ func executeGrepV2WithOptions(input json.RawMessage, workDir string, opts ToolEx
 	}
 	json.Unmarshal(input, &args)
 
-	dir := workDir
-	if args.Path != "" {
-		dir = resolvePath(args.Path, workDir)
+	paths, pathErr := executionToolWorkspacePathsWithPolicy("Grep", input, workDir, opts.ExecutionPolicy)
+	if pathErr != nil {
+		return "Grep blocked: " + pathErr.Error(), true
 	}
+	dir := paths.one("path")
 
 	// Try ripgrep first, and only fall back when the executable cannot start.
 	// A real rg exit 1 is the documented "no matches" outcome.
@@ -303,7 +317,7 @@ func executeEditV2WithOptions(input json.RawMessage, workDir string, opts ToolEx
 		return fmt.Sprintf("Invalid Edit input: %v", err), true
 	}
 
-	path, err := mutationExecutionPath(args.FilePath, workDir, "Edit", opts.fileMutation)
+	path, err := mutationExecutionPath(args.FilePath, workDir, "Edit", opts.fileMutation, opts.ExecutionPolicy)
 	if err != nil {
 		return fileMutationBlocked("edit", err)
 	}
@@ -406,7 +420,7 @@ func executeWriteV2WithOptions(input json.RawMessage, workDir string, opts ToolE
 		return fmt.Sprintf("Invalid Write input: %v", err), true
 	}
 
-	path, err := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation)
+	path, err := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation, opts.ExecutionPolicy)
 	if err != nil {
 		return fileMutationBlocked("write", err)
 	}
@@ -418,7 +432,7 @@ func executeWriteV2WithOptions(input json.RawMessage, workDir string, opts ToolE
 		return fmt.Sprintf("Error creating directory for %s: %v", args.FilePath, err), true
 	}
 	if opts.fileMutation != nil {
-		canonical, pathErr := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation)
+		canonical, pathErr := mutationExecutionPath(args.FilePath, workDir, "Write", opts.fileMutation, opts.ExecutionPolicy)
 		if pathErr != nil || !sameArtifactMutationPath(canonical, path) {
 			if pathErr == nil {
 				pathErr = errors.New("mutation directory changed after creation")

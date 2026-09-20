@@ -27,7 +27,7 @@ func defaultTUICommands() []tuiCommand {
 		{Name: "sessions", Description: "List durable sessions in this workspace", Local: true},
 		{Name: "load", Description: "Load a durable session by ID", NeedsArgs: true, Local: true},
 		{Name: "fork", Description: "Fork the current session at its exact revision", Local: true},
-		{Name: "reconcile", Description: "Acknowledge and clear an interrupted-run guard", Local: true},
+		{Name: "reconcile", Description: "Inspect file evidence and acknowledge interrupted side effects", Local: true},
 		{Name: "close", Description: "Close the current durable session", Local: true},
 		{Name: "delete", Description: "Delete the current durable session and result store", Local: true},
 		{Name: "rename", Description: "Rename the current durable session", NeedsArgs: true, Local: true},
@@ -42,7 +42,7 @@ func defaultTUICommands() []tuiCommand {
 		{Name: "quit", Description: "Exit and restore the terminal", Local: true},
 		{Name: "plan", Description: "Run the next task in read-only plan mode"},
 		{Name: "compact", Description: "Compact the current agent context"},
-		{Name: "undo", Description: "Restore the most recent agent edit checkpoint"},
+		{Name: "undo", Description: "List, inspect, and restore checkpoint files"},
 	}
 }
 
@@ -291,16 +291,9 @@ func (m tuiModel) executeLocalCommand(name, args string) (tea.Model, tea.Cmd) {
 			m.appendEntry(tuiEntryError, "The current session does not require reconciliation")
 			break
 		}
-		detail := "Review the external side effect before continuing."
-		if m.current.Interruption != nil {
-			detail = fmt.Sprintf("%s · tool=%s · state=%s · digest=%s",
-				safeTUIText(m.current.Interruption.Summary, 240),
-				safeTUIText(m.current.Interruption.ToolName, 80),
-				m.current.Interruption.SideEffectState,
-				safeTUIText(m.current.Interruption.InputDigest, 90),
-			)
-		}
-		m.confirm = &tuiConfirmation{Action: "reconcile", Title: "Mark this interrupted run reconciled?", Description: detail}
+		m.operationBusy = true
+		m.lastStatus = "Checking reconciliation evidence"
+		return m, m.reconciliationPreviewCmd(m.current.ID, m.current.Revision)
 	case "close":
 		if m.current == nil {
 			m.appendEntry(tuiEntryError, "No durable session is loaded")
@@ -328,10 +321,10 @@ func (m tuiModel) executeLocalCommand(name, args string) (tea.Model, tea.Cmd) {
 			m.appendEntry(tuiEntrySystem, fmt.Sprintf("Autosaved session %s at revision %d", m.current.ID, m.current.Revision))
 		}
 	case "diff":
-		if m.lastDiff == "" {
+		if len(m.diffs) == 0 {
 			m.appendEntry(tuiEntrySystem, "No diff has been emitted in this TUI run")
 		} else {
-			m.appendEntry(tuiEntryDiff, m.lastDiff)
+			m.appendEntry(tuiEntryDiff, formatTUIDiffSummary(m.diffs))
 		}
 	case "model":
 		parts := strings.Fields(args)
@@ -384,6 +377,33 @@ func (m tuiModel) executeLocalCommand(name, args string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func formatTUIDiffSummary(records []tuiDiffRecord) string {
+	if len(records) == 0 {
+		return "No diff has been emitted in this TUI run"
+	}
+	files := make([]string, 0, len(records))
+	seen := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		if record.File == "" {
+			continue
+		}
+		if _, ok := seen[record.File]; ok {
+			continue
+		}
+		seen[record.File] = struct{}{}
+		files = append(files, record.File)
+	}
+	var output strings.Builder
+	fmt.Fprintf(&output, "Changed files (%d): %s\n", len(files), strings.Join(files, ", "))
+	for index, record := range records {
+		if index > 0 {
+			output.WriteString("\n")
+		}
+		fmt.Fprintf(&output, "[%d] %s\n%s", index+1, record.File, record.Diff)
+	}
+	return output.String()
+}
+
 func (m *tuiModel) showHelp() {
 	var builder strings.Builder
 	builder.WriteString("TUI keys\n")
@@ -409,41 +429,23 @@ func (m tuiModel) prepareTurnCmd(ctx context.Context, prompt string, cancel cont
 	provider := m.config.Provider
 	model := m.config.Model
 	workDir := m.opts.WorkDir
+	if current != nil && !m.opts.WorkDirExplicit && strings.TrimSpace(current.Workspace) != "" {
+		workDir = current.Workspace
+	}
 	lang := m.opts.Lang
 	return func() tea.Msg {
-		session := current
-		if session == nil {
-			session = &agent.Session{
-				Workspace:       workDir,
-				Title:           titleFromPrompt(prompt),
-				Provider:        provider,
-				Model:           model,
-				LifecycleStatus: agent.SessionLifecycleActive,
-			}
+		if err := validateDurableChatWorkspace(current, workDir, m.opts.WorkDirExplicit); err != nil {
+			return tuiTurnPreparedMsg{generation: generation, cancel: cancel, err: err}
 		}
-		session.Messages = append(session.Messages, agent.SessionMessage{
-			Role:      "user",
-			Content:   prompt,
-			Timestamp: time.Now().UTC(),
-		})
-		session.Turns++
-		var expected *uint64
-		if session.ID != "" {
-			revision := session.Revision
-			expected = &revision
-		}
-		result, err := m.backend.SaveSession(ctx, session, expected)
+		session, revision, err := saveDurableChatUserTurn(ctx, m.backend, current, prompt, workDir, provider, model)
 		if err != nil {
 			return tuiTurnPreparedMsg{generation: generation, cancel: cancel, err: err}
 		}
-		session.ID = result.ID
-		session.Version = result.Version
-		session.Revision = result.Revision
-		revision := result.Revision
 		stream := m.backend.StartTurn(ctx, agentTurnRequest{
 			Messages:         wireMessagesFromSession(session.Messages),
 			WorkDir:          workDir,
 			ResponseLang:     lang,
+			ExecutionPolicy:  requestedExecutionPolicy(m.opts.Mode),
 			DurableSessionID: session.ID,
 			ExpectedRevision: &revision,
 		})
@@ -462,8 +464,6 @@ func (m tuiModel) sessionOperationCmd(action, id string, revision uint64, value 
 		switch action {
 		case "fork":
 			session, err = m.backend.ForkSession(ctx, id, revision)
-		case "reconcile":
-			session, err = m.backend.ReconcileSession(ctx, id, revision)
 		case "close":
 			session, err = m.backend.CloseSession(ctx, id, revision)
 		case "delete":
@@ -487,10 +487,73 @@ func (m tuiModel) sessionOperationCmd(action, id string, revision uint64, value 
 	}
 }
 
+func (m tuiModel) reconciliationPreviewCmd(id string, revision uint64) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		assessment, err := m.backend.ReconciliationPreview(ctx, id, revision)
+		return tuiReconciliationPreviewMsg{
+			sessionID:  id,
+			revision:   revision,
+			assessment: assessment,
+			err:        err,
+		}
+	}
+}
+
+func reconciliationAssessmentDescription(assessment agent.SessionReconciliationAssessment) string {
+	parts := []string{
+		"tool=" + safeTUIText(assessment.ToolName, 80),
+		"checkpoint=" + safeTUIText(assessment.CheckpointStatus, 32),
+		"judgment=" + safeTUIText(string(assessment.SideEffectJudgment), 32),
+		"execution=" + safeTUIText(string(assessment.RecordedExecutionState), 32),
+		fmt.Sprintf("files=%d preimage=%d postimage=%d diverged=%d unrecorded=%d unavailable=%d",
+			len(assessment.Files), assessment.MatchesPreimage, assessment.MatchesPostimage,
+			assessment.Diverged, assessment.PostimageUnrecorded, assessment.Unavailable),
+	}
+	if assessment.ManualConfirmationRequired {
+		parts = append(parts, "manual confirmation required: "+safeTUIText(assessment.ManualConfirmationReason, 240))
+	}
+	maxShown := 12
+	for index, file := range assessment.Files {
+		if index == maxShown {
+			parts = append(parts, fmt.Sprintf("… %d more file(s)", len(assessment.Files)-maxShown))
+			break
+		}
+		path := safeTUIText(file.Path, 180)
+		state := safeTUIText(string(file.Status), 40)
+		parts = append(parts, path+" → "+state)
+	}
+	if len(assessment.Files) == 0 {
+		parts = append(parts, "no checkpointed file changes")
+	}
+	parts = append(parts, "evidence="+safeTUIText(assessment.EvidenceDigest, 80))
+	return strings.Join(parts, " · ")
+}
+
 func (m tuiModel) executeConfirmed(confirmation tuiConfirmation) tea.Cmd {
 	if m.current == nil {
 		return func() tea.Msg {
 			return tuiSessionOperationMsg{action: confirmation.Action, err: fmt.Errorf("session is not loaded")}
+		}
+	}
+	if confirmation.Action == "reconcile" {
+		id := m.current.ID
+		revision := confirmation.ExpectedRevision
+		if revision == 0 {
+			revision = m.current.Revision
+		}
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			session, err := m.backend.ReconcileSession(
+				ctx,
+				id,
+				revision,
+				confirmation.EvidenceDigest,
+				confirmation.ManualConfirmationAcknowledged,
+			)
+			return tuiSessionOperationMsg{action: "reconcile", session: session, err: err}
 		}
 	}
 	return m.sessionOperationCmd(confirmation.Action, m.current.ID, m.current.Revision, "")

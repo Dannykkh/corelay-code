@@ -17,10 +17,16 @@ type agentProbeFixture struct {
 	marker             string
 	artifactPath       string
 	expectedArtifact   []byte
+	artifactFiles      []probeArtifact
 	expectedEditOld    string
 	expectedPatch      string
 	expectedSafetyPath string
 	approvedMutations  []probeApprovedMutation
+}
+
+type probeArtifact struct {
+	path     string
+	expected []byte
 }
 
 func prepareAgentProbeFixture(execution capabilityprofile.ProbeExecution) (agentProbeFixture, error) {
@@ -140,6 +146,94 @@ func prepareAgentProbeFixture(execution capabilityprofile.ProbeExecution) (agent
 		fixture.artifactPath = sentinel
 		fixture.expectedArtifact = expected
 		fixture.expectedSafetyPath = "../" + capabilityprofile.RuntimeBoundaryCanaryName
+	case capabilityprofile.CategoryMultiFileBug:
+		bugPath := filepath.Join(root, "bug", "add.go")
+		testPath := filepath.Join(root, "bug", "add_test.go")
+		if err := os.MkdirAll(filepath.Dir(bugPath), 0o700); err != nil {
+			return agentProbeFixture{}, err
+		}
+		initialBug := []byte("package bug\n\nfunc Add(a, b int) int { return a - b }\n")
+		bugTest := []byte("package bug\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if got := Add(2, 3); got != 5 { t.Fatalf(\"Add(2, 3) = %d, want 5\", got) } }\n")
+		fixedBug := []byte("package bug\n\nfunc Add(a, b int) int { return a + b }\n")
+		if err := os.WriteFile(bugPath, initialBug, 0o600); err != nil {
+			return agentProbeFixture{}, err
+		}
+		if err := os.WriteFile(testPath, bugTest, 0o600); err != nil {
+			return agentProbeFixture{}, err
+		}
+		fixture.prompt = fmt.Sprintf("Read bug/add.go and bug/add_test.go. Fix the multi-file arithmetic bug by writing the complete corrected content to bug/add.go, leave the test unchanged, then answer exactly %s.", marker)
+		fixture.artifactFiles = []probeArtifact{{path: bugPath, expected: fixedBug}, {path: testPath, expected: bugTest}}
+		fixture.approvedMutations = []probeApprovedMutation{{tool: "Write", path: "bug/add.go", input: mustProbeInput(struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+		}{FilePath: "bug/add.go", Content: string(fixedBug)})}}
+	case capabilityprofile.CategoryNewFeatureTest:
+		featurePath := filepath.Join(root, "feature", "status.go")
+		featureTestPath := filepath.Join(root, "feature", "status_test.go")
+		if err := os.MkdirAll(filepath.Dir(featurePath), 0o700); err != nil {
+			return agentProbeFixture{}, err
+		}
+		initialFeature := []byte("package feature\n\nfunc Enabled() bool { return false }\n")
+		initialFeatureTest := []byte("package feature\n\n// add an acceptance test for Enabled\n")
+		updatedFeature := []byte("package feature\n\nfunc Enabled() bool { return true }\n")
+		updatedFeatureTest := []byte("package feature\n\nimport \"testing\"\n\nfunc TestEnabled(t *testing.T) { if !Enabled() { t.Fatal(\"Enabled() = false, want true\") } }\n")
+		for path, content := range map[string][]byte{featurePath: initialFeature, featureTestPath: initialFeatureTest} {
+			if err := os.WriteFile(path, content, 0o600); err != nil {
+				return agentProbeFixture{}, err
+			}
+		}
+		fixture.prompt = fmt.Sprintf("Read feature/status.go and feature/status_test.go. Implement the requested feature by writing the complete updated implementation and an acceptance test to those two files, then answer exactly %s.", marker)
+		fixture.artifactFiles = []probeArtifact{{path: featurePath, expected: updatedFeature}, {path: featureTestPath, expected: updatedFeatureTest}}
+		fixture.approvedMutations = []probeApprovedMutation{
+			{tool: "Write", path: "feature/status.go", input: mustProbeInput(struct {
+				FilePath string `json:"file_path"`
+				Content  string `json:"content"`
+			}{FilePath: "feature/status.go", Content: string(updatedFeature)})},
+			{tool: "Write", path: "feature/status_test.go", input: mustProbeInput(struct {
+				FilePath string `json:"file_path"`
+				Content  string `json:"content"`
+			}{FilePath: "feature/status_test.go", Content: string(updatedFeatureTest)})},
+		}
+	case capabilityprofile.CategoryFixFailingTest:
+		calcPath := filepath.Join(root, "calculator", "calculator.go")
+		calcTestPath := filepath.Join(root, "calculator", "calculator_test.go")
+		if err := os.MkdirAll(filepath.Dir(calcPath), 0o700); err != nil {
+			return agentProbeFixture{}, err
+		}
+		initialCalc := []byte("package calculator\n\nfunc Sum(a, b int) int { return a - b }\n")
+		calcTest := []byte("package calculator\n\nimport \"testing\"\n\nfunc TestSum(t *testing.T) { if got := Sum(4, 5); got != 9 { t.Fatalf(\"Sum(4, 5) = %d, want 9\", got) } }\n")
+		fixedCalc := []byte("package calculator\n\nfunc Sum(a, b int) int { return a + b }\n")
+		for path, content := range map[string][]byte{calcPath: initialCalc, calcTestPath: calcTest} {
+			if err := os.WriteFile(path, content, 0o600); err != nil {
+				return agentProbeFixture{}, err
+			}
+		}
+		fixture.prompt = fmt.Sprintf("Read calculator/calculator.go and calculator/calculator_test.go. Repair the failing implementation so the existing test expectation is satisfied, write the complete corrected calculator.go, and answer exactly %s.", marker)
+		fixture.artifactFiles = []probeArtifact{{path: calcPath, expected: fixedCalc}, {path: calcTestPath, expected: calcTest}}
+		fixture.approvedMutations = []probeApprovedMutation{{tool: "Write", path: "calculator/calculator.go", input: mustProbeInput(struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+		}{FilePath: "calculator/calculator.go", Content: string(fixedCalc)})}}
+	case capabilityprofile.CategoryDecisionRetention, capabilityprofile.CategoryProjectSwitch:
+		// Stateful inputs are built by the lifecycle orchestrators, not by
+		// answer-bearing files or simulated project-selection mutations.
+		fixture.prompt = fmt.Sprintf("Complete the lifecycle probe and report %s.", marker)
+	case capabilityprofile.CategoryInterruptRecovery:
+		checkpointPath := filepath.Join(root, "resume", "checkpoint.txt")
+		if err := os.MkdirAll(filepath.Dir(checkpointPath), 0o700); err != nil {
+			return agentProbeFixture{}, err
+		}
+		initialCheckpoint := []byte("state=running\n")
+		resumedCheckpoint := []byte("state=resumed\n")
+		if err := os.WriteFile(checkpointPath, initialCheckpoint, 0o600); err != nil {
+			return agentProbeFixture{}, err
+		}
+		fixture.prompt = fmt.Sprintf("Resume the interrupted task from resume/checkpoint.txt. Read the checkpoint, change only state=running to state=resumed by writing the complete file, and answer exactly %s.", marker)
+		fixture.artifactFiles = []probeArtifact{{path: checkpointPath, expected: resumedCheckpoint}}
+		fixture.approvedMutations = []probeApprovedMutation{{tool: "Write", path: "resume/checkpoint.txt", input: mustProbeInput(struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+		}{FilePath: "resume/checkpoint.txt", Content: string(resumedCheckpoint)})}}
 	}
 	return fixture, nil
 }
@@ -170,6 +264,27 @@ func contextProbePrompt(tokens int, marker string) string {
 }
 
 func validateProbeArtifact(fixture agentProbeFixture) (string, bool) {
+	if len(fixture.artifactFiles) > 0 {
+		var digestInput []byte
+		for _, artifact := range fixture.artifactFiles {
+			info, err := os.Lstat(artifact.path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 1<<20 {
+				return digestBytes([]byte("missing-or-unsafe-artifact")), false
+			}
+			content, err := os.ReadFile(artifact.path)
+			if err != nil {
+				return digestBytes([]byte("unreadable-artifact")), false
+			}
+			digestInput = append(digestInput, []byte(artifact.path)...)
+			digestInput = append(digestInput, 0)
+			digestInput = append(digestInput, content...)
+			digestInput = append(digestInput, 0)
+			if string(content) != string(artifact.expected) {
+				return digestBytes(digestInput), false
+			}
+		}
+		return digestBytes(digestInput), true
+	}
 	if fixture.artifactPath == "" {
 		return "", true
 	}

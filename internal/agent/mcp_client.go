@@ -37,13 +37,14 @@ const (
 // is invalid. Disabled execution is accepted only by the named legacy host
 // adapter.
 type MCPExecutionOptions struct {
-	Context       context.Context
-	Runner        processsupervisor.Runner
-	Policy        sandbox.Policy
-	ObserveStart  func(processsupervisor.Report)
-	CallTimeout   time.Duration
-	MaxFrameBytes int
-	MaxJSONDepth  int
+	Context         context.Context
+	Runner          processsupervisor.Runner
+	Policy          sandbox.Policy
+	ExecutionPolicy ExecutionPolicySnapshot
+	ObserveStart    func(processsupervisor.Report)
+	CallTimeout     time.Duration
+	MaxFrameBytes   int
+	MaxJSONDepth    int
 }
 
 // DefaultMCPExecutionOptions selects the truthful streaming adapter for the
@@ -60,6 +61,7 @@ func DefaultMCPExecutionOptions(ctx context.Context, workDirs ...string) MCPExec
 		}
 	}
 	runner := processsupervisor.NewAutoRunner()
+	executionPolicy, _ := ResolveExecutionPolicy(ExecutionPolicyRequest{}, "", runner.Capabilities())
 	capabilities := runner.Capabilities()
 	policy := sandbox.Policy{
 		Enforcement: sandbox.EnforcementPreferred,
@@ -74,7 +76,7 @@ func DefaultMCPExecutionOptions(ctx context.Context, workDirs ...string) MCPExec
 		policy.Workspace = workDirs[0]
 		policy.WorkspaceAccess = sandbox.WorkspaceReadWrite
 	}
-	return MCPExecutionOptions{Context: ctx, Runner: runner, Policy: policy}
+	return MCPExecutionOptions{Context: ctx, Runner: runner, Policy: policy, ExecutionPolicy: executionPolicy}
 }
 
 // LegacyDisabledMCPExecutionOptions is the only compatibility adapter that
@@ -91,6 +93,24 @@ func LegacyDisabledMCPExecutionOptions(ctx context.Context) MCPExecutionOptions 
 				Timeouts:             true,
 			},
 		},
+	}
+}
+
+// FullModeMCPExecutionOptions explicitly runs configured MCP subprocesses with
+// the current OS user's host rights. It never changes credentials or claims
+// filesystem/network isolation.
+func FullModeMCPExecutionOptions(ctx context.Context, policy ExecutionPolicySnapshot) MCPExecutionOptions {
+	runner := processsupervisor.NewHostRunner()
+	capabilities := runner.Capabilities()
+	return MCPExecutionOptions{
+		Context: ctx,
+		Runner:  runner,
+		Policy: sandbox.Policy{Enforcement: sandbox.EnforcementDisabled, Required: sandbox.Capabilities{
+			ProcessTreeKill:      capabilities.ProcessTreeKill,
+			EnvironmentFiltering: capabilities.EnvironmentFiltering,
+			Timeouts:             capabilities.Timeouts,
+		}},
+		ExecutionPolicy: policy,
 	}
 }
 
@@ -135,10 +155,11 @@ func startMCPProcess(
 		return nil, processsupervisor.Report{}, fmt.Errorf("invalid MCP environment: %s", sanitizeMCPProtocolText(err.Error()))
 	}
 	process, report := opts.Runner.Start(opts.Context, opts.Policy, processsupervisor.Spec{
-		Executable:  command,
-		Args:        append([]string(nil), args...),
-		Dir:         workDir,
-		Environment: environmentSpec,
+		Executable:      command,
+		Args:            append([]string(nil), args...),
+		Dir:             workDir,
+		Environment:     environmentSpec,
+		ExecutionPolicy: opts.ExecutionPolicy,
 	})
 	if opts.ObserveStart != nil {
 		opts.ObserveStart(report)
@@ -221,6 +242,8 @@ type MCPClient struct {
 	callTimeout   time.Duration
 	maxFrameBytes int
 	maxJSONDepth  int
+	remote        *mcpRemoteTransport
+	toolsStale    atomic.Bool
 }
 
 // effectiveCallTimeout and the framing accessors keep manually assembled
@@ -422,6 +445,12 @@ func (c *MCPClient) CallToolContext(ctx context.Context, name string, args json.
 	if len(args) > c.effectiveMaxFrameBytes() || !json.Valid(args) || validateMCPJSONDepth(args, c.effectiveMaxJSONDepth()) != nil {
 		return "MCP tool error: invalid arguments", true
 	}
+	if c.toolsStale.Swap(false) {
+		if err := c.discoverTools(ctx); err != nil {
+			c.toolsStale.Store(true)
+			return fmt.Sprintf("MCP tool error: schema refresh failed: %s", sanitizeMCPProtocolText(err.Error())), true
+		}
+	}
 	response, err := c.callContext(ctx, "tools/call", map[string]interface{}{
 		"name": name, "arguments": json.RawMessage(args),
 	})
@@ -457,6 +486,9 @@ func (c *MCPClient) shutdown(reason error, stop bool) {
 		c.stdin = nil
 		c.stdout = nil
 		c.mu.Unlock()
+		if c.remote != nil {
+			c.remote.close()
+		}
 		if stdin != nil {
 			_ = stdin.Close()
 		}
@@ -508,6 +540,9 @@ func (c *MCPClient) callContext(parent context.Context, method string, params in
 	if err != nil || len(frame) > c.effectiveMaxFrameBytes() || validateMCPJSONDepth(frame, c.effectiveMaxJSONDepth()) != nil {
 		return nil, fmt.Errorf("invalid MCP request")
 	}
+	if c.remote != nil {
+		return c.callRemoteContext(ctx, method, id, frame)
+	}
 	waiter := make(chan mcpRPCResult, 1)
 	if err := c.addPending(id, waiter); err != nil {
 		return nil, err
@@ -554,6 +589,10 @@ func (c *MCPClient) notifyContext(parent context.Context, method string, params 
 	frame, err := json.Marshal(jsonRPCRequest{JSONRPC: "2.0", Method: method, Params: params})
 	if err != nil || len(frame) > c.effectiveMaxFrameBytes() || validateMCPJSONDepth(frame, c.effectiveMaxJSONDepth()) != nil {
 		return fmt.Errorf("invalid MCP notification")
+	}
+	if c.remote != nil {
+		_, err := c.remote.post(ctx, frame)
+		return err
 	}
 	return c.writeFrameContext(ctx, frame)
 }
@@ -676,6 +715,9 @@ func (c *MCPClient) dispatchFrame(frame []byte) error {
 		// Server notifications are intentionally ignored. Server-initiated
 		// requests are unsupported and cannot be mistaken for responses.
 		if len(response.ID) == 0 || string(response.ID) == "null" {
+			if response.Method == "notifications/tools/list_changed" {
+				c.toolsStale.Store(true)
+			}
 			return c.observeUnsolicitedMCPFrame()
 		}
 		return fmt.Errorf("unsupported MCP server request")
@@ -819,7 +861,11 @@ func ConnectMCPServers(workDir string) (int, error) {
 func ConnectMCPServersWithOptions(workDir string, opts MCPExecutionOptions) (int, error) {
 	mcpLifecycleMu.Lock()
 	defer mcpLifecycleMu.Unlock()
-	configJSON := LoadMCPConfig(workDir)
+	configJSON, _, loadErr := LoadMCPConfigWithPaths(workDir, configuredMCPConfigPaths())
+	if loadErr != nil {
+		disconnectAllMCPUnlocked()
+		return 0, loadErr
+	}
 	if configJSON == "" {
 		disconnectAllMCPUnlocked()
 		return 0, nil
@@ -861,7 +907,13 @@ func ConnectMCPServersWithOptions(workDir string, opts MCPExecutionOptions) (int
 		if old != nil {
 			old.Close()
 		}
-		client, connectErr := NewMCPClientWithOptions(name, server.Command, server.Args, workDir, server.Env, opts)
+		var client *MCPClient
+		var connectErr error
+		if strings.EqualFold(strings.TrimSpace(server.Type), "http") {
+			client, connectErr = newMCPRemoteClientWithInitializationContext(name, server.URL, server.Headers, opts, opts.Context, true)
+		} else {
+			client, connectErr = NewMCPClientWithOptions(name, server.Command, server.Args, workDir, server.Env, opts)
+		}
 		if connectErr != nil {
 			log.Printf("[MCP] Failed to connect %q: %v", name, connectErr)
 			failed = append(failed, name)

@@ -403,6 +403,16 @@ func (p HarnessProfile) ResponsePolicy() ResponsePolicy { return p.responsePolic
 func (p HarnessProfile) EditPolicy() EditPolicy         { return p.editPolicy }
 func (p HarnessProfile) ToolRouting() ToolRoutingPolicy { return p.toolRouting }
 
+// WithPlanAnchorMode returns a copy with a run-owned plan completion policy.
+// It preserves every other resolved capability instead of rebuilding defaults.
+func (p HarnessProfile) WithPlanAnchorMode(mode PlanAnchorMode) (HarnessProfile, error) {
+	if !p.Valid() || !mode.Valid() {
+		return HarnessProfile{}, fmt.Errorf("cannot change plan-anchor mode on an unresolved profile")
+	}
+	p.planAnchorMode = mode
+	return p, nil
+}
+
 // Aliases returns a copy so callers cannot mutate resolved matching policy.
 func (p HarnessProfile) Aliases() []string {
 	return append([]string(nil), p.aliases...)

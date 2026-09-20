@@ -21,21 +21,29 @@ import (
 
 // TeamConfig holds team-level settings.
 type TeamConfig struct {
-	Name              string                  `json:"name"`
-	MaxWaveSize       int                     `json:"maxWaveSize"`   // max agents per wave (default 5)
-	CycleTimeout      time.Duration           `json:"cycleTimeout"`  // per-wave timeout
-	VerifyCommand     string                  `json:"verifyCommand"` // verification command
-	Capacity          CapacityConfig          `json:"capacity,omitempty"`
-	WorkstreamContext string                  `json:"-"`
-	ProviderFactory   ProviderFactory         `json:"-"`
-	SessionID         string                  `json:"-"`
-	ApprovalRequester approval.Requester      `json:"-"`
-	SandboxRunner     sandbox.Runner          `json:"-"`
-	SandboxPolicy     sandbox.Policy          `json:"-"`
-	PluginDirs        []string                `json:"-"`
-	PluginExecution   *PluginExecutionOptions `json:"-"`
-	DisablePlugins    bool                    `json:"-"`
-	Recorder          RunRecorder             `json:"-"`
+	Name              string                   `json:"name"`
+	MaxWaveSize       int                      `json:"maxWaveSize"`   // max agents per wave (default 5)
+	CycleTimeout      time.Duration            `json:"cycleTimeout"`  // per-wave timeout
+	VerifyCommand     string                   `json:"verifyCommand"` // verification command
+	Capacity          CapacityConfig           `json:"capacity,omitempty"`
+	WorkstreamContext string                   `json:"-"`
+	CompactionContext CompactionContext        `json:"-"`
+	PlanAnchor        *PlanAnchor              `json:"-"`
+	ProviderFactory   ProviderFactory          `json:"-"`
+	SessionID         string                   `json:"-"`
+	SessionRevision   uint64                   `json:"-"`
+	CheckpointScope   *CheckpointScope         `json:"-"`
+	ApprovalRequester approval.Requester       `json:"-"`
+	SandboxRunner     sandbox.Runner           `json:"-"`
+	SandboxPolicy     sandbox.Policy           `json:"-"`
+	PluginDirs        []string                 `json:"-"`
+	PluginExecution   *PluginExecutionOptions  `json:"-"`
+	DisablePlugins    bool                     `json:"-"`
+	Recorder          RunRecorder              `json:"-"`
+	ExecutionPolicy   *ExecutionPolicySnapshot `json:"-"`
+	SkillSource       string                   `json:"-"`
+	SkillDirs         []string                 `json:"-"`
+	ProjectSkillDirs  []string                 `json:"-"`
 }
 
 type ProviderFactory func(name string) (types.Provider, error)
@@ -239,9 +247,19 @@ func NewTeam(provider types.Provider, model, workDir, baseDir string, cfg TeamCo
 		copy(pluginDirs, cfg.PluginDirs)
 		cfg.PluginDirs = pluginDirs
 	}
+	cfg.SkillDirs = cloneStringsPreserveNil(cfg.SkillDirs)
+	cfg.ProjectSkillDirs = cloneStringsPreserveNil(cfg.ProjectSkillDirs)
 	if cfg.PluginExecution != nil {
 		copy := *cfg.PluginExecution
 		cfg.PluginExecution = &copy
+	}
+	if cfg.ExecutionPolicy != nil {
+		copy := *cfg.ExecutionPolicy
+		cfg.ExecutionPolicy = &copy
+	}
+	cfg.CompactionContext = cloneCompactionContext(cfg.CompactionContext)
+	if cfg.CheckpointScope == nil {
+		cfg.CheckpointScope = NewCheckpointScope(cfg.SessionID, cfg.SessionRevision)
 	}
 	return &Team{
 		config:   cfg,
@@ -275,11 +293,13 @@ func (t *Team) worktreeToolOptions(ctx context.Context, toolID string) ToolExecu
 		t.config.SandboxRunner,
 		t.config.SandboxPolicy,
 		"team worktree",
+		t.config.ExecutionPolicy != nil && t.config.ExecutionPolicy.Mode == ExecutionModeFull,
 	)
 	return ToolExecutionOptions{
-		Context:       ctx,
-		SandboxRunner: runner,
-		SandboxPolicy: policy,
+		ExecutionPolicy: t.config.ExecutionPolicy,
+		Context:         ctx,
+		SandboxRunner:   runner,
+		SandboxPolicy:   policy,
 		ObserveSandbox: func(report sandbox.Report) {
 			recordSandboxExecution(t.config.Recorder, SandboxExecutionRecord{
 				ToolID:   toolID,
@@ -635,12 +655,24 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 		t.config.SandboxRunner,
 		t.config.SandboxPolicy,
 		"team worker",
+		t.config.ExecutionPolicy != nil && t.config.ExecutionPolicy.Mode == ExecutionModeFull,
 	)
+	requestedPolicyMode := ExecutionMode("")
+	if task.ReadOnly {
+		requestedPolicyMode = ExecutionModeReadOnly
+	}
+	executionPolicy := deriveChildExecutionPolicy(t.config.ExecutionPolicy, requestedPolicyMode, sandboxRunner)
 	go RunLoopWithOptions(workerCtx, provider, model, messages, t.workDir, RunOptions{
+		ExecutionPolicy:   executionPolicy,
 		SessionID:         t.config.SessionID,
+		DurableSessionID:  t.config.CheckpointScope.ownerSnapshot().SessionID,
+		CheckpointScope:   t.config.CheckpointScope,
+		SessionRevision:   t.config.SessionRevision,
 		ApprovalRequester: t.config.ApprovalRequester,
 		ResponseLang:      "auto",
 		WorkstreamContext: t.config.WorkstreamContext,
+		CompactionContext: cloneCompactionContext(t.config.CompactionContext),
+		PlanAnchor:        t.config.PlanAnchor,
 		WorkerID:          workerID,
 		OwnershipChecker:  t.CheckFileOwnership,
 		Recorder:          t.config.Recorder,
@@ -649,6 +681,9 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 		PluginDirs:        t.config.PluginDirs,
 		PluginExecution:   t.config.PluginExecution,
 		DisablePlugins:    t.config.DisablePlugins,
+		SkillSource:       t.config.SkillSource,
+		SkillDirs:         cloneStringsPreserveNil(t.config.SkillDirs),
+		ProjectSkillDirs:  cloneStringsPreserveNil(t.config.ProjectSkillDirs),
 	}, innerEventCh)
 
 	// Disk-based output: write to file instead of accumulating in memory
@@ -865,10 +900,14 @@ func (t *Team) Verify(ctx context.Context) (bool, string) {
 }
 
 func (t *Team) executeVerificationBash(ctx context.Context, input json.RawMessage, toolID string) BashExecResult {
+	if t.config.ExecutionPolicy != nil && t.config.ExecutionPolicy.Mode == ExecutionModeReadOnly {
+		return BashExecResult{Output: "read-only execution mode blocks team verification commands", IsError: true, ExitCode: 1}
+	}
 	runner, policy := configuredSandboxExecution(
 		t.config.SandboxRunner,
 		t.config.SandboxPolicy,
 		"team verification",
+		t.config.ExecutionPolicy != nil && t.config.ExecutionPolicy.Mode == ExecutionModeFull,
 	)
 	var observed sandbox.Report
 	var hasReport bool

@@ -75,9 +75,9 @@ func TestSessionAPIMapsValidationAndNotFoundErrors(t *testing.T) {
 func TestSessionAPISaveConflictAndDeleteResult(t *testing.T) {
 	s := newSessionAPITestServer(t)
 	id := "sess_" + strings.Repeat("b", 26)
-	base := t.TempDir()
-	workspaceA := filepath.Join(base, "a")
-	workspaceB := filepath.Join(base, "b")
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	s.SetWorkDir(workspaceA)
 
 	firstBody := `{"id":"` + id + `","workspace":"` + filepath.ToSlash(workspaceA) + `"}`
 	req, rec := sessionRequest(t, http.MethodPost, "/api/sessions", "", firstBody)

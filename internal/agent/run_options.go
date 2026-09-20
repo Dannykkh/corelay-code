@@ -86,14 +86,37 @@ type ToolExecutionJournalEntry struct {
 type ToolExecutionJournal func(ToolExecutionJournalEntry) error
 
 type RunOptions struct {
+	// ExecutionPolicyRequest is the root run's user-selected mode. RunLoop
+	// resolves it once against the compatibility default and runtime facts.
+	// Child loops must receive a derived ExecutionPolicy snapshot instead.
+	ExecutionPolicyRequest *ExecutionPolicyRequest
+	// ExecutionPolicy is the exact authority snapshot inherited by a child run.
+	// Nil on a root run resolves once to the workspace compatibility default.
+	ExecutionPolicy *ExecutionPolicySnapshot
 	// SessionID identifies the active run whose approvals must be bound to the
 	// same client session. It is distinct from durable transcript IDs.
 	SessionID string
+	// DurableSessionID scopes persisted run artifacts such as checkpoints to
+	// the transcript session. It is separate from SessionID, which owns live
+	// approvals and may be ephemeral.
+	DurableSessionID string
+	// CheckpointScope lets cooperating workers contribute to one turn's undo
+	// generation without clearing or racing each other's manifest.
+	CheckpointScope *CheckpointScope
+	// SessionRevision is the exact durable transcript revision being executed.
+	// Ephemeral runs use zero; full-mode grants still bind their run identity.
+	SessionRevision uint64
 	// ApprovalRequester is optional until the common safety pipeline requests
 	// an explicit user decision. A nil requester must never imply approval.
 	ApprovalRequester approval.Requester
 	ResponseLang      string
+	// SkillSource and SkillDirs are the resolved per-run skill catalog policy.
+	// An empty source retains the legacy "all" behavior for direct callers.
+	SkillSource       string
+	SkillDirs         []string
+	ProjectSkillDirs  []string
 	WorkstreamContext string
+	CompactionContext CompactionContext
 	Recorder          RunRecorder
 	WorkerID          string
 	OwnershipChecker  func(workerID, filePath string) (bool, string)
@@ -117,9 +140,15 @@ type RunOptions struct {
 	// empirical selection. It is ignored when HarnessProfile is explicit and is
 	// rechecked for expiry and exact provider/model identity at run start.
 	CapabilityProfile *capabilityprofile.AutomaticSelection
+	// EvaluatedLessons is a bounded profiler injection, never model-supplied text.
+	EvaluatedLessons capabilityprofile.LessonPolicy
 	// PlanAnchor is optional durable plan state. Rendering remains disabled
 	// unless the resolved HarnessProfile selects a non-off mode.
 	PlanAnchor *PlanAnchor
+	// PlanBinding pins a canonical Workstream Plan stage to this execution.
+	// Plan-bound runs force strict completion evidence regardless of the
+	// provider's ordinary plan-anchor profile.
+	PlanBinding *PlanExecutionBinding
 	// TokenEstimator can provide an exact provider tokenizer. When nil, the
 	// request planner uses its deterministic protocol-aware conservative model.
 	TokenEstimator TokenEstimator
@@ -180,6 +209,67 @@ type RunOptions struct {
 	PluginExecution *PluginExecutionOptions
 	// DisablePlugins prevents both default and explicit plugin discovery.
 	DisablePlugins bool
+}
+
+// PlanExecutionBinding is the content-free identity shared by Plan-bound
+// execution and its durable receipt.
+type PlanExecutionBinding struct {
+	WorkstreamID      string `json:"workstreamId"`
+	PlanID            string `json:"planId"`
+	PlanRevision      uint64 `json:"planRevision"`
+	PlanStateRevision uint64 `json:"planStateRevision,omitempty"`
+	StageID           string `json:"stageId"`
+	RunID             string `json:"runId"`
+}
+
+// CompactionContext carries typed durable workflow state into the common
+// structured-compaction path. It is separate from rendered prompt text and
+// from PlanExecutionBinding so Team workers can retain workflow context
+// without claiming ownership of the parent Plan stage execution.
+type CompactionContext struct {
+	WorkstreamID            string
+	WorkstreamObjective     string
+	Constraints             []string
+	Decisions               []string
+	LastVerificationStatus  string
+	LastVerificationSource  string
+	LastVerificationSummary string
+	PlanID                  string
+	PlanRevision            uint64
+	PlanStateRevision       uint64
+	StageID                 string
+	PlanEvidence            []CompactionPlanEvidence
+}
+
+// CompactionPlanEvidence contains only durable digest/status references.
+type CompactionPlanEvidence struct {
+	StageID             string `json:"stageId"`
+	StageStatus         string `json:"stageStatus,omitempty"`
+	AttemptStatus       string `json:"attemptStatus,omitempty"`
+	AttemptPlanRevision uint64 `json:"attemptPlanRevision,omitempty"`
+	ReceiptDigest       string `json:"receiptDigest,omitempty"`
+	CriteriaDigest      string `json:"criteriaDigest,omitempty"`
+	VerificationStatus  string `json:"verificationStatus,omitempty"`
+	CompletionStatus    string `json:"completionStatus,omitempty"`
+}
+
+func cloneCompactionContext(value CompactionContext) CompactionContext {
+	value.Constraints = append([]string(nil), value.Constraints...)
+	value.Decisions = append([]string(nil), value.Decisions...)
+	value.PlanEvidence = append([]CompactionPlanEvidence(nil), value.PlanEvidence...)
+	return value
+}
+
+func compactionContextForRun(value CompactionContext, binding *PlanExecutionBinding) CompactionContext {
+	value = cloneCompactionContext(value)
+	if binding != nil {
+		value.WorkstreamID = binding.WorkstreamID
+		value.PlanID = binding.PlanID
+		value.PlanRevision = binding.PlanRevision
+		value.PlanStateRevision = binding.PlanStateRevision
+		value.StageID = binding.StageID
+	}
+	return value
 }
 
 // CompletionEvidenceNotRequiredCriteria returns a defensive copy suitable for

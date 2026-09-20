@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Install Linux sandbox backend
@@ -35,14 +35,17 @@ jobs:
           fi
           bwrap --version
 
-      - name: Test all packages
-        run: go test ./... -count=1
+      - name: Install pinned gopls for Q15 semantic fixture
+        shell: bash
+        run: |
+          GOTOOLCHAIN=auto GOBIN="$RUNNER_TEMP/corelay-gopls" go install golang.org/x/tools/gopls@v0.23.0
+          echo "$RUNNER_TEMP/corelay-gopls" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/corelay-gopls:$PATH"
+          gopls version
 
-      - name: Repeat platform sandbox contracts
-        run: go test ./internal/sandbox ./internal/processsupervisor -count=3
-
-      - name: Vet
-        run: go vet ./...
+      - name: Roadmap Q01-Q16 and migration contracts
+        shell: bash
+        run: bash scripts/roadmap-qa.sh
 
   build:
     runs-on: ubuntu-latest
@@ -51,13 +54,16 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version-file: go.mod
 
       - name: Build
         run: go build ./...
 
       - name: Vet
         run: go vet ./...
+
+      - name: Go vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   race:
     runs-on: ubuntu-latest
@@ -66,7 +72,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Install Linux sandbox backend
@@ -100,6 +106,9 @@ jobs:
 
       - name: Lint
         run: cd web && npm run lint
+
+      - name: Test stream handling
+        run: cd web && npm run test:sse
 
       - name: Build
         run: cd web && npm run build

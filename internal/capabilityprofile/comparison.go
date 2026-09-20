@@ -73,6 +73,34 @@ type observationShape struct {
 }
 
 func CompareProfiles(baseline, candidate CapabilityProfile) (ComparisonReport, error) {
+	return compareProfiles(baseline, candidate, false)
+}
+
+// CompareRevisions evaluates repeated measurements of the same harness and
+// fixtures. The existing cross-variant comparison remains a separate contract.
+func CompareRevisions(baseline, candidate CapabilityProfile) (ComparisonReport, error) {
+	return compareRevisions(baseline, candidate, false)
+}
+
+func compareRevisions(baseline, candidate CapabilityProfile, lessonExperiment bool) (ComparisonReport, error) {
+	if !baseline.Valid() || !candidate.Valid() {
+		return ComparisonReport{}, ErrInvalidProfile
+	}
+	left, right := baseline.Snapshot(), candidate.Snapshot()
+	if lessonExperiment {
+		if left.Provenance.LessonDigest == "" || right.Provenance.LessonDigest == "" {
+			return ComparisonReport{}, ErrIncompatibleProfiles
+		}
+		left.Provenance.Lessons, right.Provenance.Lessons = 0, 0
+		left.Provenance.LessonDigest, right.Provenance.LessonDigest = "", ""
+	}
+	if left.Provenance != right.Provenance || len(left.ManualOverrides) != 0 || len(right.ManualOverrides) != 0 {
+		return ComparisonReport{}, ErrIncompatibleProfiles
+	}
+	return compareProfiles(baseline, candidate, true)
+}
+
+func compareProfiles(baseline, candidate CapabilityProfile, sameVariant bool) (ComparisonReport, error) {
 	if !baseline.Valid() || !candidate.Valid() {
 		return ComparisonReport{}, ErrInvalidProfile
 	}
@@ -82,7 +110,7 @@ func CompareProfiles(baseline, candidate CapabilityProfile) (ComparisonReport, e
 		left.Provenance.PlanVersion != right.Provenance.PlanVersion ||
 		!validDigest(left.Provenance.FixtureDigest) || left.Provenance.FixtureDigest != right.Provenance.FixtureDigest ||
 		left.Provenance.ExpectedAttempts != right.Provenance.ExpectedAttempts ||
-		leftVariant == rightVariant {
+		(leftVariant == rightVariant) != sameVariant {
 		return ComparisonReport{}, ErrIncompatibleProfiles
 	}
 

@@ -34,7 +34,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version-file: go.mod
 
       - name: Build frontend
         run: |
@@ -49,9 +49,9 @@ jobs:
         run: |
           EXT=""
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o "corelaycode-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/proxy
-          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "corelaycode-acp-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/corelaycode-acp
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o "corelaycode-profile-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/corelaycode-profile
+          CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${{ github.ref_name }} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${{ github.sha }}" -o "corelaycode-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/proxy
+          CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${{ github.ref_name }} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${{ github.sha }}" -o "corelaycode-acp-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/corelaycode-acp
+          CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${{ github.ref_name }} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${{ github.sha }}" -o "corelaycode-profile-${{ github.ref_name }}-${GOOS}-${GOARCH}${EXT}" ./cmd/corelaycode-profile
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -67,10 +67,38 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Verify package smoke metadata and checksums
+        shell: bash
+        run: |
+          expected=(
+            "corelaycode-${{ github.ref_name }}-linux-amd64"
+            "corelaycode-${{ github.ref_name }}-linux-arm64"
+            "corelaycode-${{ github.ref_name }}-darwin-amd64"
+            "corelaycode-${{ github.ref_name }}-darwin-arm64"
+            "corelaycode-${{ github.ref_name }}-windows-amd64.exe"
+            "corelaycode-acp-${{ github.ref_name }}-linux-amd64"
+            "corelaycode-acp-${{ github.ref_name }}-linux-arm64"
+            "corelaycode-acp-${{ github.ref_name }}-darwin-amd64"
+            "corelaycode-acp-${{ github.ref_name }}-darwin-arm64"
+            "corelaycode-acp-${{ github.ref_name }}-windows-amd64.exe"
+            "corelaycode-profile-${{ github.ref_name }}-linux-amd64"
+            "corelaycode-profile-${{ github.ref_name }}-linux-arm64"
+            "corelaycode-profile-${{ github.ref_name }}-darwin-amd64"
+            "corelaycode-profile-${{ github.ref_name }}-darwin-arm64"
+            "corelaycode-profile-${{ github.ref_name }}-windows-amd64.exe"
+          )
+          for artifact in "${expected[@]}"; do test -f "$artifact"; done
+          test "$(find . -maxdepth 1 -type f -name 'corelaycode-*' | wc -l)" -eq "${#expected[@]}"
+          sha256sum "${expected[@]}" > checksums.txt
+          test "$(wc -l < checksums.txt)" -eq "${#expected[@]}"
+          test -s checksums.txt
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: corelaycode-*
+          files: |
+            corelaycode-*
+            checksums.txt
           generate_release_notes: true
 
   container:
@@ -97,6 +125,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            CORELAY_VERSION=${{ github.ref_name }}
+            CORELAY_BUILD_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/dannykkh/corelaycode:${{ github.ref_name }}
             ghcr.io/dannykkh/corelaycode:latest

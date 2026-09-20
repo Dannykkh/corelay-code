@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Dannykkh/corelay-code/internal/acp"
+	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/approval"
 )
 
@@ -19,6 +20,7 @@ type approvalRequester struct {
 
 	mu      sync.Mutex
 	pending map[string]*approvalRequest
+	broker  *approval.Broker
 }
 
 type approvalRequest struct {
@@ -40,6 +42,7 @@ func newApprovalRequester(
 		sessionRevision:    sessionRevision,
 		ttl:                ttl,
 		pending:            make(map[string]*approvalRequest),
+		broker:             approval.NewBroker(ttl),
 	}
 }
 
@@ -59,20 +62,57 @@ func (r *approvalRequester) Open(draft approval.Draft) (approval.Pending, error)
 		RunID:           draft.RunID,
 		ToolCallID:      draft.ToolCallID,
 		ToolName:        draft.ToolName,
+		ExecutorID:      draft.ExecutorID,
 		// This value is retained only to satisfy the execution-kernel
 		// handshake. It is never projected into the ACP permission payload.
-		RedactedInput:   draft.RedactedInput,
-		InputDigest:     draft.InputDigest,
-		DangerLevel:     draft.DangerLevel,
-		Scope:           draft.Scope,
-		RememberAllowed: false,
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(r.ttl),
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		RememberAllowed:         draft.RememberAllowed,
+		CreatedAt:               now,
+		ExpiresAt:               now.Add(r.ttl),
 	}
 	r.mu.Lock()
 	r.pending[id] = &approvalRequest{pending: pending}
 	r.mu.Unlock()
 	return pending, nil
+}
+
+func (r *approvalRequester) IssueFullModeGrant(
+	draft approval.Draft,
+	policy agent.ExecutionPolicySnapshot,
+) (approval.Pending, error) {
+	if r == nil || r.broker == nil {
+		return approval.Pending{}, errors.New("approval broker is unavailable")
+	}
+	return r.broker.IssueFullModeGrant(draft, policy)
+}
+
+func (r *approvalRequester) ConsumeFullModeGrant(
+	grant approval.Pending,
+	expected approval.Draft,
+	policy agent.ExecutionPolicySnapshot,
+) error {
+	if r == nil || r.broker == nil {
+		return errors.New("approval broker is unavailable")
+	}
+	return r.broker.ConsumeFullModeGrant(grant, expected, policy)
+}
+
+func (r *approvalRequester) Shutdown() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.pending = make(map[string]*approvalRequest)
+	r.mu.Unlock()
+	if r.broker != nil {
+		r.broker.Shutdown()
+	}
 }
 
 func (r *approvalRequester) Await(ctx context.Context, sessionID, approvalID string) (approval.Resolution, error) {

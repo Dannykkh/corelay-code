@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -10,19 +13,24 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Dannykkh/corelay-code/internal/agent"
 	apiPkg "github.com/Dannykkh/corelay-code/internal/api"
 	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/buildinfo"
 	"github.com/Dannykkh/corelay-code/internal/config"
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/gateway"
 	"github.com/Dannykkh/corelay-code/internal/hooks"
 	"github.com/Dannykkh/corelay-code/internal/kairos"
@@ -31,6 +39,7 @@ import (
 	"github.com/Dannykkh/corelay-code/internal/providers"
 	"github.com/Dannykkh/corelay-code/internal/router"
 	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
@@ -41,8 +50,32 @@ var dashboardHTML []byte
 //go:embed all:webdist
 var webFS embed.FS
 
+var executionPolicyRevisions atomic.Uint64
+
+func resolveServerExecutionPolicy(
+	request *agent.ExecutionPolicyRequest,
+	workDir string,
+) (agent.ExecutionPolicySnapshot, sandbox.Runner, sandbox.Policy, error) {
+	var mode agent.ExecutionMode
+	if request != nil {
+		mode = request.Mode
+	}
+	snapshot, err := agent.ResolveExecutionPolicy(agent.ExecutionPolicyRequest{
+		Mode:     mode,
+		Revision: executionPolicyRevisions.Add(1),
+	}, "", sandbox.Capabilities{})
+	if err != nil {
+		return agent.ExecutionPolicySnapshot{}, nil, sandbox.Policy{}, err
+	}
+	runner, policy := agent.SandboxExecutionForMode(workDir, snapshot.Mode)
+	snapshot.RuntimeCapabilities = runner.Capabilities()
+	return snapshot, runner, policy, nil
+}
+
 type Server struct {
 	mu               sync.RWMutex
+	httpServerMu     sync.RWMutex
+	httpServer       *http.Server
 	activeProvider   types.Provider
 	activeModel      string
 	responseLang     string // "ko", "en", "ja", "zh", "auto"
@@ -62,6 +95,9 @@ type Server struct {
 	port             int
 	loops            *agent.LoopRegistry
 	approvals        *approvalHub
+	subAgentsMu      sync.RWMutex
+	subAgents        map[string]*agent.SubAgentManager
+	subAgentOrder    []string
 	evidenceMu       sync.RWMutex
 	evidencePolicy   agent.EvidencePolicyConfig
 	// durableQuarantine is process-local and fail-closed. It covers the rare
@@ -69,8 +105,13 @@ type Server struct {
 	// be persisted; a server restart or explicit operator recovery is required.
 	durableQuarantine sync.Map
 	// durableActive admits at most one live run for an exact durable session ID
-	// and prevents deletion while result blobs may still be published.
+	// and blocks session mutation while target or transcript snapshots are live.
 	durableActive sync.Map
+	durableGateMu sync.Mutex
+	// activePlanRuns prevents an operator from reconciling a stage while a
+	// same-process Agent, Team, or Chronos execution still owns that attempt.
+	activePlanRuns sync.Map
+	bootstrap      browserBootstrapState
 }
 
 func (s *Server) SetTracker(t *observability.Tracker) {
@@ -106,6 +147,7 @@ func New(provider types.Provider, model string, port int) *Server {
 		// contention, but a low cap keeps provider spend predictable.
 		loops:          agent.NewLoopRegistry(3),
 		approvals:      newApprovalHub(approval.DefaultTTL),
+		subAgents:      make(map[string]*agent.SubAgentManager),
 		evidencePolicy: agent.DefaultEvidencePolicyConfig(),
 	}
 }
@@ -346,6 +388,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/workstreams/{id}", s.handleWorkstreamGet)
 	mux.HandleFunc("PATCH /api/workstreams/{id}", s.handleWorkstreamPatch)
 	mux.HandleFunc("POST /api/workstreams/{id}/handoff", s.handleWorkstreamHandoff)
+	mux.HandleFunc("GET /api/workstreams/{id}/plans", s.handleWorkstreamPlanList)
+	mux.HandleFunc("POST /api/workstreams/{id}/plans", s.handleWorkstreamPlanCreate)
+	mux.HandleFunc("GET /api/workstreams/{id}/plans/{planId}", s.handleWorkstreamPlanGet)
+	mux.HandleFunc("PUT /api/workstreams/{id}/plans/{planId}", s.handleWorkstreamPlanUpdate)
+	mux.HandleFunc("POST /api/workstreams/{id}/plans/{planId}/approve", s.handleWorkstreamPlanApprove)
+	mux.HandleFunc("POST /api/workstreams/{id}/plans/{planId}/stages/{stageId}/reconcile", s.handleWorkstreamPlanStageReconcile)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionSave)
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleSessionGet)
@@ -353,13 +401,19 @@ func (s *Server) Start() error {
 	mux.HandleFunc("PUT /api/sessions/{id}", s.handleSessionRename)
 	mux.HandleFunc("POST /api/sessions/{id}/fork", s.handleSessionFork)
 	mux.HandleFunc("POST /api/sessions/{id}/interrupt", s.handleSessionInterrupt)
+	mux.HandleFunc("GET /api/sessions/{id}/reconcile-preview", s.handleSessionReconcilePreview)
 	mux.HandleFunc("POST /api/sessions/{id}/reconcile", s.handleSessionReconcile)
 	mux.HandleFunc("POST /api/sessions/{id}/close", s.handleSessionClose)
 	mux.HandleFunc("GET /api/sessions/{id}/resume-state", s.handleSessionResumeState)
 
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /api/bootstrap", s.handleBrowserBootstrap)
+	mux.HandleFunc("POST /api/bootstrap/challenge", s.handleBrowserBootstrapChallenge)
 	mux.HandleFunc("GET /", s.handleRoot)
 
+	if err := ensureServiceAccessToken(); err != nil {
+		return fmt.Errorf("initialize service access token: %w", err)
+	}
 	handler := corsMiddleware(authMiddleware(mux))
 	// Default to loopback only — a dev box running Corelay Code should not be
 	// reachable from the LAN by default (the agent has Bash/Write/Edit and
@@ -374,31 +428,58 @@ func (s *Server) Start() error {
 	}
 	addr := fmt.Sprintf("%s:%d", host, s.port)
 	log.Printf("Server listening on http://%s:%d (bind: %s)", host, s.port, host)
-	return http.ListenAndServe(addr, handler)
+	httpServer := &http.Server{Addr: addr, Handler: handler}
+	s.httpServerMu.Lock()
+	s.httpServer = httpServer
+	s.httpServerMu.Unlock()
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// Shutdown stops accepting new requests and waits for in-flight handlers until
+// ctx expires. It is safe to call before Start has installed its HTTP server.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.httpServerMu.RLock()
+	httpServer := s.httpServer
+	s.httpServerMu.RUnlock()
+	if httpServer == nil {
+		return nil
+	}
+	return httpServer.Shutdown(ctx)
 }
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg := config.Load()
+		path := r.URL.Path
+		if path == "/app" || strings.HasPrefix(path, "/assets/") || path == "/favicon.svg" || path == "/icons.svg" || path == "/health" || path == "/api/bootstrap" || path == "/api/bootstrap/challenge" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		cfg, _, err := config.LoadChecked()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "Configuration is unavailable")
+			return
+		}
 		token := cfg.AccessToken
 		if token == "" {
-			// No token configured — allow all
-			next.ServeHTTP(w, r)
+			token = strings.TrimSpace(os.Getenv("CORELAY_ACCESS_TOKEN"))
+			if token == "" {
+				token = strings.TrimSpace(os.Getenv("ANICLEW_ACCESS_TOKEN"))
+			}
+		}
+		if token == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "authentication_error", "message": "Service access token required"}})
 			return
 		}
 
-		// Skip auth for static assets and health check
-		path := r.URL.Path
-		if path == "/app" || strings.HasPrefix(path, "/assets/") || path == "/favicon.svg" || path == "/icons.svg" || path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Check token: query param, header, or cookie
-		provided := r.URL.Query().Get("token")
-		if provided == "" {
-			provided = r.Header.Get("X-Access-Token")
-		}
+		// Credentials in query strings are intentionally rejected so browser
+		// history, referrers, and access logs cannot capture the service token.
+		provided := r.Header.Get("X-Access-Token")
 		if provided == "" {
 			for _, name := range []string{"corelay-token", "aniclew-token"} {
 				if c, err := r.Cookie(name); err == nil {
@@ -419,10 +500,10 @@ func authMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		if provided != token {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(401)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Set token via ?token= or X-Access-Token header."})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 			return
 		}
 
@@ -432,15 +513,152 @@ func authMiddleware(next http.Handler) http.Handler {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" && !requestOriginAllowed(r, origin) {
+			writeError(w, http.StatusForbidden, "Origin is not allowed")
+			return
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
+		}
 		if r.Method == "OPTIONS" {
-			w.WriteHeader(204)
+			if origin == "" {
+				writeError(w, http.StatusForbidden, "Origin is required for preflight")
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Access-Token, Authorization")
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestOriginAllowed(r *http.Request, rawOrigin string) bool {
+	origin, err := url.Parse(rawOrigin)
+	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	if isLoopbackListener() && !isLoopbackHost(origin.Hostname()) {
+		return false
+	}
+	if r.TLS != nil && strings.EqualFold(origin.Scheme, "https") && strings.EqualFold(origin.Host, r.Host) {
+		return true
+	}
+	if r.TLS == nil && strings.EqualFold(origin.Scheme, "http") && strings.EqualFold(origin.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("CORELAY_ALLOWED_ORIGINS"), ",") {
+		if strings.EqualFold(strings.TrimSpace(allowed), rawOrigin) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) handleBrowserBootstrap(w http.ResponseWriter, r *http.Request) {
+	if !browserBootstrapRequestAllowed(r) {
+		writeError(w, http.StatusForbidden, "Browser bootstrap is available only from the local application origin")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	var body struct {
+		Challenge string `json:"challenge"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil || len(body.Challenge) != 43 {
+		writeError(w, http.StatusBadRequest, "Invalid bootstrap exchange")
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "Invalid bootstrap exchange")
+		return
+	}
+	if !s.bootstrap.consume(body.Challenge, r, time.Now()) {
+		writeError(w, http.StatusUnauthorized, "Bootstrap challenge is expired or unavailable")
+		return
+	}
+	cfg, err := config.Update(func(cfg *config.Config) error {
+		if cfg.AccessToken == "" {
+			secret := make([]byte, 32)
+			if _, err := rand.Read(secret); err != nil {
+				return err
+			}
+			cfg.AccessToken = base64.RawURLEncoding.EncodeToString(secret)
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Could not initialize browser credentials")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "corelay-token", Value: cfg.AccessToken, Path: "/", HttpOnly: true,
+		Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func ensureServiceAccessToken() error {
+	_, err := config.Update(func(cfg *config.Config) error {
+		if token := strings.TrimSpace(os.Getenv("CORELAY_ACCESS_TOKEN")); token != "" {
+			cfg.AccessToken = token
+			return nil
+		}
+		if token := strings.TrimSpace(os.Getenv("ANICLEW_ACCESS_TOKEN")); token != "" {
+			cfg.AccessToken = token
+			return nil
+		}
+		if cfg.AccessToken != "" {
+			return nil
+		}
+		secret := make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return err
+		}
+		cfg.AccessToken = base64.RawURLEncoding.EncodeToString(secret)
+		return nil
+	})
+	return err
+}
+
+func isLoopbackListener() bool {
+	host := strings.TrimSpace(os.Getenv("CORELAY_BIND"))
+	if host == "" {
+		host = strings.TrimSpace(os.Getenv("ANICLEW_BIND"))
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackRemote(remote string) bool {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // ── Messages Handler (core proxy logic) ──
@@ -542,6 +760,13 @@ func (s *Server) handleCanonicalProtocol(w http.ResponseWriter, r *http.Request,
 		adapter.WriteError(w, http.StatusInternalServerError, "server_error", "no provider is configured")
 		return
 	}
+	if imageErr := agent.ValidateImageInputCapability(
+		agent.ResolveModelImageInputCapability(provider, model),
+		agent.MessagesContainImageInput(req.Messages),
+	); imageErr != nil {
+		adapter.WriteError(w, http.StatusUnprocessableEntity, imageErr.Code(), imageErr.Error())
+		return
+	}
 
 	req.Model = model
 	opts.OnResponse = func(response types.ProviderResponse) {
@@ -559,6 +784,13 @@ func (s *Server) handleCanonicalProtocol(w http.ResponseWriter, r *http.Request,
 
 	var lastErr error
 	for attempt := 1; attempt <= retryCfg.MaxRetries; attempt++ {
+		if imageErr := agent.ValidateImageInputCapability(
+			agent.ResolveModelImageInputCapability(provider, model),
+			agent.MessagesContainImageInput(req.Messages),
+		); imageErr != nil {
+			adapter.WriteError(w, http.StatusUnprocessableEntity, imageErr.Code(), imageErr.Error())
+			return
+		}
 		ch, lastErr = provider.StreamMessage(streamCtx, &req, opts)
 		if lastErr == nil {
 			break
@@ -609,6 +841,13 @@ func (s *Server) handleCanonicalProtocol(w http.ResponseWriter, r *http.Request,
 					model = fallback.Model
 					target = runtimeTargetForProviderModel(provider.Name(), model)
 					req.Model = fallback.Model
+					if imageErr := agent.ValidateImageInputCapability(
+						agent.ResolveModelImageInputCapability(provider, model),
+						agent.MessagesContainImageInput(req.Messages),
+					); imageErr != nil {
+						adapter.WriteError(w, http.StatusUnprocessableEntity, imageErr.Code(), imageErr.Error())
+						return
+					}
 					ch, lastErr = fbProvider.StreamMessage(streamCtx, &req, opts)
 					if lastErr == nil {
 					} else {
@@ -804,14 +1043,14 @@ func (s *Server) handleSetWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	s.workDir = body.Path
-	s.mu.Unlock()
-
-	// Save to config
-	cfg := config.Load()
-	cfg.WorkDir = body.Path
-	config.Save(cfg)
+	if _, err := config.Update(func(cfg *config.Config) error {
+		cfg.WorkDir = body.Path
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save workspace configuration")
+		return
+	}
+	s.SetWorkDir(body.Path)
 
 	// Detect project
 	project := agent.DetectProject(body.Path)
@@ -843,11 +1082,14 @@ func (s *Server) handleGetWorkspace(w http.ResponseWriter, _ *http.Request) {
 // ── File Read (direct, no agent) ──
 
 func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	wd := s.workDir
-	s.mu.RUnlock()
-	if wd == "" {
-		wd, _ = os.Getwd()
+	wd, err := s.requestProjectWorkspace(r, "")
+	if err != nil {
+		if errors.Is(err, errWorkspaceNotRegistered) {
+			writeError(w, http.StatusForbidden, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
 	}
 
 	relPath := r.URL.Query().Get("path")
@@ -856,12 +1098,13 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Security: prevent path traversal outside workspace
-	fullPath := filepath.Join(wd, relPath)
-	absWd, _ := filepath.Abs(wd)
-	absFile, _ := filepath.Abs(fullPath)
-	if !strings.HasPrefix(absFile, absWd) {
-		writeError(w, 403, "Access denied: path outside workspace")
+	fullPath, err := resolveWorkspaceFile(wd, relPath, false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "File not found")
+		} else {
+			writeError(w, http.StatusForbidden, "Access denied: path outside workspace")
+		}
 		return
 	}
 
@@ -871,68 +1114,62 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(fullPath))
-
-	// Binary check
-	isBinary := false
-	if f, err := os.Open(fullPath); err == nil {
-		buf := make([]byte, 512)
-		n, _ := f.Read(buf)
-		f.Close()
-		for _, b := range buf[:n] {
-			if b == 0 {
-				isBinary = true
-				break
-			}
-		}
-	}
-
-	if isBinary {
-		writeJSON(w, map[string]any{
-			"path": relPath, "type": "binary", "size": info.Size(),
-			"ext": ext, "lines": 0, "content": "[Binary file]",
-		})
-		return
-	}
-
-	// Image
-	if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".svg" || ext == ".webp" || ext == ".ico" {
-		writeJSON(w, map[string]any{
-			"path": relPath, "type": "image", "size": info.Size(),
-			"ext": ext, "lines": 0, "content": "[Image file: " + ext + "]",
-		})
-		return
-	}
-
-	data, err := os.ReadFile(fullPath)
+	canonicalPath, err := canonicalWorkspaceRelative(wd, fullPath)
 	if err != nil {
-		writeError(w, 500, "Read error: "+err.Error())
+		writeError(w, http.StatusForbidden, "Access denied: path outside workspace")
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	response := fileReadResponse{Path: canonicalPath, Type: fileTypeForExtension(ext), Size: info.Size(), Ext: ext}
+
+	if info.IsDir() {
+		response.Type = "directory"
+		response.Entries = buildTree(wd, fullPath, 1, 0)
+		writeJSON(w, response)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		response.Type = "unsupported"
+		response.Content = "[Unsupported file type]"
+		writeJSON(w, response)
 		return
 	}
 
-	content := string(data)
-	lines := strings.Count(content, "\n") + 1
-
-	// Truncate large files
-	if len(content) > 100000 {
-		content = content[:100000] + "\n... (truncated)"
+	probe, err := readFilePrefix(fullPath, fileProbeBytes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Read error: "+err.Error())
+		return
+	}
+	if isImageExtension(ext) {
+		response.Type = "image"
+		response.Content = "[Image file: " + ext + "]"
+		writeJSON(w, response)
+		return
+	}
+	if isBinaryFileSample(probe) {
+		response.Type = "binary"
+		response.Content = "[Binary file]"
+		writeJSON(w, response)
+		return
 	}
 
-	fileType := "text"
-	if ext == ".md" {
-		fileType = "markdown"
+	data, err := readFilePrefix(fullPath, maxFileReadBytes+1)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Read error: "+err.Error())
+		return
 	}
-	if ext == ".json" {
-		fileType = "json"
+	if int64(len(data)) > maxFileReadBytes {
+		data = data[:maxFileReadBytes]
+		response.Type = "too_large"
+		response.Truncated = true
+		response.Content = string(data) + "\n... (truncated at 100000 bytes)"
+		response.Lines = previewLines(data)
+		writeJSON(w, response)
+		return
 	}
-	if ext == ".go" || ext == ".ts" || ext == ".tsx" || ext == ".js" || ext == ".py" || ext == ".rs" || ext == ".java" || ext == ".cs" {
-		fileType = "code"
-	}
-
-	writeJSON(w, map[string]any{
-		"path": relPath, "type": fileType, "size": info.Size(),
-		"ext": ext, "lines": lines, "content": content,
-	})
+	response.Content = string(data)
+	response.Lines = previewLines(data)
+	writeJSON(w, response)
 }
 
 // ── Recursive File Tree (for accordion) ──
@@ -947,33 +1184,38 @@ type treeNode struct {
 }
 
 func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	wd := s.workDir
-	s.mu.RUnlock()
-	if wd == "" {
-		wd, _ = os.Getwd()
-	}
-
 	var body struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
+		WorkDir string `json:"workDir"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
 		return
 	}
+	wd, err := s.requestProjectWorkspace(r, body.WorkDir)
+	if err != nil {
+		if errors.Is(err, errWorkspaceNotRegistered) {
+			writeError(w, http.StatusForbidden, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
 
-	// Security: prevent path traversal
-	fullPath := filepath.Join(wd, body.Path)
-	absWd, _ := filepath.Abs(wd)
-	absFile, _ := filepath.Abs(fullPath)
-	if !strings.HasPrefix(absFile, absWd) {
+	fullPath, err := resolveWorkspaceFile(wd, body.Path, true)
+	if err != nil {
 		writeError(w, 403, "Access denied: path outside workspace")
 		return
 	}
 
 	// Create parent directories if needed
 	os.MkdirAll(filepath.Dir(fullPath), 0755)
+	fullPath, err = resolveWorkspaceFile(wd, body.Path, true)
+	if err != nil {
+		writeError(w, 403, "Access denied: path outside workspace")
+		return
+	}
 
 	if err := os.WriteFile(fullPath, []byte(body.Content), 0644); err != nil {
 		writeError(w, 500, err.Error())
@@ -983,12 +1225,15 @@ func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "path": body.Path, "size": len(body.Content)})
 }
 
-func (s *Server) handleFileTree(w http.ResponseWriter, _ *http.Request) {
-	s.mu.RLock()
-	wd := s.workDir
-	s.mu.RUnlock()
-	if wd == "" {
-		wd, _ = os.Getwd()
+func (s *Server) handleFileTree(w http.ResponseWriter, r *http.Request) {
+	wd, err := s.requestProjectWorkspace(r, "")
+	if err != nil {
+		if errors.Is(err, errWorkspaceNotRegistered) {
+			writeError(w, http.StatusForbidden, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
 	}
 
 	root := buildTree(wd, wd, 4, 0) // max depth 4
@@ -1082,14 +1327,15 @@ func (s *Server) handleRegisterProvider(w http.ResponseWriter, r *http.Request) 
 
 	// API key update only (no baseUrl)
 	if body.BaseURL == "" && body.APIKey != "" {
-		cfg := config.Load()
-		if cfg.Providers == nil {
-			cfg.Providers = map[string]config.ProviderSettings{}
+		if _, err := config.Update(func(cfg *config.Config) error {
+			existing := cfg.Providers[body.Name]
+			existing.APIKey = body.APIKey
+			cfg.Providers[body.Name] = existing
+			return nil
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save provider credentials")
+			return
 		}
-		existing := cfg.Providers[body.Name]
-		existing.APIKey = body.APIKey
-		cfg.Providers[body.Name] = existing
-		config.Save(cfg)
 
 		writeJSON(w, map[string]any{"ok": true, "name": body.Name, "keySet": true})
 		return
@@ -1100,21 +1346,16 @@ func (s *Server) handleRegisterProvider(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	providers.RegisterCustomProvider(body.Name, &types.ProviderConfig{
-		APIKey:  body.APIKey,
-		BaseURL: body.BaseURL,
-	})
-
-	// Save to config
-	cfg := config.Load()
-	if cfg.Providers == nil {
-		cfg.Providers = map[string]config.ProviderSettings{}
+	if _, err := config.Update(func(cfg *config.Config) error {
+		cfg.Providers[body.Name] = config.ProviderSettings{
+			APIKey: body.APIKey, BaseURL: body.BaseURL,
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save provider configuration")
+		return
 	}
-	cfg.Providers[body.Name] = config.ProviderSettings{
-		APIKey:  body.APIKey,
-		BaseURL: body.BaseURL,
-	}
-	config.Save(cfg)
+	providers.RegisterCustomProvider(body.Name, &types.ProviderConfig{APIKey: body.APIKey, BaseURL: body.BaseURL})
 
 	log.Printf("Custom provider registered: %s → %s", body.Name, body.BaseURL)
 	writeJSON(w, map[string]any{
@@ -1237,20 +1478,21 @@ func (s *Server) applyConfigUpdate(update serverConfigUpdate, nextProvider types
 			return errConfigActiveRuns
 		}
 
-		cfg := config.Load()
-		if update.Provider != "" {
-			cfg.DefaultProvider = update.Provider
-		}
-		if update.Model != "" {
-			cfg.DefaultModel = update.Model
-		}
-		if update.ResponseLang != "" {
-			cfg.ResponseLang = update.ResponseLang
-		}
-		if update.RouterEnabled != nil {
-			cfg.RouterEnabled = *update.RouterEnabled
-		}
-		if err := config.Save(cfg); err != nil {
+		if _, err := config.Update(func(cfg *config.Config) error {
+			if update.Provider != "" {
+				cfg.DefaultProvider = update.Provider
+			}
+			if update.Model != "" {
+				cfg.DefaultModel = update.Model
+			}
+			if update.ResponseLang != "" {
+				cfg.ResponseLang = update.ResponseLang
+			}
+			if update.RouterEnabled != nil {
+				cfg.RouterEnabled = *update.RouterEnabled
+			}
+			return nil
+		}); err != nil {
 			return errConfigPersistFailed
 		}
 
@@ -1357,7 +1599,8 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	defer s.mu.RUnlock()
 	result := map[string]any{
 		"name":     "corelaycode",
-		"version":  "1.0.0",
+		"version":  buildinfo.Version,
+		"commit":   buildinfo.Commit,
 		"provider": s.activeProvider.Name(),
 		"model":    s.activeModel,
 		"router":   s.router != nil,
@@ -1756,13 +1999,50 @@ func (s *Server) handleImageUpload(w http.ResponseWriter, r *http.Request) {
 
 // ── Sub-agents ──
 
-var subAgentMgr *agent.SubAgentManager
+const maxSubAgentSessions = 32
+
+func (s *Server) storeSubAgentManager(sessionID string, manager *agent.SubAgentManager) bool {
+	s.subAgentsMu.Lock()
+	defer s.subAgentsMu.Unlock()
+	if s.subAgents == nil {
+		s.subAgents = make(map[string]*agent.SubAgentManager)
+	}
+	for len(s.subAgents) >= maxSubAgentSessions {
+		removed := false
+		for index, existingID := range s.subAgentOrder {
+			existing := s.subAgents[existingID]
+			if existing == nil || existing.AllDone() {
+				delete(s.subAgents, existingID)
+				s.subAgentOrder = append(s.subAgentOrder[:index], s.subAgentOrder[index+1:]...)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			return false
+		}
+	}
+	s.subAgents[sessionID] = manager
+	s.subAgentOrder = append(s.subAgentOrder, sessionID)
+	return true
+}
+
+func (s *Server) subAgentManager(sessionID string) *agent.SubAgentManager {
+	s.subAgentsMu.RLock()
+	defer s.subAgentsMu.RUnlock()
+	return s.subAgents[strings.TrimSpace(sessionID)]
+}
 
 func (s *Server) handleSubAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	provider := s.activeProvider
 	model := s.activeModel
+	serverWorkDir := s.workDir
 	s.mu.RUnlock()
+	if provider == nil {
+		writeError(w, http.StatusInternalServerError, "No provider configured")
+		return
+	}
 
 	var body struct {
 		Tasks []struct {
@@ -1773,44 +2053,71 @@ func (s *Server) handleSubAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		WorkDir string `json:"workDir"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "Invalid JSON")
+		writeError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
-
+	if len(body.Tasks) == 0 {
+		writeError(w, http.StatusBadRequest, "At least one task required")
+		return
+	}
 	workDir := body.WorkDir
+	if workDir == "" {
+		workDir = serverWorkDir
+	}
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
-
-	sessionID := ""
-	if subAgentMgr == nil {
-		sessionID = observability.NewTraceID("subagent")
-		sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(workDir)
-		subAgentMgr = agent.NewSubAgentManagerWithOptions(provider, model, workDir, agent.SubAgentManagerOptions{
-			SessionID:         sessionID,
-			ApprovalRequester: s.approvals,
-			SandboxRunner:     sandboxRunner,
-			SandboxPolicy:     sandboxPolicy,
-			CapabilityProfile: selectAutomaticCapabilityProfile(provider, model, time.Now()),
-		})
-	} else {
-		sessionID = subAgentMgr.SessionID()
-	}
-
-	var spawned []map[string]string
-	for _, t := range body.Tasks {
-		task := subAgentMgr.Spawn(t.Name, t.Instruction, t.Files)
-		spawned = append(spawned, map[string]string{"id": task.ID, "name": task.Name, "status": task.Status})
-	}
-	writeJSON(w, map[string]any{"spawned": len(spawned), "sessionId": sessionID, "tasks": spawned})
-}
-
-func (s *Server) handleSubAgentTasks(w http.ResponseWriter, _ *http.Request) {
-	if subAgentMgr == nil {
-		writeJSON(w, []any{})
+	skillSettings, err := resolveSkillSettings(workDir)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Skill configuration is unavailable")
 		return
 	}
-	writeJSON(w, subAgentMgr.GetTasks())
+	// This standalone API creates a root workspace-scoped run. It has no parent
+	// run from which it could safely inherit full-mode authority.
+	policy, sandboxRunner, sandboxPolicy, err := resolveServerExecutionPolicy(nil, workDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "default execution policy unavailable")
+		return
+	}
+	sessionID := observability.NewTraceID("subagent")
+	manager := agent.NewSubAgentManagerWithOptions(provider, model, workDir, agent.SubAgentManagerOptions{
+		SessionID:         sessionID,
+		ApprovalRequester: s.approvals,
+		SandboxRunner:     sandboxRunner,
+		SandboxPolicy:     sandboxPolicy,
+		CapabilityProfile: selectAutomaticCapabilityProfile(provider, model, time.Now()),
+		ExecutionPolicy:   &policy,
+		SkillSource:       skillSettings.source,
+		SkillDirs:         append([]string{}, skillSettings.dirs...),
+		ProjectSkillDirs:  append([]string{}, skillSettings.projectDirs...),
+	})
+	if !s.storeSubAgentManager(sessionID, manager) {
+		writeError(w, http.StatusTooManyRequests, "too many active sub-agent sessions")
+		return
+	}
+	var spawned []map[string]string
+	for _, taskInput := range body.Tasks {
+		task := manager.Spawn(taskInput.Name, taskInput.Instruction, taskInput.Files)
+		spawned = append(spawned, map[string]string{"id": task.ID, "name": task.Name, "status": task.Status})
+	}
+	writeJSON(w, map[string]any{
+		"spawned": len(spawned), "sessionId": sessionID, "tasks": spawned,
+		"executionPolicy": map[string]any{"mode": policy.Mode, "revision": policy.Revision},
+	})
+}
+
+func (s *Server) handleSubAgentTasks(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "missing sessionId")
+		return
+	}
+	manager := s.subAgentManager(sessionID)
+	if manager == nil {
+		writeError(w, http.StatusNotFound, "sub-agent session not found")
+		return
+	}
+	writeJSON(w, manager.GetTasks())
 }
 
 // ── Slash Commands ──
@@ -1820,25 +2127,51 @@ func (s *Server) handleCommandsList(w http.ResponseWriter, r *http.Request) {
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
-	skills := agent.LoadSkills(workDir)
-	commands := agent.ParseSlashCommands(skills)
+	skills, err := loadConfiguredSkills(workDir)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Skill configuration is unavailable")
+		return
+	}
+	commands := agent.ParseSkillSlashCommands(skills)
 	writeJSON(w, commands)
 }
 
 // ── Plan Mode ──
 
-func (s *Server) handlePlanGet(w http.ResponseWriter, _ *http.Request) {
-	plan := agent.GetActivePlan()
-	if plan == nil {
-		writeJSON(w, map[string]string{"status": "no_plan"})
+func (s *Server) handlePlanGet(w http.ResponseWriter, r *http.Request) {
+	workstreamID := strings.TrimSpace(r.URL.Query().Get("workstreamId"))
+	planID := strings.TrimSpace(r.URL.Query().Get("planId"))
+	if workstreamID == "" && planID == "" {
+		writeJSON(w, map[string]any{"status": "no_plan", "scopeRequired": true})
+		return
+	}
+	if workstreamID == "" || planID == "" {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_plan_scope", "workstreamId and planId are both required", nil, nil)
+		return
+	}
+	workDir, err := s.requestProjectWorkspace(r, "")
+	if err != nil {
+		writeProjectWorkspaceScopeError(w, err)
+		return
+	}
+	store := workstream.NewStore(workDir)
+	plan, err := store.GetPlan(workstreamID, planID)
+	if err != nil {
+		writeWorkstreamPlanError(w, err)
 		return
 	}
 	writeJSON(w, plan)
 }
 
 func (s *Server) handlePlanApprove(w http.ResponseWriter, _ *http.Request) {
-	result := agent.ApprovePlan()
-	writeJSON(w, map[string]string{"result": result})
+	writeSessionAPIError(
+		w,
+		http.StatusGone,
+		"global_plan_approval_removed",
+		"plan approval requires a Workstream, Plan ID, and expected revision",
+		nil,
+		nil,
+	)
 }
 
 // ── MCP Servers ──
@@ -1886,7 +2219,11 @@ func (s *Server) handleProjectContext(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := agent.LoadProjectContext(workDir)
 	mcpCfg := agent.LoadMCPConfig(workDir)
-	skills := agent.LoadSkills(workDir)
+	skills, err := loadConfiguredSkills(workDir)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Skill configuration is unavailable")
+		return
+	}
 
 	writeJSON(w, map[string]any{
 		"workDir":   workDir,
@@ -1908,24 +2245,33 @@ func (s *Server) handleSkillsList(w http.ResponseWriter, r *http.Request) {
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
-	skills := agent.LoadSkillsWithConfig(workDir, nil)
+	skills, err := loadConfiguredSkills(workDir)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Skill configuration is unavailable")
+		return
+	}
 
 	type skillInfo struct {
-		Name   string `json:"name"`
-		Path   string `json:"path"`
-		Source string `json:"source"`
+		ID          string              `json:"id"`
+		Name        string              `json:"name"`
+		Description string              `json:"description"`
+		Path        string              `json:"path"`
+		ModuleRoot  string              `json:"module_root"`
+		Aliases     []string            `json:"aliases,omitempty"`
+		Size        int64               `json:"size"`
+		Source      string              `json:"source"`
+		Namespace   string              `json:"namespace"`
+		Digest      string              `json:"digest"`
+		Shadowed    []agent.SkillOrigin `json:"shadowed,omitempty"`
 	}
 	var result []skillInfo
 	for _, sk := range skills {
-		source := "custom"
-		if strings.Contains(sk.Path, ".claude") {
-			source = "claude"
-		} else if strings.Contains(sk.Path, ".codex") {
-			source = "codex"
-		} else if strings.Contains(sk.Path, ".gemini") {
-			source = "gemini"
-		}
-		result = append(result, skillInfo{Name: sk.Name, Path: sk.Path, Source: source})
+		result = append(result, skillInfo{
+			ID: sk.ID, Name: sk.Name, Description: sk.Description,
+			Path: sk.Path, ModuleRoot: sk.ModuleRoot, Aliases: sk.Aliases, Size: sk.Size,
+			Source: sk.Source, Namespace: sk.Namespace, Digest: sk.Digest,
+			Shadowed: sk.Shadowed,
+		})
 	}
 	writeJSON(w, result)
 }
@@ -1941,14 +2287,65 @@ func (s *Server) handleProjectDetect(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSetSkillSource(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Source string `json:"source"`
+		Source    string    `json:"source"`
+		WorkDir   string    `json:"workDir,omitempty"`
+		SkillDirs *[]string `json:"skillDirs,omitempty"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
-	// Save to config
-	cfg := config.Load()
-	cfg.SkillSource = body.Source
-	config.Save(cfg)
-	writeJSON(w, map[string]any{"ok": true, "skillSource": body.Source})
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	body.Source = config.NormalizeSkillSource(body.Source)
+	if !config.ValidSkillSource(body.Source) {
+		writeError(w, http.StatusBadRequest, "Invalid skill source")
+		return
+	}
+	workspace := strings.TrimSpace(body.WorkDir)
+	if workspace != "" {
+		var err error
+		workspace, err = s.requestProjectWorkspace(r, workspace)
+		if err != nil {
+			writeProjectWorkspaceScopeError(w, err)
+			return
+		}
+	}
+	errNoRegisteredProjectSettings := errors.New("project skill settings require a registered project")
+	if _, err := config.Update(func(cfg *config.Config) error {
+		if workspace == "" {
+			cfg.SkillSource = body.Source
+			if body.SkillDirs != nil {
+				cfg.SkillDirs = append([]string{}, (*body.SkillDirs)...)
+			}
+			return nil
+		}
+		for index := range cfg.Projects {
+			project := &cfg.Projects[index]
+			if !config.SameProjectWorkspace(project.Path, workspace) {
+				continue
+			}
+			project.SkillSource = body.Source
+			if body.SkillDirs != nil {
+				project.SkillDirs = append([]string{}, (*body.SkillDirs)...)
+			}
+			return nil
+		}
+		return errNoRegisteredProjectSettings
+	}); err != nil {
+		if errors.Is(err, errNoRegisteredProjectSettings) {
+			writeSessionAPIError(w, http.StatusNotFound, "project_not_found", "project must be registered before saving project skill settings", nil, nil)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "Failed to save skill source")
+		return
+	}
+	response := map[string]any{"ok": true, "skillSource": body.Source}
+	if workspace != "" {
+		response["workDir"] = workspace
+	}
+	if body.SkillDirs != nil {
+		response["skillDirs"] = *body.SkillDirs
+	}
+	writeJSON(w, response)
 }
 
 // ── Session Management ──
@@ -2003,6 +2400,7 @@ func (s *Server) handleWorkstreamCreate(w http.ResponseWriter, r *http.Request) 
 		Title      string          `json:"title"`
 		Summary    string          `json:"summary"`
 		NextAction string          `json:"nextAction"`
+		Decisions  []string        `json:"decisions"`
 		Tags       []string        `json:"tags"`
 		Goal       workstream.Goal `json:"goal"`
 	}
@@ -2017,6 +2415,7 @@ func (s *Server) handleWorkstreamCreate(w http.ResponseWriter, r *http.Request) 
 		Title:      body.Title,
 		Summary:    body.Summary,
 		NextAction: body.NextAction,
+		Decisions:  body.Decisions,
 		Tags:       body.Tags,
 		Goal:       body.Goal,
 	})
@@ -2054,12 +2453,14 @@ func (s *Server) handleWorkstreamPatch(w http.ResponseWriter, r *http.Request) {
 		Status           *workstream.Status             `json:"status"`
 		Summary          *string                        `json:"summary"`
 		NextAction       *string                        `json:"nextAction"`
+		Decisions        []string                       `json:"decisions"`
 		OpenQuestions    []string                       `json:"openQuestions"`
 		Tags             []string                       `json:"tags"`
 		Goal             *workstream.Goal               `json:"goal"`
 		LastVerification *workstream.VerificationResult `json:"lastVerification"`
 		HasOpenQuestions bool                           `json:"hasOpenQuestions"`
 		HasTags          bool                           `json:"hasTags"`
+		HasDecisions     bool                           `json:"hasDecisions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
@@ -2071,8 +2472,12 @@ func (s *Server) handleWorkstreamPatch(w http.ResponseWriter, r *http.Request) {
 		Status:           body.Status,
 		Summary:          body.Summary,
 		NextAction:       body.NextAction,
+		HasDecisions:     body.HasDecisions,
 		Goal:             body.Goal,
 		LastVerification: body.LastVerification,
+	}
+	if len(body.Decisions) > 0 || body.HasDecisions {
+		patch.Decisions = body.Decisions
 	}
 	// JSON cannot distinguish omitted slices from null with this simple
 	// decoder shape, so accept explicit booleans for clients that need to
@@ -2094,20 +2499,33 @@ func (s *Server) handleWorkstreamPatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWorkstreamHandoff(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		WorkDir            string `json:"workDir"`
+		PlanID             string `json:"planId"`
 		IncludeReceipts    bool   `json:"includeReceipts"`
 		IncludeMemoryIndex bool   `json:"includeMemoryIndex"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "Invalid JSON")
+			return
+		}
 	}
-	workDir := s.requestWorkDir(r, body.WorkDir)
+	workDir, scopeErr := s.requestProjectWorkspace(r, body.WorkDir)
+	if scopeErr != nil {
+		writeProjectWorkspaceScopeError(w, scopeErr)
+		return
+	}
 	store := workstream.NewStore(workDir)
 	snap, err := store.GenerateHandoff(r.PathValue("id"), workstream.HandoffOptions{
 		IncludeReceipts:    body.IncludeReceipts,
 		IncludeMemoryIndex: body.IncludeMemoryIndex,
+		PlanID:             body.PlanID,
 	})
 	if err != nil {
-		writeError(w, 400, err.Error())
+		if errors.Is(err, workstream.ErrPlanNotFound) || errors.Is(err, workstream.ErrPlanInvalid) || errors.Is(err, workstream.ErrPlanCorrupt) {
+			writeWorkstreamPlanError(w, err)
+		} else {
+			writeError(w, 400, err.Error())
+		}
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "path": snap.Path, "markdown": snap.Markdown})
@@ -2124,6 +2542,12 @@ type sessionRevisionRequest struct {
 	ExpectedRevision *uint64 `json:"expectedRevision"`
 }
 
+type sessionReconcileRequest struct {
+	ExpectedRevision               *uint64 `json:"expectedRevision"`
+	EvidenceDigest                 string  `json:"evidenceDigest"`
+	ManualConfirmationAcknowledged bool    `json:"manualConfirmationAcknowledged"`
+}
+
 type sessionInterruptRequest struct {
 	ExpectedRevision *uint64                      `json:"expectedRevision"`
 	RunID            string                       `json:"runId"`
@@ -2131,7 +2555,7 @@ type sessionInterruptRequest struct {
 	ToolCallID       string                       `json:"toolCallId,omitempty"`
 	InputDigest      string                       `json:"inputDigest"`
 	SideEffectState  agent.SessionSideEffectState `json:"sideEffectState"`
-	Summary          string                       `json:"summary"`
+	Summary          string                       `json:"summary"` // accepted for compatibility; never persisted
 }
 
 type sessionRecoveryResponse struct {
@@ -2221,6 +2645,20 @@ func writeSessionAPIError(
 	})
 }
 
+func writeWorkstreamNotFound(w http.ResponseWriter) {
+	writeSessionAPIError(w, http.StatusNotFound, "workstream_not_found", "workstream not found", nil, nil)
+}
+
+func (s *Server) lockDurableSessionMutation(w http.ResponseWriter, sessionID string) (func(), bool) {
+	s.durableGateMu.Lock()
+	if _, active := s.durableActive.Load(sessionID); active {
+		s.durableGateMu.Unlock()
+		writeSessionAPIError(w, http.StatusConflict, "active_run_conflict", "session has an active durable run", nil, nil)
+		return nil, true
+	}
+	return s.durableGateMu.Unlock, false
+}
+
 func writeSessionError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	code := "session_operation_failed"
@@ -2242,6 +2680,14 @@ func writeSessionError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 		code = "invalid_session_id"
 		message = "invalid session id"
+	case errors.Is(err, agent.ErrSessionAssociationInvalid):
+		status = http.StatusBadRequest
+		code = "invalid_session_association"
+		message = "invalid session association"
+	case errors.Is(err, agent.ErrSessionImageReferenceInvalid):
+		status = http.StatusUnprocessableEntity
+		code = "session_image_unavailable"
+		message = "a durable session image is unavailable or invalid"
 	case errors.Is(err, agent.ErrSessionNotFound):
 		status = http.StatusNotFound
 		code = "session_not_found"
@@ -2254,6 +2700,14 @@ func writeSessionError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 		code = "session_version_unsupported"
 		message = "session version is not supported"
+	case errors.Is(err, errDurableWorkspaceConflict):
+		status = http.StatusConflict
+		code = "session_workspace_conflict"
+		message = "durable session belongs to another workspace"
+	case errors.Is(err, errDurableImageHistoryBudget):
+		status = http.StatusUnprocessableEntity
+		code = "session_image_budget_exceeded"
+		message = "the session's retained images exceed the request image limit"
 	case errors.Is(err, agent.ErrSessionConflict), errors.Is(err, agent.ErrSessionParentInvalid):
 		status = http.StatusConflict
 		code = "session_conflict"
@@ -2330,6 +2784,7 @@ func (s *Server) handleSessionSave(w http.ResponseWriter, r *http.Request) {
 	store := s.sessions
 	prov := s.activeProvider
 	model := s.activeModel
+	workDir := s.workDir
 	s.mu.RUnlock()
 	if store == nil {
 		writeSessionAPIError(w, http.StatusServiceUnavailable, "sessions_unavailable", "sessions are not initialized", nil, nil)
@@ -2339,20 +2794,60 @@ func (s *Server) handleSessionSave(w http.ResponseWriter, r *http.Request) {
 	if !decodeSessionRequest(w, r, &body) {
 		return
 	}
+	unlockDurableGate, active := s.lockDurableSessionMutation(w, body.ID)
+	if active {
+		return
+	}
+	defer unlockDurableGate()
 	sess := body.Session
-	if sess.Provider == "" && prov != nil {
-		sess.Provider = prov.Name()
-	}
-	if sess.Model == "" {
-		sess.Model = model
-	}
 	expectedRevision := body.ExpectedRevision
+	var existing *agent.Session
 	if sess.ID != "" {
-		_, err := store.Get(sess.ID)
+		loaded, err := store.Get(sess.ID)
 		switch {
 		case err == nil:
 			if !requireSessionRevision(w, expectedRevision) {
 				return
+			}
+			if *expectedRevision != loaded.Revision {
+				writeSessionError(w, &agent.SessionRevisionConflictError{
+					SessionID: loaded.ID,
+					Expected:  *expectedRevision,
+					Current:   loaded.Revision,
+				})
+				return
+			}
+			if strings.TrimSpace(sess.Workspace) != "" && !sameDurableWorkspace(sess.Workspace, loaded.Workspace) {
+				writeSessionError(w, agent.ErrSessionConflict)
+				return
+			}
+			existing = loaded
+			if sess.Workspace == "" {
+				sess.Workspace = loaded.Workspace
+			}
+			if sess.WorkstreamID == "" {
+				sess.WorkstreamID = loaded.WorkstreamID
+			}
+			sameWorkstream := sess.WorkstreamID == loaded.WorkstreamID
+			if sess.PlanID == "" && sameWorkstream {
+				sess.PlanID = loaded.PlanID
+				sess.PlanRevision = loaded.PlanRevision
+				if sess.StageID == "" {
+					sess.StageID = loaded.StageID
+				}
+			} else if sameWorkstream && sess.PlanID == loaded.PlanID {
+				if sess.PlanRevision == 0 {
+					sess.PlanRevision = loaded.PlanRevision
+				}
+				if sess.StageID == "" {
+					sess.StageID = loaded.StageID
+				}
+			}
+			if sess.Provider == "" {
+				sess.Provider = loaded.Provider
+			}
+			if sess.Model == "" {
+				sess.Model = loaded.Model
 			}
 		case errors.Is(err, agent.ErrSessionNotFound):
 			// A valid caller-supplied ID remains supported for create. SaveExpected
@@ -2361,6 +2856,34 @@ func (s *Server) handleSessionSave(w http.ResponseWriter, r *http.Request) {
 			writeSessionError(w, err)
 			return
 		}
+	}
+	if existing == nil {
+		if sess.Workspace == "" {
+			sess.Workspace = workDir
+			if sess.Workspace == "" {
+				sess.Workspace, _ = os.Getwd()
+			}
+		}
+		if sess.Provider == "" && prov != nil {
+			sess.Provider = prov.Name()
+		}
+		if sess.Model == "" {
+			sess.Model = model
+		}
+		workspace, err := s.requestProjectWorkspace(r, sess.Workspace)
+		if err != nil {
+			writeProjectWorkspaceScopeError(w, err)
+			return
+		}
+		sess.Workspace = workspace
+	}
+	if err := agent.ValidateSessionAssociations(sess); err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if _, err := resolveSessionWorkflowBinding(&sess); err != nil {
+		writeSessionWorkflowBindingError(w, err)
+		return
 	}
 	if expectedRevision == nil {
 		zero := uint64(0)
@@ -2409,10 +2932,13 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	if !requireSessionRevision(w, expectedRevision) {
 		return
 	}
+	s.durableGateMu.Lock()
 	if _, active := s.durableActive.Load(id); active {
+		s.durableGateMu.Unlock()
 		writeSessionAPIError(w, http.StatusConflict, "session_run_active", "session has an active durable run", nil, nil)
 		return
 	}
+	defer s.durableGateMu.Unlock()
 	result, err := store.DeleteExpected(id, *expectedRevision)
 	if err != nil {
 		writeSessionError(w, err)
@@ -2437,6 +2963,11 @@ func (s *Server) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 	if !requireSessionRevision(w, body.ExpectedRevision) {
 		return
 	}
+	unlockDurableGate, active := s.lockDurableSessionMutation(w, id)
+	if active {
+		return
+	}
+	defer unlockDurableGate()
 	sess, err := store.Get(id)
 	if err != nil {
 		writeSessionError(w, err)
@@ -2487,14 +3018,24 @@ func (s *Server) handleSessionInterrupt(w http.ResponseWriter, r *http.Request) 
 	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
 		return
 	}
+	unlockDurableGate, active := s.lockDurableSessionMutation(w, r.PathValue("id"))
+	if active {
+		return
+	}
+	defer unlockDurableGate()
+	// This endpoint only installs a manual reconciliation guard. Caller-supplied
+	// execution identifiers and digests are not trusted journal evidence, and
+	// must not be persisted because arbitrary strings could carry prompt input.
+	emptyInputDigest := sha256.Sum256(nil)
 	marker := agent.SessionInterruption{
 		At:              time.Now().UTC(),
-		RunID:           body.RunID,
-		ToolName:        body.ToolName,
-		ToolCallID:      body.ToolCallID,
-		InputDigest:     body.InputDigest,
-		SideEffectState: body.SideEffectState,
-		Summary:         body.Summary,
+		RunID:           "manual-interrupt",
+		ToolName:        "unknown",
+		InputDigest:     fmt.Sprintf("sha256:%x", emptyInputDigest),
+		SideEffectState: agent.SessionSideEffectUnknown,
+		// Caller-controlled fields remain accepted for request compatibility,
+		// but this endpoint records no caller-supplied execution metadata.
+		Summary: "interrupted execution requires reconciliation",
 	}
 	if err := agent.ValidateSessionInterruption(marker); err != nil {
 		writeSessionAPIError(w, http.StatusBadRequest, "invalid_interruption", "invalid interruption metadata", nil, nil)
@@ -2508,16 +3049,92 @@ func (s *Server) handleSessionInterrupt(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{"ok": true, "session": updated, "revision": updated.Revision})
 }
 
+func (s *Server) handleSessionReconcilePreview(w http.ResponseWriter, r *http.Request) {
+	store := s.sessionStoreOrError(w)
+	if store == nil {
+		return
+	}
+	rawRevision := strings.TrimSpace(r.URL.Query().Get("expectedRevision"))
+	if rawRevision == "" {
+		writeSessionAPIError(w, http.StatusPreconditionRequired, "expected_revision_required", "expectedRevision is required for a reconciliation preview", nil, nil)
+		return
+	}
+	revision, err := strconv.ParseUint(rawRevision, 10, 64)
+	if err != nil {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_request", "expectedRevision must be an unsigned integer", nil, nil)
+		return
+	}
+	session, err := store.Get(r.PathValue("id"))
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if session.Revision != revision {
+		writeSessionAPIError(w, http.StatusConflict, "session_revision_conflict", "session changed before reconciliation preview", map[string]any{
+			"expectedRevision": revision,
+			"currentRevision":  session.Revision,
+		}, nil)
+		return
+	}
+	assessment, err := agent.AssessSessionReconciliation(session)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	writeJSON(w, assessment)
+}
+
 func (s *Server) handleSessionReconcile(w http.ResponseWriter, r *http.Request) {
 	store := s.sessionStoreOrError(w)
 	if store == nil {
 		return
 	}
-	var body sessionRevisionRequest
+	var body sessionReconcileRequest
 	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
 		return
 	}
-	updated, err := store.MarkReconciled(r.PathValue("id"), *body.ExpectedRevision)
+	unlockDurableGate, active := s.lockDurableSessionMutation(w, r.PathValue("id"))
+	if active {
+		return
+	}
+	defer unlockDurableGate()
+	session, err := store.Get(r.PathValue("id"))
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if session.Revision != *body.ExpectedRevision {
+		writeSessionAPIError(w, http.StatusConflict, "session_revision_conflict", "session changed before reconciliation", map[string]any{
+			"expectedRevision": *body.ExpectedRevision,
+			"currentRevision":  session.Revision,
+		}, nil)
+		return
+	}
+	assessment, err := agent.AssessSessionReconciliation(session)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.EvidenceDigest)), []byte(assessment.EvidenceDigest)) != 1 {
+		writeSessionAPIError(w, http.StatusConflict, "reconciliation_evidence_stale", "reconciliation evidence changed; review a fresh preview", map[string]any{
+			"assessment": assessment,
+		}, nil)
+		return
+	}
+	if assessment.ManualConfirmationRequired && !body.ManualConfirmationAcknowledged {
+		writeSessionAPIError(w, http.StatusConflict, "manual_confirmation_required", "manual side-effect confirmation is required before reconciliation", map[string]any{
+			"assessment": assessment,
+		}, nil)
+		return
+	}
+	receipt, err := agent.NewSessionReconciliationReceipt(assessment, body.ManualConfirmationAcknowledged, time.Now().UTC())
+	if err != nil {
+		writeSessionAPIError(w, http.StatusConflict, "manual_confirmation_required", "manual side-effect confirmation is required before reconciliation", map[string]any{
+			"assessment": assessment,
+		}, nil)
+		return
+	}
+	updated, err := store.MarkReconciledWithReceipt(r.PathValue("id"), *body.ExpectedRevision, assessment.RunID, receipt)
 	if err != nil {
 		writeSessionError(w, err)
 		return
@@ -2534,6 +3151,11 @@ func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
 	if !decodeSessionRequest(w, r, &body) || !requireSessionRevision(w, body.ExpectedRevision) {
 		return
 	}
+	unlockDurableGate, active := s.lockDurableSessionMutation(w, r.PathValue("id"))
+	if active {
+		return
+	}
+	defer unlockDurableGate()
 	updated, err := store.Close(r.PathValue("id"), *body.ExpectedRevision)
 	if err != nil {
 		writeSessionError(w, err)
@@ -2585,6 +3207,8 @@ type approvalHub struct {
 }
 
 var _ approval.Requester = (*approvalHub)(nil)
+var _ approval.FullModeIssuer = (*approvalHub)(nil)
+var _ approval.FullModeGrantConsumer = (*approvalHub)(nil)
 
 func newApprovalHub(ttl time.Duration) *approvalHub {
 	return &approvalHub{
@@ -2606,6 +3230,31 @@ func (h *approvalHub) Open(draft approval.Draft) (approval.Pending, error) {
 	}
 	h.pending[pending.ID] = pending
 	return pending, nil
+}
+
+func (h *approvalHub) IssueFullModeGrant(
+	draft approval.Draft,
+	policy executionpolicy.Snapshot,
+) (approval.Pending, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return approval.Pending{}, approval.ErrBrokerClosed
+	}
+	return h.broker.IssueFullModeGrant(draft, policy)
+}
+
+func (h *approvalHub) ConsumeFullModeGrant(
+	grant approval.Pending,
+	expected approval.Draft,
+	policy executionpolicy.Snapshot,
+) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return approval.ErrBrokerClosed
+	}
+	return h.broker.ConsumeFullModeGrant(grant, expected, policy)
 }
 
 func (h *approvalHub) Await(ctx context.Context, sessionID, approvalID string) (approval.Resolution, error) {
@@ -2820,42 +3469,39 @@ func (s *Server) handleApprovalResolve(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Messages         []types.Message `json:"messages"`
-		WorkDir          string          `json:"workDir"`
-		ResponseLang     string          `json:"responseLang"`
-		WorkstreamID     string          `json:"workstreamId"`
-		DurableSessionID string          `json:"durableSessionId"`
-		ExpectedRevision *uint64         `json:"expectedRevision"`
+		Messages         []types.Message               `json:"messages"`
+		WorkDir          string                        `json:"workDir"`
+		ResponseLang     string                        `json:"responseLang"`
+		WorkstreamID     string                        `json:"workstreamId"`
+		ExecutionPolicy  *agent.ExecutionPolicyRequest `json:"executionPolicy"`
+		DurableSessionID string                        `json:"durableSessionId"`
+		ExpectedRevision *uint64                       `json:"expectedRevision"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "Invalid JSON")
+	r.Body = http.MaxBytesReader(w, r.Body, protocol.MaxRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	writeDecodeError := func(err error) {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeSessionAPIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the protocol limit", nil, nil)
+			return
+		}
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_json", "request body is malformed", nil, nil)
+	}
+	if err := decoder.Decode(&body); err != nil {
+		writeDecodeError(err)
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeDecodeError(err)
+		return
+	}
+	if err := protocol.ValidateCanonicalHistory(body.Messages); err != nil {
+		status, code, message := protocol.ErrorDetails(err)
+		writeSessionAPIError(w, status, code, message, nil, nil)
 		return
 	}
 
-	workDir := body.WorkDir
-	if workDir == "" {
-		s.mu.RLock()
-		workDir = s.workDir
-		s.mu.RUnlock()
-	}
-	if workDir == "" {
-		workDir, _ = os.Getwd()
-	}
-
-	s.mu.RLock()
-	respLang := body.ResponseLang
-	if respLang == "" {
-		respLang = s.responseLang
-	}
-	if respLang == "" {
-		respLang = "auto"
-	}
-	tracker := s.tracker
-	sessionStore := s.sessions
-	s.mu.RUnlock()
-	traceID := observability.NewTraceID("run")
-
-	var durableRun *durableAgentRun
 	durableSessionID := strings.TrimSpace(body.DurableSessionID)
 	switch {
 	case durableSessionID == "" && body.ExpectedRevision != nil:
@@ -2864,7 +3510,25 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	case durableSessionID != "" && body.ExpectedRevision == nil:
 		writeSessionAPIError(w, http.StatusPreconditionRequired, "expected_revision_required", "expectedRevision is required for a durable agent run", nil, nil)
 		return
-	case durableSessionID != "":
+	}
+
+	s.mu.RLock()
+	sessionStore := s.sessions
+	serverWorkDir := s.workDir
+	respLang := body.ResponseLang
+	if respLang == "" {
+		respLang = s.responseLang
+	}
+	if respLang == "" {
+		respLang = "auto"
+	}
+	tracker := s.tracker
+	s.mu.RUnlock()
+
+	var targetSession *agent.Session
+	var workflowBinding *sessionWorkflowBinding
+	workDir := strings.TrimSpace(body.WorkDir)
+	if durableSessionID != "" {
 		if _, quarantined := s.durableQuarantine.Load(durableSessionID); quarantined {
 			writeSessionAPIError(w, http.StatusConflict, "session_runtime_quarantined", "durable session requires operator recovery before another run", nil, nil)
 			return
@@ -2873,7 +3537,112 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 			writeSessionAPIError(w, http.StatusServiceUnavailable, "sessions_unavailable", "sessions are not initialized", nil, nil)
 			return
 		}
-		if _, active := s.durableActive.LoadOrStore(durableSessionID, struct{}{}); active {
+		var err error
+		targetSession, err = sessionStore.Get(durableSessionID)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		if err := validateDurableAgentSession(targetSession, *body.ExpectedRevision, body.WorkDir, body.Messages); err != nil {
+			if errors.Is(err, errDurableTranscriptMismatch) {
+				writeSessionAPIError(w, http.StatusConflict, "session_transcript_conflict", "durable session transcript does not match the run request", nil, nil)
+				return
+			}
+			writeSessionError(w, err)
+			return
+		}
+		workflowBinding, err = resolveSessionWorkflowBinding(targetSession)
+		if err != nil {
+			writeSessionWorkflowBindingError(w, err)
+			return
+		}
+		if workflowBinding.Plan != nil && !isPlanModeRequest(body.Messages) {
+			if err := validateSessionPlanExecution(targetSession, workflowBinding); err != nil {
+				writeSessionWorkflowBindingError(w, err)
+				return
+			}
+		}
+		workDir = targetSession.Workspace
+	} else if workDir == "" {
+		workDir = strings.TrimSpace(serverWorkDir)
+		if workDir == "" {
+			workDir, _ = os.Getwd()
+		}
+	}
+	skillSettings, err := resolveSkillSettings(workDir)
+	if err != nil {
+		writeSessionAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "skill configuration is unavailable", nil, nil)
+		return
+	}
+
+	workstreamID := strings.TrimSpace(body.WorkstreamID)
+	if targetSession != nil {
+		if workstreamID == "" {
+			workstreamID = targetSession.WorkstreamID
+		} else if targetSession.WorkstreamID != "" && workstreamID != targetSession.WorkstreamID {
+			writeSessionAPIError(w, http.StatusConflict, "session_workstream_conflict", "requested workstream does not match the durable session", nil, nil)
+			return
+		}
+	}
+
+	var ws *workstream.Workstream
+	var wsStore *workstream.Store
+	workstreamContext := ""
+	var compactionContext agent.CompactionContext
+	if workstreamID != "" {
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(workstreamID)
+		if err != nil {
+			writeWorkstreamNotFound(w)
+			return
+		}
+		ws = loaded
+		var compactionPlan *workstream.Plan
+		var compactionStageID string
+		if workflowBinding != nil {
+			compactionPlan = workflowBinding.Plan
+		}
+		if targetSession != nil {
+			compactionStageID = targetSession.StageID
+		}
+		compactionContext = workstreamCompactionContext(ws, compactionPlan, compactionStageID)
+		if workflowBinding != nil && workflowBinding.Plan != nil {
+			workstreamContext = workstream.RenderContextWithPlan(*ws, workflowBinding.Plan, targetSession.StageID, 2000)
+		} else {
+			workstreamContext = workstream.RenderContext(*ws, 2000)
+		}
+	}
+	var canonicalPlanAnchor *agent.PlanAnchor
+	var canonicalPlanCriteriaDigest string
+	if workflowBinding != nil && workflowBinding.Plan != nil && !isPlanModeRequest(body.Messages) {
+		var anchorErr error
+		canonicalPlanAnchor, canonicalPlanCriteriaDigest, anchorErr = planAnchorForStage(workflowBinding.Plan, targetSession.StageID)
+		if anchorErr != nil {
+			writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "stored plan definition cannot be executed", nil, nil)
+			return
+		}
+	}
+
+	policyRequest := body.ExecutionPolicy
+	if targetSession != nil && policyRequest == nil && targetSession.ExecutionPolicy != nil {
+		policyRequest = &agent.ExecutionPolicyRequest{Mode: targetSession.ExecutionPolicy.Mode}
+	}
+	// Resolve the caller's mode once at the HTTP boundary. The client can only
+	// choose a mode; it cannot provide capabilities, provenance, or a policy
+	// snapshot. Durable revision and workspace checks happen before this step.
+	executionPolicy, sandboxRunner, sandboxPolicy, policyErr := resolveServerExecutionPolicy(policyRequest, workDir)
+	if policyErr != nil {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_execution_policy", policyErr.Error(), nil, nil)
+		return
+	}
+
+	traceID := observability.NewTraceID("run")
+	var durableRun *durableAgentRun
+	if durableSessionID != "" {
+		s.durableGateMu.Lock()
+		_, active := s.durableActive.LoadOrStore(durableSessionID, struct{}{})
+		s.durableGateMu.Unlock()
+		if active {
 			writeSessionAPIError(w, http.StatusConflict, "session_run_active", "durable session already has an active run", nil, nil)
 			return
 		}
@@ -2897,20 +3666,6 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		durableRun.quarantine = func(sessionID string) {
 			s.durableQuarantine.Store(sessionID, struct{}{})
 		}
-	}
-
-	var ws *workstream.Workstream
-	var wsStore *workstream.Store
-	workstreamContext := ""
-	if body.WorkstreamID != "" {
-		wsStore = workstream.NewStore(workDir)
-		loaded, err := wsStore.Get(body.WorkstreamID)
-		if err != nil {
-			writeError(w, 404, err.Error())
-			return
-		}
-		ws = loaded
-		workstreamContext = workstream.RenderContext(*ws, 2000)
 	}
 
 	// Register with the loop registry before we touch the response writer
@@ -2943,12 +3698,81 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	provider := s.activeProvider
 	model := s.activeModel
 	s.mu.RUnlock()
+	if durableRun != nil {
+		provider, model, err = resolveDurableSessionProviderTarget(durableRun.session, provider, model)
+		if err != nil {
+			writeSessionAPIError(w, http.StatusConflict, "session_target_unavailable", "durable session provider/model target is unavailable", nil, nil)
+			return
+		}
+	}
 	if provider == nil {
 		writeError(w, http.StatusInternalServerError, "No provider configured")
 		return
 	}
+	needsImageInput := agent.MessagesContainImageInput(body.Messages)
+	if targetSession != nil {
+		for _, message := range targetSession.Messages {
+			if len(message.Attachments) > 0 {
+				needsImageInput = true
+				break
+			}
+		}
+	}
+	if imageErr := agent.ValidateImageInputCapability(
+		agent.ResolveModelImageInputCapability(provider, model),
+		needsImageInput,
+	); imageErr != nil {
+		writeSessionAPIError(w, http.StatusUnprocessableEntity, imageErr.Code(), imageErr.Error(), nil, nil)
+		return
+	}
+	providerMessages := body.Messages
 	if durableRun != nil {
+		if err := durableRun.PrepareImages(body.Messages); err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		providerMessages = durableRun.messages
 		durableRun.SetRuntimeRunID(sessionID)
+	}
+	var planRunBinding *agent.PlanExecutionBinding
+	var planStageRecorder *workstreamPlanStageRecorder
+	if canonicalPlanAnchor != nil && workflowBinding != nil && workflowBinding.Plan != nil && targetSession != nil {
+		if wsStore == nil {
+			wsStore = workstream.NewStore(workDir)
+		}
+		activeKey := activeWorkstreamPlanRunKey(workDir, targetSession.WorkstreamID, workflowBinding.Plan.ID, traceID)
+		s.activePlanRuns.Store(activeKey, struct{}{})
+		defer s.activePlanRuns.Delete(activeKey)
+		startedPlan, beginErr := beginWorkstreamPlanStageForAgentRun(wsStore, durableRun, targetSession.WorkstreamID, workflowBinding.Plan.ID, workstream.BeginPlanStageRequest{
+			ExpectedRevision: workflowBinding.Plan.Revision, ExpectedStateRevision: workflowBinding.Plan.StateRevision,
+			StageID: targetSession.StageID, RunID: traceID,
+		})
+		if beginErr != nil {
+			writeWorkstreamPlanError(w, beginErr)
+			return
+		}
+		workstreamContext = workstream.RenderContextWithPlan(*ws, startedPlan, targetSession.StageID, 2000)
+		compactionContext = workstreamCompactionContext(ws, startedPlan, targetSession.StageID)
+		planRunBinding = &agent.PlanExecutionBinding{
+			WorkstreamID:      targetSession.WorkstreamID,
+			PlanID:            workflowBinding.Plan.ID,
+			PlanRevision:      workflowBinding.Plan.Revision,
+			PlanStateRevision: startedPlan.StateRevision,
+			StageID:           targetSession.StageID,
+			RunID:             traceID,
+		}
+		planStageRecorder = &workstreamPlanStageRecorder{
+			store: wsStore, workstreamID: targetSession.WorkstreamID,
+			planID: workflowBinding.Plan.ID, stageID: targetSession.StageID,
+			revision: workflowBinding.Plan.Revision, stateRevision: startedPlan.StateRevision,
+			runID: traceID, criteriaDigest: canonicalPlanCriteriaDigest,
+		}
+	}
+	if durableRun != nil {
+		if err := commitDurableImagesForPlanRun(durableRun, planStageRecorder); err != nil {
+			writeSessionError(w, err)
+			return
+		}
 	}
 
 	// SSE response
@@ -2959,7 +3783,12 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 
 	// First frame: hand the client its session id so it can later POST to
 	// /api/agent/{sessionId}/cancel or query /api/agent/loops.
-	sessionData := map[string]any{"sessionId": sessionID, "workDir": workDir, "traceId": traceID}
+	sessionData := map[string]any{
+		"sessionId":       sessionID,
+		"workDir":         workDir,
+		"traceId":         traceID,
+		"executionPolicy": map[string]any{"mode": executionPolicy.Mode, "revision": executionPolicy.Revision},
+	}
 	if durableRun != nil {
 		sessionData["durableSessionId"] = durableRun.session.ID
 		sessionData["durableRevision"] = durableRun.expectedRevision
@@ -3003,6 +3832,9 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 			model:        model,
 		})
 	}
+	if planStageRecorder != nil {
+		recorders = append(recorders, planStageRecorder)
+	}
 	if tracker != nil {
 		recorders = append(recorders, newObservabilityRunRecorder(tracker, observability.RunTrace{
 			ID:           traceID,
@@ -3010,7 +3842,7 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 			Provider:     provider.Name(),
 			Model:        model,
 			WorkDir:      workDir,
-			WorkstreamID: body.WorkstreamID,
+			WorkstreamID: workstreamID,
 			Metadata: map[string]string{
 				"sessionId": sessionID,
 				"source":    "api.agent",
@@ -3024,9 +3856,6 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		recorder = compositeRunRecorder{recorders: recorders}
 	}
 
-	// Resolve the process boundary explicitly at the HTTP composition root.
-	// Preferred remains fail-closed if the platform adapter is unavailable.
-	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(workDir)
 	capabilityProfile := selectAutomaticCapabilityProfile(provider, model, time.Now())
 	var planAnchor *agent.PlanAnchor
 	if capabilityProfile != nil {
@@ -3036,6 +3865,9 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 			// has no objective from which to construct one, preserve legacy fallback.
 			capabilityProfile = nil
 		}
+	}
+	if canonicalPlanAnchor != nil {
+		planAnchor = canonicalPlanAnchor
 	}
 	var toolResultStore agent.ToolResultStore
 	var toolResultReader agent.ToolResultReader
@@ -3048,17 +3880,29 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		preExecutionJournal = durableRun.JournalToolExecution
 	}
 
-	go agent.RunLoopWithOptions(loopCtx, provider, model, body.Messages, workDir, agent.RunOptions{
+	var sessionRevision uint64
+	if durableRun != nil {
+		sessionRevision = durableRun.expectedRevision
+	}
+	go agent.RunLoopWithOptions(loopCtx, provider, model, providerMessages, workDir, agent.RunOptions{
+		ExecutionPolicy:      &executionPolicy,
 		SessionID:            sessionID,
+		DurableSessionID:     durableSessionID,
+		SessionRevision:      sessionRevision,
 		ApprovalRequester:    s.approvals,
 		ResponseLang:         respLang,
+		SkillSource:          skillSettings.source,
+		SkillDirs:            append([]string{}, skillSettings.dirs...),
+		ProjectSkillDirs:     append([]string{}, skillSettings.projectDirs...),
 		WorkstreamContext:    workstreamContext,
+		CompactionContext:    compactionContext,
 		Recorder:             recorder,
 		EvidencePolicy:       s.currentEvidencePolicy(),
 		SandboxRunner:        sandboxRunner,
 		SandboxPolicy:        sandboxPolicy,
 		CapabilityProfile:    capabilityProfile,
 		PlanAnchor:           planAnchor,
+		PlanBinding:          planRunBinding,
 		ToolResultStore:      toolResultStore,
 		ToolResultReader:     toolResultReader,
 		ToolResultReferences: toolResultReferences,
@@ -3416,7 +4260,13 @@ func (s *Server) handleRAGSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "q parameter required")
 		return
 	}
-	results := agent.RAGSearch(workDir, query, 5)
+	settings, err := resolveSkillSettings(workDir)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Skill configuration is unavailable")
+		return
+	}
+	excludedSkillRoots := agent.SkillIndexExclusionPaths(workDir, settings.projectDirs, settings.dirs)
+	results := agent.RAGSearch(workDir, query, 5, excludedSkillRoots...)
 	writeJSON(w, results)
 }
 
@@ -3467,12 +4317,17 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name          string               `json:"name"`
-		Objective     string               `json:"objective"`
-		VerifyCommand string               `json:"verifyCommand"`
-		WorkstreamID  string               `json:"workstreamId"`
-		Capacity      agent.CapacityConfig `json:"capacity"`
-		Tasks         []struct {
+		Name            string                        `json:"name"`
+		Objective       string                        `json:"objective"`
+		VerifyCommand   string                        `json:"verifyCommand"`
+		WorkDir         string                        `json:"workDir"`
+		WorkstreamID    string                        `json:"workstreamId"`
+		PlanID          string                        `json:"planId"`
+		PlanRevision    uint64                        `json:"planRevision"`
+		StageID         string                        `json:"stageId"`
+		ExecutionPolicy *agent.ExecutionPolicyRequest `json:"executionPolicy"`
+		Capacity        agent.CapacityConfig          `json:"capacity"`
+		Tasks           []struct {
 			ID          string                   `json:"id"`
 			Name        string                   `json:"name"`
 			Description string                   `json:"description"`
@@ -3491,12 +4346,38 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(body.Tasks) == 0 {
+	planBound := strings.TrimSpace(body.PlanID) != "" || body.PlanRevision != 0 || strings.TrimSpace(body.StageID) != ""
+	if planBound && (strings.TrimSpace(body.WorkstreamID) == "" || strings.TrimSpace(body.PlanID) == "" || body.PlanRevision == 0 || strings.TrimSpace(body.StageID) == "") {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_plan_binding", "workstreamId, planId, planRevision, and stageId are required together", nil, nil)
+		return
+	}
+	if planBound && len(body.Tasks) > 0 {
+		writeSessionAPIError(w, http.StatusBadRequest, "plan_definition_override_denied", "plan-bound execution uses the stored plan definition", nil, nil)
+		return
+	}
+	if !planBound && len(body.Tasks) == 0 {
 		writeError(w, 400, "At least one task required")
 		return
 	}
-	if workDir == "" {
+	if body.WorkDir != "" || planBound {
+		var scopeErr error
+		workDir, scopeErr = s.requestProjectWorkspace(r, body.WorkDir)
+		if scopeErr != nil {
+			writeProjectWorkspaceScopeError(w, scopeErr)
+			return
+		}
+	} else if workDir == "" {
 		workDir, _ = os.Getwd()
+	}
+	executionPolicy, teamSandboxRunner, teamSandboxPolicy, policyErr := resolveServerExecutionPolicy(body.ExecutionPolicy, workDir)
+	if policyErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid execution policy: "+policyErr.Error())
+		return
+	}
+	skillSettings, skillSettingsErr := resolveSkillSettings(workDir)
+	if skillSettingsErr != nil {
+		writeSessionAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "skill configuration is unavailable", nil, nil)
+		return
 	}
 
 	baseDir := config.BaseDir()
@@ -3508,33 +4389,92 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	if objective == "" {
 		objective = teamName
 	}
-	plan := agent.TeamPlan{
-		Version:       1,
-		Name:          teamName,
-		Objective:     objective,
-		VerifyCommand: body.VerifyCommand,
-		Capacity:      body.Capacity,
-		Tasks:         make([]agent.AgentTask, 0, len(body.Tasks)),
-	}
-
-	for _, t := range body.Tasks {
-		kind := agent.TaskKind(strings.TrimSpace(t.Kind))
-		files := serverTeamTaskFiles(string(kind), t.ReadOnly, t.Files)
-		dependsOn := compactStringList(t.DependsOn)
-		plan.Tasks = append(plan.Tasks, agent.AgentTask{
-			ID:          t.ID,
-			Name:        t.Name,
-			Kind:        kind,
-			Role:        t.Role,
-			Goal:        t.Description,
-			Description: t.Description,
-			Files:       files,
-			DependsOn:   dependsOn,
-			ReadOnly:    t.ReadOnly,
-			Provider:    t.Provider,
-			Model:       t.Model,
-			Resources:   t.Resources,
-		})
+	var plan agent.TeamPlan
+	var ws *workstream.Workstream
+	var wsStore *workstream.Store
+	var canonicalPlan *workstream.Plan
+	var teamPlanAnchor *agent.PlanAnchor
+	var compactionContext agent.CompactionContext
+	var criteriaDigest string
+	workstreamID := strings.TrimSpace(body.WorkstreamID)
+	if planBound {
+		wsStore = workstream.NewStore(workDir)
+		loaded, err := wsStore.Get(workstreamID)
+		if err != nil {
+			writeWorkstreamNotFound(w)
+			return
+		}
+		ws = loaded
+		canonicalPlan, err = wsStore.GetPlan(workstreamID, strings.TrimSpace(body.PlanID))
+		if err != nil {
+			writeWorkstreamPlanError(w, err)
+			return
+		}
+		if canonicalPlan.Revision != body.PlanRevision {
+			writeWorkstreamPlanError(w, workstream.ErrPlanRevisionConflict)
+			return
+		}
+		if canonicalPlan.ApprovedRevision != canonicalPlan.Revision ||
+			(canonicalPlan.Status != workstream.PlanStatusApproved && canonicalPlan.Status != workstream.PlanStatusExecuting && canonicalPlan.Status != workstream.PlanStatusFailed) {
+			writeWorkstreamPlanError(w, workstream.ErrPlanTransition)
+			return
+		}
+		fullDefinition, stage, stageCriteria, err := workstreamPlanStageDefinition(canonicalPlan, strings.TrimSpace(body.StageID))
+		if err != nil {
+			writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "stored plan definition cannot be executed", nil, nil)
+			return
+		}
+		if strings.TrimSpace(fullDefinition.VerifyCommand) == "" {
+			writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_verification_required", "plan-bound Team execution requires a stored verifyCommand", nil, nil)
+			return
+		}
+		if body.VerifyCommand != "" && body.VerifyCommand != fullDefinition.VerifyCommand {
+			writeSessionAPIError(w, http.StatusBadRequest, "plan_verification_override_denied", "plan-bound execution uses the stored verifyCommand", nil, nil)
+			return
+		}
+		plan, err = teamPlanForStage(fullDefinition, stage.ID)
+		if err != nil {
+			writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "selected plan stage cannot be executed", nil, nil)
+			return
+		}
+		teamName = fullDefinition.Name
+		objective = fullDefinition.Objective
+		body.VerifyCommand = fullDefinition.VerifyCommand
+		body.Capacity = fullDefinition.Capacity
+		criteriaDigest = planCriteriaDigest(stageCriteria)
+		teamPlanAnchor, _, err = planAnchorForStage(canonicalPlan, stage.ID)
+		if err != nil {
+			writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "stored plan definition cannot be executed", nil, nil)
+			return
+		}
+	} else {
+		plan = agent.TeamPlan{
+			Version:       1,
+			Name:          teamName,
+			Objective:     objective,
+			VerifyCommand: body.VerifyCommand,
+			Capacity:      body.Capacity,
+			Tasks:         make([]agent.AgentTask, 0, len(body.Tasks)),
+		}
+		for _, t := range body.Tasks {
+			kind := agent.TaskKind(strings.TrimSpace(t.Kind))
+			files := serverTeamTaskFiles(string(kind), t.ReadOnly, t.Files)
+			dependsOn := compactStringList(t.DependsOn)
+			plan.Tasks = append(plan.Tasks, agent.AgentTask{
+				ID:          t.ID,
+				Name:        t.Name,
+				Kind:        kind,
+				Role:        t.Role,
+				Provider:    t.Provider,
+				Model:       t.Model,
+				Goal:        t.Description,
+				Description: t.Description,
+				Files:       files,
+				DependsOn:   dependsOn,
+				ReadOnly:    t.ReadOnly,
+				Resources:   t.Resources,
+			})
+		}
 	}
 	if err := agent.ValidateTeamPlan(plan); err != nil {
 		writeError(w, 400, err.Error())
@@ -3543,18 +4483,24 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	traceID := observability.NewTraceID("run")
 	defer s.approvals.CancelSession(traceID)
 
-	var ws *workstream.Workstream
-	var wsStore *workstream.Store
 	workstreamContext := ""
-	if strings.TrimSpace(body.WorkstreamID) != "" {
-		wsStore = workstream.NewStore(workDir)
-		loaded, err := wsStore.Get(strings.TrimSpace(body.WorkstreamID))
-		if err != nil {
-			writeError(w, 404, err.Error())
-			return
+	if workstreamID != "" {
+		if wsStore == nil {
+			wsStore = workstream.NewStore(workDir)
 		}
-		ws = loaded
-		workstreamContext = workstream.RenderContext(*ws, 2000)
+		if ws == nil {
+			loaded, err := wsStore.Get(workstreamID)
+			if err != nil {
+				writeError(w, 404, err.Error())
+				return
+			}
+			ws = loaded
+		}
+		if planBound {
+			workstreamContext = workstream.RenderContextWithPlan(*ws, canonicalPlan, strings.TrimSpace(body.StageID), 2000)
+		} else {
+			workstreamContext = workstream.RenderContext(*ws, 2000)
+		}
 		if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
 			Type:    "team_run_started",
 			Message: "Team run started",
@@ -3570,21 +4516,50 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
+		compactionContext = workstreamCompactionContext(ws, canonicalPlan, body.StageID)
+	}
+	var planRunBinding *agent.PlanExecutionBinding
+	var planStageStateRevision uint64
+	if planBound {
+		activeKey := activeWorkstreamPlanRunKey(workDir, workstreamID, canonicalPlan.ID, traceID)
+		s.activePlanRuns.Store(activeKey, struct{}{})
+		defer s.activePlanRuns.Delete(activeKey)
+		startedPlan, err := wsStore.BeginPlanStage(workstreamID, canonicalPlan.ID, workstream.BeginPlanStageRequest{
+			ExpectedRevision: canonicalPlan.Revision, ExpectedStateRevision: canonicalPlan.StateRevision,
+			StageID: strings.TrimSpace(body.StageID), RunID: traceID,
+		})
+		if err != nil {
+			writeWorkstreamPlanError(w, err)
+			return
+		}
+		planStageStateRevision = startedPlan.StateRevision
+		workstreamContext = workstream.RenderContextWithPlan(*ws, startedPlan, strings.TrimSpace(body.StageID), 2000)
+		compactionContext = workstreamCompactionContext(ws, startedPlan, body.StageID)
+		planRunBinding = &agent.PlanExecutionBinding{
+			WorkstreamID: workstreamID, PlanID: canonicalPlan.ID,
+			PlanRevision: canonicalPlan.Revision, PlanStateRevision: planStageStateRevision,
+			StageID: strings.TrimSpace(body.StageID), RunID: traceID,
+		}
 	}
 
-	teamSandboxRunner, teamSandboxPolicy := agent.DefaultSandboxExecution(workDir)
 	team := agent.NewTeam(provider, model, workDir, baseDir, agent.TeamConfig{
 		Name:              teamName,
 		VerifyCommand:     body.VerifyCommand,
 		Capacity:          body.Capacity,
 		WorkstreamContext: workstreamContext,
+		CompactionContext: compactionContext,
+		PlanAnchor:        teamPlanAnchor,
 		SessionID:         traceID,
 		ApprovalRequester: s.approvals,
 		ProviderFactory: func(name string) (types.Provider, error) {
 			return providers.Create(name, &types.ProviderConfig{})
 		},
-		SandboxRunner: teamSandboxRunner,
-		SandboxPolicy: teamSandboxPolicy,
+		SandboxRunner:    teamSandboxRunner,
+		SandboxPolicy:    teamSandboxPolicy,
+		ExecutionPolicy:  &executionPolicy,
+		SkillSource:      skillSettings.source,
+		SkillDirs:        append([]string{}, skillSettings.dirs...),
+		ProjectSkillDirs: append([]string{}, skillSettings.projectDirs...),
 	})
 	for _, task := range plan.ToTeamTasks() {
 		team.AddTask(task)
@@ -3597,7 +4572,14 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 
 	sessionEvent, _ := json.Marshal(agent.Event{
 		Type: "session",
-		Data: map[string]string{"workDir": workDir, "traceId": traceID},
+		Data: map[string]any{
+			"workDir": workDir,
+			"traceId": traceID,
+			"executionPolicy": map[string]any{
+				"mode":     executionPolicy.Mode,
+				"revision": executionPolicy.Revision,
+			},
+		},
 	})
 	fmt.Fprintf(w, "data: %s\n\n", sessionEvent)
 	if f, ok := w.(http.Flusher); ok {
@@ -3636,7 +4618,8 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 			failureDetail = err.Error()
 			eventCh <- agent.Event{Type: "error", Data: err.Error()}
 			eventCh <- agent.Event{Type: "text", Data: "\n\n" + team.Summary()}
-			receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification)
+			receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification, planRunBinding)
+			finishServerPlanStageFromTeam(wsStore, planRunBinding, planStageStateRevision, criteriaDigest, receipt, receiptPath)
 			recordServerTeamRun(tracker, wsStore, ws, traceID, traceStartedAt, receipt, receiptPath, failureDetail)
 			team.Shutdown()
 			eventCh <- agent.Event{Type: "done", Data: nil}
@@ -3684,7 +4667,8 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 		}
 
 		eventCh <- agent.Event{Type: "text", Data: "\n\n" + team.Summary()}
-		receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification)
+		receipt, receiptPath := emitServerTeamReceipt(eventCh, team, plan, baseDir, workDir, runStatus, verification, planRunBinding)
+		finishServerPlanStageFromTeam(wsStore, planRunBinding, planStageStateRevision, criteriaDigest, receipt, receiptPath)
 		recordServerTeamRun(tracker, wsStore, ws, traceID, traceStartedAt, receipt, receiptPath, failureDetail)
 		team.Shutdown()
 		eventCh <- agent.Event{Type: "done", Data: nil}
@@ -3708,8 +4692,11 @@ func (s *Server) handleTeamExecute(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func emitServerTeamReceipt(eventCh chan<- agent.Event, team *agent.Team, plan agent.TeamPlan, baseDir, workDir, status string, verification agent.ReceiptVerification) (agent.TeamRunReceipt, string) {
+func emitServerTeamReceipt(eventCh chan<- agent.Event, team *agent.Team, plan agent.TeamPlan, baseDir, workDir, status string, verification agent.ReceiptVerification, bindings ...*agent.PlanExecutionBinding) (agent.TeamRunReceipt, string) {
 	receipt := team.BuildRunReceipt(plan, status, verification)
+	if len(bindings) > 0 {
+		receipt.PlanBinding = bindings[0]
+	}
 	path, err := agent.WriteTeamRunReceipt(baseDir, workDir, receipt)
 	if err != nil {
 		eventCh <- agent.Event{Type: "status", Data: "Team receipt write failed: " + err.Error()}
@@ -3876,22 +4863,49 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Task          string `json:"task"`
-		VerifyCommand string `json:"verifyCommand"`
-		MaxCycles     int    `json:"maxCycles"`
-		WorkstreamID  string `json:"workstreamId"`
+		Task            string                        `json:"task"`
+		VerifyCommand   string                        `json:"verifyCommand"`
+		MaxCycles       int                           `json:"maxCycles"`
+		WorkDir         string                        `json:"workDir"`
+		WorkstreamID    string                        `json:"workstreamId"`
+		PlanID          string                        `json:"planId"`
+		PlanRevision    uint64                        `json:"planRevision"`
+		StageID         string                        `json:"stageId"`
+		ExecutionPolicy *agent.ExecutionPolicyRequest `json:"executionPolicy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "Invalid JSON")
 		return
 	}
 
-	if body.Task == "" {
+	planBound := strings.TrimSpace(body.PlanID) != "" || body.PlanRevision != 0 || strings.TrimSpace(body.StageID) != ""
+	if planBound && (strings.TrimSpace(body.WorkstreamID) == "" || strings.TrimSpace(body.PlanID) == "" || body.PlanRevision == 0 || strings.TrimSpace(body.StageID) == "") {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_plan_binding", "workstreamId, planId, planRevision, and stageId are required together", nil, nil)
+		return
+	}
+	if body.Task == "" && !planBound {
 		writeError(w, 400, "task is required")
 		return
 	}
-	if workDir == "" {
+	if body.WorkDir != "" || planBound {
+		var scopeErr error
+		workDir, scopeErr = s.requestProjectWorkspace(r, body.WorkDir)
+		if scopeErr != nil {
+			writeProjectWorkspaceScopeError(w, scopeErr)
+			return
+		}
+	} else if workDir == "" {
 		workDir, _ = os.Getwd()
+	}
+	executionPolicy, chronosSandboxRunner, chronosSandboxPolicy, policyErr := resolveServerExecutionPolicy(body.ExecutionPolicy, workDir)
+	if policyErr != nil {
+		writeError(w, http.StatusBadRequest, "Invalid execution policy: "+policyErr.Error())
+		return
+	}
+	skillSettings, skillSettingsErr := resolveSkillSettings(workDir)
+	if skillSettingsErr != nil {
+		writeSessionAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "skill configuration is unavailable", nil, nil)
+		return
 	}
 	traceID := observability.NewTraceID("run")
 	defer s.approvals.CancelSession(traceID)
@@ -3906,6 +4920,11 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 
 	var ws *workstream.Workstream
 	var wsStore *workstream.Store
+	var canonicalPlan *workstream.Plan
+	var planRunBinding *agent.PlanExecutionBinding
+	var planStageRecorder *workstreamPlanStageRecorder
+	var criteriaDigest string
+	body.WorkstreamID = strings.TrimSpace(body.WorkstreamID)
 	if body.WorkstreamID != "" {
 		wsStore = workstream.NewStore(workDir)
 		loaded, err := wsStore.Get(body.WorkstreamID)
@@ -3914,21 +4933,96 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ws = loaded
-		cfg.WorkstreamContext = workstream.RenderContext(*ws, 2000)
+		if planBound {
+			canonicalPlan, err = wsStore.GetPlan(ws.ID, strings.TrimSpace(body.PlanID))
+			if err != nil {
+				writeWorkstreamPlanError(w, err)
+				return
+			}
+			if canonicalPlan.Revision != body.PlanRevision {
+				writeWorkstreamPlanError(w, workstream.ErrPlanRevisionConflict)
+				return
+			}
+			if canonicalPlan.ApprovedRevision != canonicalPlan.Revision ||
+				(canonicalPlan.Status != workstream.PlanStatusApproved && canonicalPlan.Status != workstream.PlanStatusExecuting && canonicalPlan.Status != workstream.PlanStatusFailed) {
+				writeWorkstreamPlanError(w, workstream.ErrPlanTransition)
+				return
+			}
+			definition, stage, criteria, definitionErr := workstreamPlanStageDefinition(canonicalPlan, strings.TrimSpace(body.StageID))
+			if definitionErr != nil {
+				writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "stored plan definition cannot be executed", nil, nil)
+				return
+			}
+			if strings.TrimSpace(definition.VerifyCommand) == "" {
+				writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_verification_required", "plan-bound Chronos execution requires a stored verifyCommand", nil, nil)
+				return
+			}
+			if body.VerifyCommand != "" && body.VerifyCommand != definition.VerifyCommand {
+				writeSessionAPIError(w, http.StatusBadRequest, "plan_verification_override_denied", "plan-bound execution uses the stored verifyCommand", nil, nil)
+				return
+			}
+			body.VerifyCommand = definition.VerifyCommand
+			cfg.VerifyCommand = definition.VerifyCommand
+			body.Task = workstreamPlanStageTask(definition, stage)
+			cfg.PlanAnchor, _, definitionErr = planAnchorForStage(canonicalPlan, stage.ID)
+			if definitionErr != nil {
+				writeSessionAPIError(w, http.StatusUnprocessableEntity, "plan_definition_invalid", "stored plan definition cannot be executed", nil, nil)
+				return
+			}
+			planRunBinding = &agent.PlanExecutionBinding{
+				WorkstreamID: ws.ID, PlanID: canonicalPlan.ID, PlanRevision: canonicalPlan.Revision,
+				StageID: stage.ID, RunID: traceID,
+			}
+			cfg.PlanBinding = planRunBinding
+			criteriaDigest = planCriteriaDigest(criteria)
+		}
+		cfg.CompactionContext = workstreamCompactionContext(ws, canonicalPlan, body.StageID)
 		if err := wsStore.AppendEvent(ws.ID, workstream.TimelineEvent{
 			Type:    "chronos_run_started",
 			Message: "Chronos run started",
 			Data: map[string]string{
-				"provider":  provider.Name(),
-				"model":     model,
-				"traceId":   traceID,
-				"task":      body.Task,
-				"maxCycles": fmt.Sprintf("%d", cfg.MaxCycles),
+				"provider":                provider.Name(),
+				"model":                   model,
+				"traceId":                 traceID,
+				"task":                    body.Task,
+				"maxCycles":               fmt.Sprintf("%d", cfg.MaxCycles),
+				"executionMode":           string(executionPolicy.Mode),
+				"executionPolicyRevision": fmt.Sprintf("%d", executionPolicy.Revision),
 			},
 		}); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
+	}
+	var planStageStateRevision uint64
+	if planBound {
+		activeKey := activeWorkstreamPlanRunKey(workDir, ws.ID, canonicalPlan.ID, traceID)
+		s.activePlanRuns.Store(activeKey, struct{}{})
+		defer s.activePlanRuns.Delete(activeKey)
+		startedPlan, err := wsStore.BeginPlanStage(ws.ID, canonicalPlan.ID, workstream.BeginPlanStageRequest{
+			ExpectedRevision: canonicalPlan.Revision, ExpectedStateRevision: canonicalPlan.StateRevision,
+			StageID: strings.TrimSpace(body.StageID), RunID: traceID,
+		})
+		if err != nil {
+			writeWorkstreamPlanError(w, err)
+			return
+		}
+		planStageStateRevision = startedPlan.StateRevision
+		cfg.WorkstreamContext = workstream.RenderContextWithPlan(*ws, startedPlan, strings.TrimSpace(body.StageID), 2000)
+		cfg.CompactionContext = workstreamCompactionContext(ws, startedPlan, body.StageID)
+		if planRunBinding != nil {
+			planRunBinding.PlanStateRevision = planStageStateRevision
+		}
+		planStageRecorder = &workstreamPlanStageRecorder{
+			store: wsStore, workstreamID: ws.ID, planID: canonicalPlan.ID, stageID: strings.TrimSpace(body.StageID),
+			revision: canonicalPlan.Revision, stateRevision: planStageStateRevision,
+			runID: traceID, criteriaDigest: criteriaDigest,
+		}
+		cfg.Recorder = planStageRecorder
+	}
+	if ws != nil && !planBound {
+		cfg.WorkstreamContext = workstream.RenderContext(*ws, 2000)
+		cfg.CompactionContext = workstreamCompactionContext(ws, nil, "")
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -3950,9 +5044,11 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		WorkstreamID: body.WorkstreamID,
 		Status:       "running",
 		Metadata: map[string]string{
-			"task":          body.Task,
-			"maxCycles":     fmt.Sprintf("%d", cfg.MaxCycles),
-			"verifyCommand": cfg.VerifyCommand,
+			"task":                    body.Task,
+			"maxCycles":               fmt.Sprintf("%d", cfg.MaxCycles),
+			"verifyCommand":           cfg.VerifyCommand,
+			"executionMode":           string(executionPolicy.Mode),
+			"executionPolicyRevision": fmt.Sprintf("%d", executionPolicy.Revision),
 		},
 		Spans: []observability.RunSpan{{
 			ID:        "chronos",
@@ -3968,6 +5064,14 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		Data: map[string]string{"traceId": traceID},
 	})
 	fmt.Fprintf(w, "data: %s\n\n", traceEvent)
+	policyEvent, _ := json.Marshal(agent.Event{
+		Type: "execution_policy",
+		Data: map[string]any{
+			"mode":     executionPolicy.Mode,
+			"revision": executionPolicy.Revision,
+		},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", policyEvent)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -3989,9 +5093,12 @@ func (s *Server) handleChronos(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	chronosSandboxRunner, chronosSandboxPolicy := agent.DefaultSandboxExecution(workDir)
 	cfg.SandboxRunner = chronosSandboxRunner
 	cfg.SandboxPolicy = chronosSandboxPolicy
+	cfg.ExecutionPolicy = &executionPolicy
+	cfg.SkillSource = skillSettings.source
+	cfg.SkillDirs = append([]string{}, skillSettings.dirs...)
+	cfg.ProjectSkillDirs = append([]string{}, skillSettings.projectDirs...)
 	cfg.SessionID = traceID
 	cfg.ApprovalRequester = s.approvals
 	cfg.CapabilityProfile = selectAutomaticCapabilityProfile(provider, model, time.Now())
@@ -4353,24 +5460,24 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		body.Name = filepath.Base(body.Path)
 	}
 
-	cfg := config.Load()
-
-	// Check duplicate
-	for _, p := range cfg.Projects {
-		if filepath.Clean(p.Path) == filepath.Clean(body.Path) {
-			writeError(w, 409, "Project already exists")
-			return
+	errProjectAlreadyExists := errors.New("project already exists")
+	_, err = config.Update(func(cfg *config.Config) error {
+		for _, p := range cfg.Projects {
+			if filepath.Clean(p.Path) == filepath.Clean(body.Path) {
+				return errProjectAlreadyExists
+			}
 		}
+		cfg.Projects = append(cfg.Projects, config.Project{Path: body.Path, Name: body.Name})
+		return nil
+	})
+	if errors.Is(err, errProjectAlreadyExists) {
+		writeError(w, http.StatusConflict, "Project already exists")
+		return
 	}
-
-	cfg.Projects = append(cfg.Projects, config.Project{Path: body.Path, Name: body.Name})
-	if err := config.Save(cfg); err != nil {
+	if err != nil {
 		writeError(w, 500, "Failed to save config")
 		return
 	}
-
-	// Switch to the new project
-	s.SetWorkDir(body.Path)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "name": body.Name, "path": body.Path})
@@ -4383,24 +5490,31 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := config.Load()
-	found := false
-	filtered := make([]config.Project, 0, len(cfg.Projects))
-	for _, p := range cfg.Projects {
-		if filepath.Clean(p.Path) == filepath.Clean(path) {
-			found = true
-			continue
+	errProjectNotFound := errors.New("project not found")
+	_, err := config.Update(func(cfg *config.Config) error {
+		found := false
+		filtered := make([]config.Project, 0, len(cfg.Projects))
+		for _, p := range cfg.Projects {
+			if filepath.Clean(p.Path) == filepath.Clean(path) {
+				found = true
+				continue
+			}
+			filtered = append(filtered, p)
 		}
-		filtered = append(filtered, p)
-	}
-
-	if !found {
-		writeError(w, 404, "Project not found")
+		if !found {
+			return errProjectNotFound
+		}
+		cfg.Projects = filtered
+		return nil
+	})
+	if errors.Is(err, errProjectNotFound) {
+		writeError(w, http.StatusNotFound, "Project not found")
 		return
 	}
-
-	cfg.Projects = filtered
-	config.Save(cfg)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to save config")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true})

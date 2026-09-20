@@ -97,6 +97,75 @@ func TestToolRoutingDeterministicFiltersThenWidensAfterExecution(t *testing.T) {
 	}
 }
 
+func TestToolRoutingReadOnlyRestrictionLimitsFutureWidening(t *testing.T) {
+	base := routingTestCatalog()
+	for _, policy := range []harness.ToolRoutingPolicy{
+		harness.ToolRoutingDeterministic,
+		harness.ToolRoutingTwoStage,
+	} {
+		t.Run(string(policy), func(t *testing.T) {
+			state, err := newToolRoutingState(routingTestProfile(t, policy), base, "read file contents")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if policy == harness.ToolRoutingTwoStage {
+				if handled, _, _, consumeErr := state.consumeSelector([]toolUseBlock{{
+					ID: "select-write", Name: translate.ToolCategorySelectorName(), InputRaw: `{"category":"write"}`,
+				}}, ""); !handled || consumeErr != nil {
+					t.Fatalf("consume write selector: handled=%v err=%v", handled, consumeErr)
+				}
+			}
+
+			state.restrictToReadOnly()
+			for _, catalog := range [][]types.ToolDef{state.base, state.tools()} {
+				for _, tool := range catalog {
+					if !planModeTools[tool.Name] {
+						t.Fatalf("read-only route retained %q: %v", tool.Name, toolNames(catalog))
+					}
+				}
+			}
+			state.observeDispatch([]toolDispatchResult{{Executed: true}})
+			for _, tool := range state.tools() {
+				if !planModeTools[tool.Name] {
+					t.Fatalf("successful dispatch widened beyond read-only base: %v", toolNames(state.tools()))
+				}
+			}
+		})
+	}
+}
+
+func TestToolRoutingKeepsRunBoundSkillLoaderVisible(t *testing.T) {
+	base := append(routingTestCatalog(), skillLoadToolDefinition())
+	for _, policy := range []harness.ToolRoutingPolicy{
+		harness.ToolRoutingDeterministic,
+		harness.ToolRoutingTwoStage,
+	} {
+		t.Run(string(policy), func(t *testing.T) {
+			state, err := newToolRoutingState(routingTestProfile(t, policy), base, "write the selected workflow")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if policy == harness.ToolRoutingTwoStage {
+				if containsTool(state.tools(), loadSkillToolName) {
+					t.Fatal("skill body loader should wait until the route category is selected")
+				}
+				if handled, _, _, consumeErr := state.consumeSelector([]toolUseBlock{{
+					ID: "select-write", Name: translate.ToolCategorySelectorName(), InputRaw: `{"category":"write"}`,
+				}}, ""); !handled || consumeErr != nil {
+					t.Fatalf("consume write selector: handled=%v err=%v", handled, consumeErr)
+				}
+			}
+			if !containsTool(state.tools(), loadSkillToolName) {
+				t.Fatalf("routed catalog omitted shortlist-bound skill loader: %v", toolNames(state.tools()))
+			}
+			state.restrictToReadOnly()
+			if !containsTool(state.tools(), loadSkillToolName) {
+				t.Fatalf("read-only route dropped the skill loader: %v", toolNames(state.tools()))
+			}
+		})
+	}
+}
+
 func TestToolRoutingTwoStageStrictSelectorAndRoundTrip(t *testing.T) {
 	base := routingTestCatalog()
 	state, err := newToolRoutingState(routingTestProfile(t, harness.ToolRoutingTwoStage), base, "modify the file")

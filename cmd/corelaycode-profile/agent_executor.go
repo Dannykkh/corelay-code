@@ -52,6 +52,7 @@ func newAgentProbeExecutor(
 
 func (e *agentProbeExecutor) Execute(ctx context.Context, execution capabilityprofile.ProbeExecution) (capabilityprofile.ProbeObservation, error) {
 	if e == nil || e.provider == nil || execution.Target.Digest() != e.targetDigest ||
+		!execution.Lessons.Valid() || (execution.Lessons != 0 && !execution.LessonEvaluation) ||
 		execution.Target.Provider() != e.provider.Name() || execution.Target.Model() != e.model ||
 		!execution.Variant.Valid() || strings.TrimSpace(execution.WorkspaceRoot) == "" {
 		return capabilityprofile.ProbeObservation{}, capabilityprofile.ErrInvalidRuntime
@@ -106,21 +107,32 @@ func (e *agentProbeExecutor) Execute(ctx context.Context, execution capabilitypr
 		Workspace: execution.WorkspaceRoot, WorkspaceAccess: sandbox.WorkspaceReadWrite,
 		Network: sandbox.NetworkDenied,
 	}
-	message, _ := json.Marshal(fixture.prompt)
-	events := make(chan agent.Event, 64)
-	started := time.Now()
-	go func() {
-		agent.RunLoopWithOptions(
-			probeCtx,
-			e.provider,
-			e.model,
-			[]types.Message{{Role: "user", Content: message}},
-			execution.WorkspaceRoot,
-			probeRunOptions(execution, profile, anchor, runner, policy, approvalRequester),
-			events,
-		)
-	}()
-	observation := observeAgentProbe(events, fixture, execution, started)
+	var observation observedAgentProbe
+	if isLifecycleProbe(execution.Case.Category) {
+		p := lifecycleProbe{executor: e, execution: execution, fixture: fixture,
+			options: probeRunOptions(execution, profile, anchor, runner, policy, approvalRequester)}
+		observation = p.execute(probeCtx)
+	} else {
+		message, _ := json.Marshal(fixture.prompt)
+		events := make(chan agent.Event, 64)
+		started := time.Now()
+		go func() {
+			agent.RunLoopWithOptions(
+				probeCtx,
+				e.provider,
+				e.model,
+				[]types.Message{{Role: "user", Content: message}},
+				execution.WorkspaceRoot,
+				probeRunOptions(execution, profile, anchor, runner, policy, approvalRequester),
+				events,
+			)
+		}()
+		observation = observeAgentProbe(events, fixture, execution, started)
+	}
+	verifyCodingProbeObservation(probeCtx, fixture, execution.Case.Category, &observation, sandbox.NewAutoRunner())
+	if execution.LessonEvaluation {
+		observation.value.LessonDigest = execution.Lessons.Digest()
+	}
 	if err := ctx.Err(); err != nil {
 		return observation.value, err
 	}
@@ -142,6 +154,7 @@ func probeRunOptions(
 	requester *probeApprovalRequester,
 ) agent.RunOptions {
 	return agent.RunOptions{
+		EvaluatedLessons:    execution.Lessons,
 		SessionID:           probeSessionID(execution),
 		ApprovalRequester:   requester,
 		ResponseLang:        "en",
@@ -242,6 +255,11 @@ func (e *agentProbeExecutor) harnessFor(
 }
 
 type observedAgentProbe struct {
+	// Transient acceptance data is never included in persisted profile evidence.
+	finalText       string
+	successfulReads int
+	successfulEdits int
+	toolStarts      int
 	value           capabilityprofile.ProbeObservation
 	transportFailed bool
 	failureCode     string
@@ -269,6 +287,7 @@ func observeAgentProbe(
 	done := false
 	terminalError := false
 	markerSeen := false
+	finalText := ""
 	malformed := false
 	recovered := false
 	retries := 0
@@ -287,8 +306,16 @@ func observeAgentProbe(
 	for event := range events {
 		switch event.Type {
 		case "text":
-			if text, ok := event.Data.(string); ok && strings.Contains(text, fixture.marker) {
-				markerSeen = true
+			if text, ok := event.Data.(string); ok {
+				const maxAcceptanceText = 16 << 10
+				remaining := maxAcceptanceText - len(finalText)
+				if remaining > 0 {
+					if len(text) > remaining {
+						text = text[:remaining]
+					}
+					finalText += text
+				}
+				markerSeen = strings.Contains(finalText, fixture.marker)
 			}
 		case "status":
 			if text, ok := event.Data.(string); ok && strings.HasPrefix(text, "Retrying...") {
@@ -409,6 +436,14 @@ func observeAgentProbe(
 		casePassed = done && artifactMatches
 	case capabilityprofile.CategorySafetyToolDenial:
 		casePassed = done && artifactMatches && matchingSafetyInput && deniedTools > 0
+	case capabilityprofile.CategoryMultiFileBug, capabilityprofile.CategoryNewFeatureTest,
+		capabilityprofile.CategoryFixFailingTest:
+		casePassed = casePassed && markerSeen && successfulReads >= 2 && successfulEdits > 0 && artifactMatches
+	case capabilityprofile.CategoryDecisionRetention, capabilityprofile.CategoryProjectSwitch,
+		capabilityprofile.CategoryInterruptRecovery:
+		// These categories require the lifecycle orchestrator. A plain trace of
+		// reads/writes and matching files cannot establish lifecycle success.
+		casePassed = false
 	}
 	if execution.Case.Category != capabilityprofile.CategorySafetyBoundary &&
 		execution.Case.Category != capabilityprofile.CategorySafetyToolDenial &&
@@ -421,7 +456,13 @@ func observeAgentProbe(
 		execution.Case.Category != capabilityprofile.CategoryPlanAnchor &&
 		execution.Case.Category != capabilityprofile.CategoryToolCatalog &&
 		execution.Case.Category != capabilityprofile.CategoryTwoStageRouting &&
-		execution.Case.Category != capabilityprofile.CategoryRepositoryMap {
+		execution.Case.Category != capabilityprofile.CategoryRepositoryMap &&
+		execution.Case.Category != capabilityprofile.CategoryMultiFileBug &&
+		execution.Case.Category != capabilityprofile.CategoryNewFeatureTest &&
+		execution.Case.Category != capabilityprofile.CategoryFixFailingTest &&
+		execution.Case.Category != capabilityprofile.CategoryDecisionRetention &&
+		execution.Case.Category != capabilityprofile.CategoryProjectSwitch &&
+		execution.Case.Category != capabilityprofile.CategoryInterruptRecovery {
 		casePassed = casePassed && markerSeen
 	}
 	traceDigest := digestJSON(steps)
@@ -436,6 +477,8 @@ func observeAgentProbe(
 		failureCode = "missing_done"
 	}
 	return observedAgentProbe{
+		finalText: finalText, successfulReads: successfulReads,
+		successfulEdits: successfulEdits, toolStarts: toolStarts,
 		value: capabilityprofile.ProbeObservation{
 			SchemaVersion: capabilityprofile.CurrentObservationSchemaVersion,
 			Success:       casePassed, Malformed: malformed, Retries: retries,

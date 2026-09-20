@@ -2,6 +2,13 @@
 
 Observed: 2026-08-12
 
+2026-09-20 workflow boundary: ACP does not yet support Workstream/Plan/Stage
+execution. Loading or prompting a session with any workflow binding returns an
+explicit unsupported error before runtime registration, MCP, provider calls, or
+durable mutation. Use the native Web/API workflow path. The regression tests in
+`internal/acpbridge/workflow_binding_test.go` cover both entry points; ordinary
+ACP sessions remain supported.
+
 ## Pins
 
 - Protocol current-main snapshot: `af41b25f57a79c5629b3164e23fb4e8650badeeb`
@@ -60,8 +67,9 @@ result decoding. It is a smoke test, not a full conformance suite.
 Supported and exercised:
 
 - initialize
-- session new, load, list, and close
+- session new, load, list, close, delete, and resume
 - session configuration updates
+- session mode selection (`read-only`, `workspace`, `full`) with durable policy revision and workspace default
 - text prompts and cancellation
 - redacted permission requests
 - stable stdio MCP with session-owned process and catalog lifetime
@@ -69,10 +77,16 @@ Supported and exercised:
 Unsupported or deliberately unadvertised:
 
 - authenticate and logout
-- session delete, resume, and set_mode
 - additional directories
 - image, audio, and embedded-resource prompts
 - HTTP and SSE MCP transports
 
 Capability status remains `connected` until a deterministic advertised-surface
 fixture and the relevant external SDK lane run in repeatable CI.
+
+The execution-mode boundary has backend coverage in
+`internal/acpbridge/execution_mode_test.go` and a built-command protocol fixture
+in `cmd/corelaycode-acp/conformance_test.go`, including `session/set_mode`, mode
+update notification, and full-mode persistence across load/resume. The pinned
+external SDK smoke above predates this addition and does not certify mode
+negotiation through that SDK end to end.

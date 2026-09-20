@@ -7,6 +7,14 @@ making the existing surface small, explicit, and auditable.
 
 ## Public Surface
 
+The RSI adoption gate is available through `corelaycode-profile improve`.
+With `--learn`, repeated calibration failures propose bounded lesson instructions,
+then fresh control and candidate plans execute independently before adoption.
+Only accepted candidates enter the existing automatic-selection store and add
+their evaluated reminders to subsequent matching runs. See
+[RSI contract and remaining stages](rsi.md); this is not an autonomous
+source-code improvement loop.
+
 Keep the user-facing model compact:
 
 | Mode | Purpose | Primary implementation |
@@ -40,6 +48,37 @@ The web Team page is part of this same contract. It submits the TeamPlan
 objective, verification command, capacity limits, task kind/role, provider/model
 overrides, read-only mode, dependencies, file scopes, and per-task resource
 reservations instead of relying on a reduced legacy task shape.
+
+### Current product boundaries
+
+Every native ingress still resolves one run-owned context: project/workspace,
+durable session revision, Workstream/Plan stage when present, execution policy,
+tool catalog, and evidence receipt. A project switch invalidates the old runtime
+epoch so delayed stream frames cannot update the newly selected project. Skills
+are descriptors and bounded instruction sources selected by the current project
+and run; recalled memory, skill text, MCP responses, and model output cannot
+raise the execution policy or approval state.
+
+The Web chat treats a response stream that ends without a completion event as
+interrupted. It preserves the partial reply, displays the interruption, and
+does not save that reply through the legacy successful-completion fallback.
+An unfinished SSE frame at EOF cannot establish completion. User cancellation
+and responses from a previously selected project retain their separate paths.
+
+`WebFetch` first tries bounded HTTP and can explicitly use the local Rod
+headless browser for JavaScript pages. It does not start a Python crawler or a
+persistent browser server. MCP stdio and streamable HTTP clients are owned by
+the run catalog; credentials stay in operator configuration and are not copied
+to receipts. Go semantic navigation is a separate read-only `LSP` capability;
+when `gopls` is unavailable the result says `RepoMap fallback` instead of
+pretending that structural search is semantic.
+
+Release updates are operator actions. The product has no background updater or
+remote release discovery: `corelaycode update` accepts a local artifact and
+expected SHA-256, stages and verifies it, retains a rollback copy, and on
+Windows schedules a one-shot helper for the current executable. The helper
+waits for the parent command to exit before replacement and explicit rollback;
+other in-use targets fail closed.
 
 ## Invariants
 

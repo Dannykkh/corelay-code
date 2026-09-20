@@ -27,36 +27,49 @@ type AgentReceipt struct {
 	PlanMode     bool                        `json:"planMode"`
 	Iterations   int                         `json:"iterations"`
 	EditedFiles  []string                    `json:"editedFiles"`
+	Skills       []ReceiptSkill              `json:"skills,omitempty"`
 	Artifacts    []ReceiptArtifact           `json:"artifacts,omitempty"`
 	Verification ReceiptVerification         `json:"verification"`
 	Completion   *CompletionContractSnapshot `json:"completion,omitempty"`
 	Recovery     *RunGuardSnapshot           `json:"recovery,omitempty"`
+	PlanBinding  *PlanExecutionBinding       `json:"planBinding,omitempty"`
+}
+
+// ReceiptSkill identifies a skill whose complete instruction body was loaded
+// during this run. It intentionally omits local paths and skill contents.
+type ReceiptSkill struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Namespace string `json:"namespace,omitempty"`
+	Digest    string `json:"digest"`
 }
 
 // TeamRunReceipt is the durable state snapshot for a TeamPlan or worker run.
 // It stores compact summaries and file pointers, never raw prompts or full
 // model/tool output.
 type TeamRunReceipt struct {
-	Version             int                 `json:"version"`
-	Kind                string              `json:"kind"`
-	CreatedAt           string              `json:"createdAt"`
-	WorkDir             string              `json:"workDir"`
-	Status              string              `json:"status"` // completed, failed, cancelled
-	TeamName            string              `json:"teamName"`
-	PlanName            string              `json:"planName,omitempty"`
-	PlanVersion         int                 `json:"planVersion,omitempty"`
-	Objective           string              `json:"objective,omitempty"`
-	Provider            string              `json:"provider"`
-	Model               string              `json:"model"`
-	Capacity            CapacityConfig      `json:"capacity"`
-	VerifyCommand       string              `json:"verifyCommand,omitempty"`
-	VerifyCommandDigest string              `json:"verifyCommandDigest,omitempty"` // digest of the pre-redaction command
-	TaskCount           int                 `json:"taskCount"`
-	Completed           int                 `json:"completed"`
-	Failed              int                 `json:"failed"`
-	ToolCalls           int                 `json:"toolCalls"`
-	Verification        ReceiptVerification `json:"verification"`
-	Tasks               []TeamTaskReceipt   `json:"tasks"`
+	Version             int                   `json:"version"`
+	Kind                string                `json:"kind"`
+	CreatedAt           string                `json:"createdAt"`
+	WorkDir             string                `json:"workDir"`
+	Status              string                `json:"status"` // completed, failed, cancelled
+	TeamName            string                `json:"teamName"`
+	PlanName            string                `json:"planName,omitempty"`
+	PlanVersion         int                   `json:"planVersion,omitempty"`
+	Objective           string                `json:"objective,omitempty"`
+	Provider            string                `json:"provider"`
+	Model               string                `json:"model"`
+	Capacity            CapacityConfig        `json:"capacity"`
+	VerifyCommand       string                `json:"verifyCommand,omitempty"`
+	VerifyCommandDigest string                `json:"verifyCommandDigest,omitempty"` // digest of the pre-redaction command
+	TaskCount           int                   `json:"taskCount"`
+	Completed           int                   `json:"completed"`
+	Failed              int                   `json:"failed"`
+	ToolCalls           int                   `json:"toolCalls"`
+	Verification        ReceiptVerification   `json:"verification"`
+	Tasks               []TeamTaskReceipt     `json:"tasks"`
+	PlanBinding         *PlanExecutionBinding `json:"planBinding,omitempty"`
 }
 
 type TeamTaskReceipt struct {

@@ -101,7 +101,11 @@ func TestGrepOneShotProcessUsesRunnerArgvFilteredEnvironmentAndReport(t *testing
 	if len(commands) != 1 {
 		t.Fatalf("runner calls=%d, want 1", len(commands))
 	}
-	wantArgs := []string{"--no-heading", "--line-number", "--color=never", "-i", "--glob", "*.txt", "needle", workDir}
+	canonicalWorkDir, err := canonicalWorkspace(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{"--no-heading", "--line-number", "--color=never", "-i", "--glob", "*.txt", "needle", canonicalWorkDir}
 	if commands[0].Path != "rg" || !reflect.DeepEqual(commands[0].Args, wantArgs) {
 		t.Fatalf("command=%q %#v, want rg %#v", commands[0].Path, commands[0].Args, wantArgs)
 	}

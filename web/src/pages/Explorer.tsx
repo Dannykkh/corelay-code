@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON } from '../lib/api';
+import { fileResponseContent, readWorkspaceFile } from '../lib/files';
 
 interface ConfigResponse {
   workDir?: string;
@@ -11,19 +12,6 @@ interface ProjectInfo {
   framework?: string;
   fileCount: number;
   fileTree?: string;
-}
-
-type AgentEvent = {
-  type?: string;
-  data?: unknown;
-};
-
-type ToolResultData = {
-  result?: string;
-};
-
-function toolResultData(data: unknown): ToolResultData {
-  return data && typeof data === 'object' ? data as ToolResultData : {};
 }
 
 export function ExplorerPage() {
@@ -43,35 +31,11 @@ export function ExplorerPage() {
   async function readFile(path: string) {
     setSelectedFile(path);
     try {
-      const resp = await fetch('/api/agent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [{ role: 'user', content: `Read the file ${path} and show its contents` }],
-          workDir: workDir,
-        }),
-      });
-      const reader = resp.body!.getReader();
-      const decoder = new TextDecoder();
-      let content = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const text = decoder.decode(value);
-        const lines = text.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const event = JSON.parse(line.slice(6)) as AgentEvent;
-              if (event.type === 'text') content += typeof event.data === 'string' ? event.data : '';
-              if (event.type === 'tool_result') content = toolResultData(event.data).result || '';
-            } catch { /* skip */ }
-          }
-        }
-      }
-      setFileContent(content);
+      const response = await readWorkspaceFile(workDir, path);
+      setSelectedFile(response.path || path);
+      setFileContent(fileResponseContent(response));
     } catch (e) {
-      setFileContent(`Error: ${e}`);
+      setFileContent(`Error: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 

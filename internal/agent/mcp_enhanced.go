@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -154,9 +156,12 @@ type MCPManager struct {
 
 // MCPServerDef from config.
 type MCPServerDef struct {
+	Type    string            `json:"type"`
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
 }
 
 // NewMCPManager creates a manager.
@@ -174,7 +179,11 @@ func (m *MCPManager) ConnectAll(workDir string) int {
 	m.workDir = workDir
 	m.mu.Unlock()
 
-	configJSON := LoadMCPConfig(workDir)
+	configJSON, _, loadErr := LoadMCPConfigWithPaths(workDir, configuredMCPConfigPaths())
+	if loadErr != nil {
+		log.Printf("[MCP Manager] Config error: %v", loadErr)
+		return 0
+	}
 	if configJSON == "" {
 		return 0
 	}
@@ -189,9 +198,10 @@ func (m *MCPManager) ConnectAll(workDir string) int {
 	for name, srv := range cfg.MCPServers {
 		m.mu.Lock()
 		m.configs[name] = MCPServerDef{
-			Command: srv.Command,
-			Args:    srv.Args,
-			Env:     srv.Env,
+			Type: srv.Type, Command: srv.Command,
+			Args: srv.Args,
+			Env:  srv.Env,
+			URL:  srv.URL, Headers: srv.Headers,
 		}
 		m.mu.Unlock()
 
@@ -218,7 +228,13 @@ func (m *MCPManager) connect(name string) error {
 		return fmt.Errorf("unknown server: %s", name)
 	}
 
-	client, err := NewMCPClient(name, def.Command, def.Args, workDir, def.Env)
+	var client *MCPClient
+	var err error
+	if strings.EqualFold(strings.TrimSpace(def.Type), "http") {
+		client, err = NewMCPRemoteClientWithOptions(name, def.URL, def.Headers, DefaultMCPExecutionOptions(context.Background(), workDir))
+	} else {
+		client, err = NewMCPClient(name, def.Command, def.Args, workDir, def.Env)
+	}
 	if err != nil {
 		return err
 	}

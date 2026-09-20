@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
+	"github.com/Dannykkh/corelay-code/internal/workstream"
 )
 
 type failingDurableInterruptionStore struct {
@@ -540,6 +542,327 @@ func TestAgentLoopBindsAndCommitsDurableSessionBeforeDone(t *testing.T) {
 	}
 	if !strings.Contains(response, `"durableSessionId":"`+session.ID+`"`) || !strings.Contains(response, `"durableRevision":1`) {
 		t.Fatalf("initial session binding missing:\n%s", response)
+	}
+}
+
+func TestAgentLoopUsesDurableSessionWorkspaceWorkstreamAndModel(t *testing.T) {
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
+	projectWorkspace := t.TempDir()
+	serverWorkspace := t.TempDir()
+	workstreams := workstream.NewStore(projectWorkspace)
+	ws, err := workstreams.Create(workstream.CreateRequest{ID: "ws_saved", Title: "Saved project workstream"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherWorkstream, err := workstreams.Create(workstream.CreateRequest{ID: "ws_other", Title: "Other workstream"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := agent.NewSessionStore(t.TempDir())
+	policy, err := agent.ResolveExecutionPolicy(agent.ExecutionPolicyRequest{Mode: agent.ExecutionModeReadOnly}, "", sandbox.Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := agent.Session{
+		Workspace: projectWorkspace, WorkstreamID: ws.ID,
+		Provider: "fake", Model: "session-target-model",
+		ExecutionPolicy: &policy,
+		Messages:        []agent.SessionMessage{{Role: "user", Content: "hello"}},
+	}
+	if err := store.Save(&session); err != nil {
+		t.Fatal(err)
+	}
+	provider := &agentLoopFakeProvider{text: "durable answer"}
+	server := New(provider, "server-default-model", 0)
+	server.SetWorkDir(serverWorkspace)
+	server.SetSessionStore(store)
+	body, _ := json.Marshal(map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"durableSessionId": session.ID,
+		"expectedRevision": session.Revision,
+	})
+	recorder := httptest.NewRecorder()
+	server.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 1 || provider.model != "session-target-model" {
+		t.Fatalf("provider calls=%d model=%q, want one call to persisted model", provider.calls, provider.model)
+	}
+	var sessionEventWorkDir string
+	workstreamEventFound := false
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "data: "))
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var event struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode SSE event %q: %v", line, err)
+		}
+		if event.Type == "session" {
+			var data struct {
+				WorkDir string `json:"workDir"`
+			}
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				t.Fatalf("decode session event data: %v", err)
+			}
+			sessionEventWorkDir = data.WorkDir
+		}
+		if event.Type == "workstream" {
+			var data struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				t.Fatalf("decode workstream event data: %v", err)
+			}
+			workstreamEventFound = data.ID == ws.ID
+		}
+	}
+	if !sameDurableWorkspace(sessionEventWorkDir, projectWorkspace) || workstreamEventFound != true {
+		t.Fatalf("resolved workspace=%q workstream event=%v response=%s", sessionEventWorkDir, workstreamEventFound, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"executionPolicy":{"mode":"read-only"`) {
+		t.Fatalf("durable session policy was not used as the run default: %s", recorder.Body.String())
+	}
+	if !strings.Contains(provider.systemPrompt, "Saved project workstream") {
+		t.Fatalf("persisted workstream context missing from provider prompt: %q", provider.systemPrompt)
+	}
+	committed, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.Revision != 2 || committed.Workspace != session.Workspace || committed.WorkstreamID != ws.ID ||
+		committed.Provider != session.Provider || committed.Model != session.Model {
+		t.Fatalf("durable session target changed after run: %#v", committed)
+	}
+
+	boundSession := agent.Session{
+		Workspace: projectWorkspace, WorkstreamID: ws.ID, Provider: "fake", Model: "session-target-model",
+		Messages: []agent.SessionMessage{{Role: "user", Content: "hello"}},
+	}
+	if err := store.Save(&boundSession); err != nil {
+		t.Fatal(err)
+	}
+	mismatchBody, _ := json.Marshal(map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"workstreamId":     otherWorkstream.ID,
+		"durableSessionId": boundSession.ID,
+		"expectedRevision": boundSession.Revision,
+	})
+	mismatchRecorder := httptest.NewRecorder()
+	server.handleAgentLoop(mismatchRecorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(mismatchBody)))
+	if mismatchRecorder.Code != http.StatusConflict || provider.calls != 1 ||
+		!strings.Contains(mismatchRecorder.Body.String(), `"code":"session_workstream_conflict"`) {
+		t.Fatalf("workstream mismatch status=%d provider calls=%d body=%s", mismatchRecorder.Code, provider.calls, mismatchRecorder.Body.String())
+	}
+}
+
+func TestAgentLoopRejectsStaleWorkstreamPlanBeforeProviderCall(t *testing.T) {
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
+	workspace := t.TempDir()
+	workstreams := workstream.NewStore(workspace)
+	ws, err := workstreams.Create(workstream.CreateRequest{ID: "ws_stale_plan", Title: "Stale plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planServer := New(nil, "", 0)
+	planServer.SetWorkDir(workspace)
+	plan := createWorkstreamPlanAPIForTest(t, planServer, workspace, ws.ID, "plan_stale", "research")
+	store := agent.NewSessionStore(t.TempDir())
+	session := agent.Session{
+		Workspace: workspace, WorkstreamID: ws.ID, PlanID: plan.ID,
+		PlanRevision: plan.Revision + 1, StageID: "research", Provider: "fake", Model: "fake-model",
+		Messages: []agent.SessionMessage{{Role: "user", Content: "hello"}},
+	}
+	if err := store.Save(&session); err != nil {
+		t.Fatal(err)
+	}
+	provider := &agentLoopFakeProvider{text: "must not run"}
+	server := New(provider, "fake-model", 0)
+	server.SetWorkDir(workspace)
+	server.SetSessionStore(store)
+	body, err := json.Marshal(map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"durableSessionId": session.ID,
+		"expectedRevision": session.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if recorder.Code != http.StatusConflict || provider.calls != 0 ||
+		!strings.Contains(recorder.Body.String(), `"code":"plan_revision_conflict"`) {
+		t.Fatalf("stale workflow plan status=%d provider calls=%d body=%s", recorder.Code, provider.calls, recorder.Body.String())
+	}
+	persisted, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Revision != session.Revision || persisted.PlanRevision != plan.Revision+1 {
+		t.Fatalf("rejected run changed session: %#v", persisted)
+	}
+}
+
+func TestAgentLoopRequiresPlanApprovalAndReceiptBeforeCompletingStage(t *testing.T) {
+	t.Setenv("CORELAY_CONFIG_DIR", t.TempDir())
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
+	workspace := t.TempDir()
+	workstreams := workstream.NewStore(workspace)
+	ws, err := workstreams.Create(workstream.CreateRequest{ID: "ws_plan_approval", Title: "Plan approval"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup := New(nil, "", 0)
+	setup.SetWorkDir(workspace)
+	plan := createWorkstreamPlanAPIForTest(t, setup, workspace, ws.ID, "plan_approval", "research")
+	store := agent.NewSessionStore(t.TempDir())
+	session := agent.Session{
+		Workspace: workspace, WorkstreamID: ws.ID, PlanID: plan.ID,
+		PlanRevision: plan.Revision, StageID: "research", Provider: "fake", Model: "fake-model",
+		Messages: []agent.SessionMessage{{Role: "user", Content: "hello"}},
+	}
+	if err := store.Save(&session); err != nil {
+		t.Fatal(err)
+	}
+	provider := &agentLoopFakeProvider{text: "an answer without completion evidence"}
+	server := New(provider, "fake-model", 0)
+	server.SetWorkDir(workspace)
+	server.SetSessionStore(store)
+	body, err := json.Marshal(map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"durableSessionId": session.ID,
+		"expectedRevision": session.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unapproved := httptest.NewRecorder()
+	server.handleAgentLoop(unapproved, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if unapproved.Code != http.StatusConflict || provider.calls != 0 ||
+		!strings.Contains(unapproved.Body.String(), `"code":"plan_approval_required"`) {
+		t.Fatalf("unapproved plan status=%d provider calls=%d body=%s", unapproved.Code, provider.calls, unapproved.Body.String())
+	}
+	unchanged, err := workstreams.GetPlan(ws.ID, plan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Status != workstream.PlanStatusDraft || unchanged.StateRevision != plan.StateRevision {
+		t.Fatalf("rejected unapproved run changed plan: %+v", unchanged)
+	}
+
+	plan, err = workstreams.ApprovePlan(ws.ID, plan.ID, workstream.ApprovePlanRequest{
+		ExpectedRevision: plan.Revision, ExpectedStateRevision: plan.StateRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvedRun := httptest.NewRecorder()
+	server.handleAgentLoop(approvedRun, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if approvedRun.Code != http.StatusOK || provider.calls == 0 {
+		t.Fatalf("approved plan status=%d provider calls=%d body=%s", approvedRun.Code, provider.calls, approvedRun.Body.String())
+	}
+	for _, want := range []string{
+		"Plan ID: plan_approval (definition revision 1, state revision 3, status executing, approved revision 1)",
+		"Current stage: research (running)",
+		"Current stage attempt: run run_",
+	} {
+		if !strings.Contains(provider.systemPrompt, want) {
+			t.Fatalf("Plan-bound Agent prompt is missing started state %q:\n%s", want, provider.systemPrompt)
+		}
+	}
+	afterRun, err := workstreams.GetPlan(ws.ID, plan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRun.Status == workstream.PlanStatusCompleted || afterRun.Stages[0].Status == workstream.PlanStageStatusCompleted ||
+		len(afterRun.Stages[0].Attempts) != 1 || afterRun.Stages[0].Attempts[0].Evidence != nil {
+		t.Fatalf("plain provider response completed stage without receipt acceptance evidence: %+v", afterRun)
+	}
+}
+
+func TestAgentLoopRejectsExplicitDurableWorkspaceMismatchBeforeDispatch(t *testing.T) {
+	projectWorkspace := t.TempDir()
+	otherWorkspace := t.TempDir()
+	store := agent.NewSessionStore(t.TempDir())
+	session := agent.Session{
+		Workspace: projectWorkspace, Provider: "fake", Model: "session-target-model",
+		Messages: []agent.SessionMessage{{Role: "user", Content: "hello"}},
+	}
+	if err := store.Save(&session); err != nil {
+		t.Fatal(err)
+	}
+	provider := &agentLoopFakeProvider{text: "must not run"}
+	server := New(provider, "server-default-model", 0)
+	server.SetWorkDir(projectWorkspace)
+	server.SetSessionStore(store)
+	body, _ := json.Marshal(map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"workDir":          otherWorkspace,
+		"durableSessionId": session.ID,
+		"expectedRevision": session.Revision,
+	})
+	recorder := httptest.NewRecorder()
+	server.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if recorder.Code != http.StatusConflict || provider.calls != 0 ||
+		!strings.Contains(recorder.Body.String(), `"code":"session_workspace_conflict"`) ||
+		strings.Contains(recorder.Body.String(), `"type":"session"`) {
+		t.Fatalf("status=%d provider calls=%d body=%s", recorder.Code, provider.calls, recorder.Body.String())
+	}
+	persisted, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Revision != session.Revision || len(persisted.Messages) != 1 || persisted.Messages[0].Content != "hello" {
+		t.Fatalf("rejected workspace request changed session: %#v", persisted)
+	}
+}
+
+func TestAgentLoopReportsServerResolvedExecutionPolicy(t *testing.T) {
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
+	workDir := t.TempDir()
+	provider := &agentLoopFakeProvider{text: "full mode answer"}
+	server := New(provider, "fake-model", 0)
+	server.SetWorkDir(workDir)
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}],"executionPolicy":{"mode":"full","revision":999,"runtimeCapabilities":{"filesystemIsolation":true}}}`)
+	recorder := httptest.NewRecorder()
+	server.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	response := recorder.Body.String()
+	if !strings.Contains(response, `"executionPolicy":{"mode":"full","revision":`) {
+		t.Fatalf("initial session event omitted effective execution policy:\n%s", response)
+	}
+	if strings.Contains(response, `"revision":999`) {
+		t.Fatalf("server trusted caller-supplied policy revision:\n%s", response)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls=%d, want 1", provider.calls)
+	}
+}
+
+func TestAgentLoopRejectsUnknownExecutionPolicyMode(t *testing.T) {
+	provider := &agentLoopFakeProvider{text: "must not run"}
+	server := New(provider, "fake-model", 0)
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}],"executionPolicy":{"mode":"unrestricted"}}`)
+	recorder := httptest.NewRecorder()
+	server.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest || provider.calls != 0 ||
+		!strings.Contains(recorder.Body.String(), `"code":"invalid_execution_policy"`) {
+		t.Fatalf("status=%d provider calls=%d body=%s", recorder.Code, provider.calls, recorder.Body.String())
 	}
 }
 

@@ -73,6 +73,32 @@ func runToolProcess(
 	args []string,
 	timeout time.Duration,
 ) toolProcessResult {
+	return runToolProcessWithEnvironment(opts, component, workDir, path, args, timeout, nil)
+}
+
+func runToolProcessWithGitIndex(
+	opts ToolExecutionOptions,
+	component string,
+	workDir string,
+	args []string,
+	timeout time.Duration,
+	indexPath string,
+) toolProcessResult {
+	if strings.TrimSpace(indexPath) == "" {
+		return toolProcessResult{Result: sandbox.Result{ExitCode: sandbox.ExitNotStarted, Err: errors.New("Git index path is empty")}}
+	}
+	return runToolProcessWithEnvironment(opts, component, workDir, "git", args, timeout, map[string]string{"GIT_INDEX_FILE": indexPath})
+}
+
+func runToolProcessWithEnvironment(
+	opts ToolExecutionOptions,
+	component string,
+	workDir string,
+	path string,
+	args []string,
+	timeout time.Duration,
+	trustedOverrides map[string]string,
+) toolProcessResult {
 	policy := opts.SandboxPolicy
 	runner := opts.SandboxRunner
 	if timeout <= 0 {
@@ -122,6 +148,15 @@ func runToolProcess(
 	environment, err := bashEnvironmentSpec(nil)
 	if err != nil {
 		return setupFailure(sandbox.FailureCommandInvalid, err.Error())
+	}
+	for name, value := range trustedOverrides {
+		if name != "GIT_INDEX_FILE" || strings.TrimSpace(value) == "" {
+			return setupFailure(sandbox.FailureCommandInvalid, "unsupported trusted process environment override")
+		}
+		if environment.Set == nil {
+			environment.Set = make(map[string]string)
+		}
+		environment.Set[name] = value
 	}
 	if strings.TrimSpace(path) == "" {
 		return setupFailure(sandbox.FailureCommandInvalid, "command path is empty")

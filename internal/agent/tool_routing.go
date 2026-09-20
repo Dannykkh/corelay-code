@@ -67,7 +67,7 @@ func newToolRoutingState(
 			task,
 			deterministicToolRouteMinimumConfidence,
 		)
-		state.active = active
+		state.active = appendCandidateSkillLoader(active, base)
 		state.decision = decision
 		if dropped > 0 {
 			state.phase = toolRoutingFiltered
@@ -93,6 +93,53 @@ func (s *toolRoutingState) tools() []types.ToolDef {
 		return nil
 	}
 	return append([]types.ToolDef(nil), s.active...)
+}
+
+// appendCandidateSkillLoader keeps the per-run, shortlist-bound skill reader
+// available after category routing without exposing unrelated skill content.
+func appendCandidateSkillLoader(active, base []types.ToolDef) []types.ToolDef {
+	var loader *types.ToolDef
+	for index := range base {
+		if base[index].Name == loadSkillToolName {
+			loader = &base[index]
+			break
+		}
+	}
+	if loader == nil {
+		return active
+	}
+	for _, tool := range active {
+		if tool.Name == loadSkillToolName {
+			return active
+		}
+	}
+	return append(active, *loader)
+}
+
+// restrictToReadOnly permanently narrows the route's widening ceiling for the
+// remainder of a bounded read-only run. The loop rebuilds both the provider
+// catalog and dispatcher allow-list from this state on each iteration, so the
+// base catalog must be narrowed along with the currently active catalog.
+func (s *toolRoutingState) restrictToReadOnly() bool {
+	if s == nil {
+		return false
+	}
+	base := filterReadOnlyTools(s.base)
+	active := filterReadOnlyTools(s.active)
+	if len(active) == 0 {
+		active = append([]types.ToolDef(nil), base...)
+	}
+	changed := !sameToolCatalog(s.base, base) || !sameToolCatalog(s.active, active)
+	s.base = base
+	s.active = active
+	if s.policy != harness.ToolRoutingDirect {
+		if sameToolCatalog(s.active, s.base) {
+			s.phase = toolRoutingWidened
+		} else {
+			s.phase = toolRoutingFiltered
+		}
+	}
+	return changed
 }
 
 func (s *toolRoutingState) record() toolRoutingRecord {
@@ -163,7 +210,7 @@ func (s *toolRoutingState) consumeSelector(
 		return true, types.Message{}, types.Message{}, fmt.Errorf("routing selector category is missing")
 	}
 	category := translate.ToolCategory(categoryText)
-	selected := translate.FilterToolsForCategory(s.base, category)
+	selected := appendCandidateSkillLoader(translate.FilterToolsForCategory(s.base, category), s.base)
 
 	if strings.TrimSpace(call.ID) == "" {
 		call.ID = "route_selector"

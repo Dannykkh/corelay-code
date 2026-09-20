@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -63,9 +64,11 @@ func (s *Server) handleRuntimeQuotaSourceCreate(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	cfg := config.Load()
-	cfg.RuntimeQuotaSources = append(cfg.RuntimeQuotaSources, normalized)
-	if err := config.Save(cfg); err != nil {
+	cfg, err := config.Update(func(cfg *config.Config) error {
+		cfg.RuntimeQuotaSources = append(cfg.RuntimeQuotaSources, normalized)
+		return nil
+	})
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -109,8 +112,12 @@ func (s *Server) handleRuntimeQuotaSourceTestSaved(w http.ResponseWriter, r *htt
 	if !ok {
 		return
 	}
-	cfg := config.Load()
-	if idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
+	cfg, exists, err := config.LoadChecked()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	if !exists || idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
 		writeError(w, http.StatusNotFound, "quota source not found")
 		return
 	}
@@ -135,22 +142,35 @@ func (s *Server) handleRuntimeQuotaSourcePatch(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	cfg := config.Load()
-	if idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
+	errQuotaSourceNotFound := errors.New("quota source not found")
+	errInvalidQuotaSource := errors.New("invalid quota source")
+	var normalized config.RuntimeQuotaSource
+	var validationErr error
+	cfg, err := config.Update(func(cfg *config.Config) error {
+		if idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
+			return errQuotaSourceNotFound
+		}
+		source := cfg.RuntimeQuotaSources[idx]
+		applyRuntimeQuotaSourcePatch(&source, patch)
+		var err error
+		normalized, err = normalizeRuntimeQuotaSourceConfig(source)
+		if err != nil {
+			validationErr = err
+			return errInvalidQuotaSource
+		}
+		cfg.RuntimeQuotaSources[idx] = normalized
+		return nil
+	})
+	if errors.Is(err, errQuotaSourceNotFound) {
 		writeError(w, http.StatusNotFound, "quota source not found")
 		return
 	}
-
-	source := cfg.RuntimeQuotaSources[idx]
-	applyRuntimeQuotaSourcePatch(&source, patch)
-	normalized, err := normalizeRuntimeQuotaSourceConfig(source)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if errors.Is(err, errInvalidQuotaSource) {
+		writeError(w, http.StatusBadRequest, validationErr.Error())
 		return
 	}
-	cfg.RuntimeQuotaSources[idx] = normalized
-	if err := config.Save(cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to update quota source configuration")
 		return
 	}
 	count := s.SetRuntimeQuotaCollectors(cfg.RuntimeQuotaSources)
@@ -166,14 +186,19 @@ func (s *Server) handleRuntimeQuotaSourceDelete(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	cfg := config.Load()
-	if idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
+	errQuotaSourceNotFound := errors.New("quota source not found")
+	cfg, err := config.Update(func(cfg *config.Config) error {
+		if idx < 0 || idx >= len(cfg.RuntimeQuotaSources) {
+			return errQuotaSourceNotFound
+		}
+		cfg.RuntimeQuotaSources = append(cfg.RuntimeQuotaSources[:idx], cfg.RuntimeQuotaSources[idx+1:]...)
+		return nil
+	})
+	if errors.Is(err, errQuotaSourceNotFound) {
 		writeError(w, http.StatusNotFound, "quota source not found")
 		return
 	}
-
-	cfg.RuntimeQuotaSources = append(cfg.RuntimeQuotaSources[:idx], cfg.RuntimeQuotaSources[idx+1:]...)
-	if err := config.Save(cfg); err != nil {
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

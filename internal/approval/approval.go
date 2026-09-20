@@ -5,6 +5,18 @@ package approval
 import (
 	"context"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
+)
+
+// ApprovalSource identifies how an execution authorization was obtained.
+// Full-mode grants are broker-issued from an explicit user-selected policy;
+// they are not user prompt resolutions.
+type ApprovalSource string
+
+const (
+	ApprovalSourceUser             ApprovalSource = "user-prompt"
+	ApprovalSourceUserSelectedFull ApprovalSource = "user-selected-full"
 )
 
 // Outcome is the explicit choice supplied by an approval client.
@@ -38,30 +50,37 @@ type Draft struct {
 	RunID           string
 	// ToolCallID binds the approval to the exact model-issued call. Legacy
 	// requesters may leave it empty, but execution adapters should preserve it.
-	ToolCallID      string
-	ToolName        string
-	RedactedInput   string
-	InputDigest     string
-	DangerLevel     string
-	Scope           string
-	RememberAllowed bool
+	ToolCallID              string
+	ToolName                string
+	ExecutorID              string
+	RedactedInput           string
+	InputDigest             string
+	ExecutionPolicyRevision uint64
+	FullSelectionRevision   uint64
+	DangerLevel             string
+	Scope                   string
+	RememberAllowed         bool
 }
 
 // Pending is the immutable approval request returned by Broker.Open.
 type Pending struct {
-	ID              string
-	SessionID       string
-	SessionRevision uint64
-	RunID           string
-	ToolCallID      string
-	ToolName        string
-	RedactedInput   string
-	InputDigest     string
-	DangerLevel     string
-	Scope           string
-	RememberAllowed bool
-	CreatedAt       time.Time
-	ExpiresAt       time.Time
+	ID                      string
+	SessionID               string
+	SessionRevision         uint64
+	RunID                   string
+	ToolCallID              string
+	ToolName                string
+	ExecutorID              string
+	RedactedInput           string
+	InputDigest             string
+	ExecutionPolicyRevision uint64
+	FullSelectionRevision   uint64
+	ApprovalSource          ApprovalSource
+	DangerLevel             string
+	Scope                   string
+	RememberAllowed         bool
+	CreatedAt               time.Time
+	ExpiresAt               time.Time
 }
 
 // Decision is a session-bound, one-time response to a Pending approval.
@@ -86,6 +105,19 @@ type Resolution struct {
 type Requester interface {
 	Open(Draft) (Pending, error)
 	Await(context.Context, string, string) (Resolution, error)
+}
+
+// FullModeIssuer issues a no-prompt, one-call grant only for a validated
+// user-selected full-mode snapshot. Implementations must retain the grant so
+// it can be consumed exactly once by the execution boundary.
+type FullModeIssuer interface {
+	IssueFullModeGrant(Draft, executionpolicy.Snapshot) (Pending, error)
+}
+
+// FullModeGrantConsumer validates and atomically consumes a grant against the
+// exact pending metadata, expected tool identity/input, and run policy.
+type FullModeGrantConsumer interface {
+	ConsumeFullModeGrant(Pending, Draft, executionpolicy.Snapshot) error
 }
 
 // Allowed reports whether this resolution grants one execution.

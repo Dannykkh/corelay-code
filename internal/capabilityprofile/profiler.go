@@ -43,13 +43,15 @@ type WorkspaceFactory interface {
 }
 
 type ProbeExecution struct {
-	Target        TargetIdentity
-	PlanVersion   string
-	PlanDigest    string
-	Variant       HarnessVariant
-	Case          ProbeCase
-	Attempt       int
-	WorkspaceRoot string
+	Lessons          LessonPolicy
+	LessonEvaluation bool
+	Target           TargetIdentity
+	PlanVersion      string
+	PlanDigest       string
+	Variant          HarnessVariant
+	Case             ProbeCase
+	Attempt          int
+	WorkspaceRoot    string
 }
 
 type Executor interface {
@@ -97,6 +99,17 @@ func NewProfiler(workspaces WorkspaceFactory, executor Executor, config Profiler
 // errors become bounded observations and typed quarantine reasons; their text
 // is never copied into the profile.
 func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePlan) (CapabilityProfile, error) {
+	return p.run(ctx, target, plan, 0, false)
+}
+
+func (p *Profiler) RunWithLessons(ctx context.Context, target TargetIdentity, plan ProbePlan, lessons LessonPolicy) (CapabilityProfile, error) {
+	return p.run(ctx, target, plan, lessons, true)
+}
+
+func (p *Profiler) run(ctx context.Context, target TargetIdentity, plan ProbePlan, lessons LessonPolicy, lessonEvaluation bool) (CapabilityProfile, error) {
+	if !lessons.Valid() {
+		return CapabilityProfile{}, ErrInvalidProfile
+	}
 	if p == nil || p.workspaces == nil || p.executor == nil {
 		return CapabilityProfile{}, fmt.Errorf("capability profiler is not initialized")
 	}
@@ -147,10 +160,22 @@ func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePla
 			}
 
 			observed, executeErr := p.executor.Execute(ctx, ProbeExecution{
+				Lessons: lessons, LessonEvaluation: lessonEvaluation,
 				Target: target, PlanVersion: plan.Version(), PlanDigest: plan.Digest(),
 				Variant: plan.Variant(), Case: probeCase, Attempt: attempt, WorkspaceRoot: lease.Root(),
 			})
+			if err := ctx.Err(); err != nil {
+				_ = lease.Close()
+				return CapabilityProfile{}, err
+			}
+			if lessonEvaluation && observed.LessonDigest != lessons.Digest() {
+				_ = lease.Close()
+				return CapabilityProfile{}, fmt.Errorf("executor did not attest the evaluated lesson policy")
+			}
 			record := normalizeObservation(probeCase, attempt, proof.WorkspaceDigest, observed, executeErr != nil)
+			if lessonEvaluation {
+				record.LessonDigest = lessons.Digest()
+			}
 			observations = append(observations, record)
 			if !reportedObservationValid(observed) {
 				reasons = append(reasons, QuarantineSchemaMismatch)
@@ -189,6 +214,7 @@ func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePla
 		SchemaVersion: CurrentProfileSchemaVersion,
 		Target:        target.Snapshot(),
 		Provenance: ProfileProvenance{
+			Lessons:         lessons,
 			ProfilerVersion: ProfilerImplementationVersion,
 			PlanVersion:     plan.Version(), PlanDigest: plan.Digest(),
 			FixtureDigest: plan.FixtureDigest(), Variant: plan.Variant(),
@@ -203,6 +229,9 @@ func (p *Profiler) Run(ctx context.Context, target TargetIdentity, plan ProbePla
 		Verified:              verified, QuarantineReasons: reasons,
 		Metrics: metricsFor(observations), Recommendations: recommend(observations),
 		Observations: observations,
+	}
+	if lessonEvaluation {
+		snapshot.Provenance.LessonDigest = lessons.Digest()
 	}
 	return profileFromSnapshot(snapshot, true)
 }

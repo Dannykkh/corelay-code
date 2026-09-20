@@ -178,6 +178,9 @@ func TestCheckPermissionRejectsMalformedAmbiguousAndUnsafeGlobInputs(t *testing.
 		{"non-string grep path", "Grep", json.RawMessage(`{"pattern":"x","path":42}`)},
 		{"malformed glob", "Glob", json.RawMessage(`{"pattern":"["}`)},
 		{"post-wildcard traversal", "Glob", json.RawMessage(`{"pattern":"sub*/../../outside/*.txt"}`)},
+		{"git commit without explicit staged scope", "GitCommit", json.RawMessage(`{"message":"commit"}`)},
+		{"git commit wildcard path", "GitCommit", json.RawMessage(`{"message":"commit","files":"src/**"}`)},
+		{"git commit pathspec magic", "GitCommit", json.RawMessage(`{"message":"commit","files":":(exclude)src"}`)},
 		{"trailing JSON", "LS", json.RawMessage(`{} {}`)},
 	}
 	for _, test := range tests {

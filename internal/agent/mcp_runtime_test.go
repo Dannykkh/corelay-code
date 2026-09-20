@@ -32,6 +32,7 @@ func (*secureTestMCPRunner) Name() string { return "test-secure-mcp" }
 func (*secureTestMCPRunner) Capabilities() sandbox.Capabilities {
 	return sandbox.Capabilities{
 		ProcessIsolation:     true,
+		FilesystemIsolation:  true,
 		ProcessTreeKill:      true,
 		EnvironmentFiltering: true,
 		Timeouts:             true,
@@ -286,6 +287,54 @@ func TestRunLoopRejectsRunOwnedMCPCatalogCollisionBeforeProvider(t *testing.T) {
 	}
 	if calls := len(provider.requestsSnapshot()); calls != 0 || !strings.Contains(failure, "reserved built-in") {
 		t.Fatalf("provider calls=%d failure=%q", calls, failure)
+	}
+}
+
+func TestRunLoopWorkspaceMCPRequiresFilesystemIsolationBeforeStart(t *testing.T) {
+	isolateEvidenceLoopTest(t)
+	provider := &responsePolicyTestProvider{steps: []responsePolicyStep{{visible: "must-not-run"}}}
+	mainRunner := &fakeBashRunner{name: "job-only", capabilities: fakeBashCapabilities()}
+	executionPolicy, err := ResolveExecutionPolicy(
+		ExecutionPolicyRequest{Mode: ExecutionModeWorkspace}, "", mainRunner.Capabilities(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpExecution := MCPExecutionOptions{
+		Context: context.Background(),
+		Runner:  processsupervisor.NewUnavailableRunner("test runner has no filesystem isolation"),
+		Policy:  sandbox.Policy{Enforcement: sandbox.EnforcementPreferred},
+	}
+	factoryCalls := 0
+	events := make(chan Event, 32)
+	go RunLoopWithOptions(
+		context.Background(), provider, "mcp-workspace-model",
+		[]types.Message{{Role: "user", Content: mustJSON("hello")}}, t.TempDir(),
+		RunOptions{
+			ExecutionPolicy:     &executionPolicy,
+			SandboxRunner:       mainRunner,
+			SandboxPolicy:       fakeBashPolicy(sandbox.EnforcementPreferred),
+			DisableWorkspaceMCP: true,
+			MCPServers:          []MCPServerSpec{{Name: "external", Command: "server"}},
+			MCPExecution:        &mcpExecution,
+			MCPRuntimeFactory: func(
+				context.Context, string, []MCPServerSpec, MCPExecutionOptions,
+			) (MCPRuntime, error) {
+				factoryCalls++
+				return nil, errors.New("factory must not run")
+			},
+		},
+		events,
+	)
+	var failure string
+	for event := range events {
+		if event.Type == "error" {
+			failure, _ = event.Data.(string)
+		}
+	}
+	if factoryCalls != 0 || len(provider.requestsSnapshot()) != 0 ||
+		!strings.Contains(failure, "requires filesystem isolation") {
+		t.Fatalf("factory calls=%d provider calls=%d failure=%q", factoryCalls, len(provider.requestsSnapshot()), failure)
 	}
 }
 

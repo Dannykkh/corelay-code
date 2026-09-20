@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/Dannykkh/corelay-code/internal/protocol"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
@@ -28,6 +30,9 @@ const (
 	maxSessionResultBlobBytes = 64 << 20
 	maxSessionResultStoreSize = 256 << 20
 	maxSessionResultBlobs     = 512
+	maxSessionImageBlobBytes  = protocol.MaxImageBytes
+	maxSessionImageStoreSize  = 256 << 20
+	maxSessionImageBlobs      = 512
 	maxSessionMemoryIDBytes   = 256
 	maxBlobPublishAttempts    = 16
 )
@@ -149,6 +154,310 @@ func (sm *SessionMemory) StoreResult(toolName string, result string) (string, bo
 	return reference, disposition == ToolResultPersisted
 }
 
+// StoreImage publishes a validated image into this exact session namespace and
+// returns content-free metadata. The bytes are never converted to text or
+// passed through tool-result redaction.
+func (sm *SessionMemory) StoreImage(mediaType string, data []byte) (SessionImageReference, error) {
+	if sm == nil || sm.initErr != nil || sm.mu == nil || sm.dir == "" ||
+		protocol.ValidateImageBytes(mediaType, data) != nil {
+		return SessionImageReference{}, ErrSessionImageReferenceInvalid
+	}
+	digestBytes := sha256.Sum256(data)
+	digest := hex.EncodeToString(digestBytes[:])
+	reference := SessionImageReference{Digest: "sha256:" + digest, MediaType: mediaType, Size: int64(len(data))}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if err := validateSessionMemoryDirectory(sm.root, sm.dir); err != nil {
+		return SessionImageReference{}, fmt.Errorf("session image store unavailable")
+	}
+	if err := sm.storeImageBlobLocked(digest, data); err != nil {
+		return SessionImageReference{}, fmt.Errorf("session image persistence failed")
+	}
+	return reference, nil
+}
+
+// LoadImage returns bytes only when the exact session namespace contains a
+// regular file whose digest, size, encoded format, and declared MIME all agree.
+func (sm *SessionMemory) LoadImage(reference SessionImageReference) ([]byte, error) {
+	if err := validateSessionImageReference(reference); err != nil {
+		return nil, err
+	}
+	if sm == nil || sm.initErr != nil || sm.mu == nil || sm.dir == "" {
+		return nil, fmt.Errorf("session image store unavailable")
+	}
+	digest := strings.TrimPrefix(reference.Digest, "sha256:")
+	path, err := sm.imageBlobPath(digest)
+	if err != nil {
+		return nil, fmt.Errorf("session image not found or invalid")
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if err := validateSessionMemoryDirectory(sm.root, sm.dir); err != nil {
+		return nil, fmt.Errorf("session image store unavailable")
+	}
+	data, _, err := readVerifiedBlob(path, digest, maxSessionImageBlobBytes)
+	if err != nil || int64(len(data)) != reference.Size || protocol.ValidateImageBytes(reference.MediaType, data) != nil {
+		return nil, fmt.Errorf("session image not found or invalid")
+	}
+	return data, nil
+}
+
+// ValidateImageReferences confirms that every reference in a transcript is
+// backed by a valid blob in this exact session namespace.
+func (sm *SessionMemory) ValidateImageReferences(messages []SessionMessage) error {
+	if err := ValidateSessionImageReferences(messages); err != nil {
+		return err
+	}
+	for _, reference := range sessionImageReferences(messages) {
+		if _, err := sm.LoadImage(reference); err != nil {
+			return fmt.Errorf("%w: referenced image is unavailable", ErrSessionImageReferenceInvalid)
+		}
+	}
+	return nil
+}
+
+// CleanupUnreferencedImages removes only verified image blobs that are not
+// named by the supplied committed transcript. It is used after a failed
+// pre-commit run preparation so rejected uploads cannot fill the session quota.
+func (sm *SessionMemory) CleanupUnreferencedImages(messages []SessionMessage) error {
+	if sm == nil || sm.initErr != nil || sm.mu == nil || sm.dir == "" {
+		return fmt.Errorf("session image store unavailable")
+	}
+	if err := ValidateSessionImageReferences(messages); err != nil {
+		return err
+	}
+	referenced := make(map[string]struct{})
+	for _, reference := range sessionImageReferences(messages) {
+		referenced[strings.TrimPrefix(reference.Digest, "sha256:")] = struct{}{}
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if err := validateSessionMemoryDirectory(sm.root, sm.dir); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(sm.dir)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "image_") || !strings.HasSuffix(name, ".blob") {
+			continue
+		}
+		digest := strings.TrimSuffix(strings.TrimPrefix(name, "image_"), ".blob")
+		path, err := sm.imageBlobPath(digest)
+		if err != nil {
+			return fmt.Errorf("session image store contains an invalid entry")
+		}
+		if _, _, err := readVerifiedBlob(path, digest, maxSessionImageBlobBytes); err != nil {
+			return fmt.Errorf("session image store contains an invalid entry")
+		}
+		if _, keep := referenced[digest]; keep {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return syncSessionMemoryDirectory(sm.dir)
+	}
+	return nil
+}
+
+// CloneImagesTo copies only the verified image references committed in the
+// parent transcript into another exact session namespace.
+func (sm *SessionMemory) CloneImagesTo(target *SessionMemory, references []SessionImageReference) error {
+	if sm == nil || target == nil || sm.initErr != nil || target.initErr != nil ||
+		sm.mu == nil || target.mu == nil || sm.dir == "" || target.dir == "" {
+		return fmt.Errorf("session image store unavailable")
+	}
+	unlock := lockSessionMemoryPair(sm, target)
+	defer unlock()
+	if err := validateSessionMemoryDirectory(sm.root, sm.dir); err != nil {
+		return err
+	}
+	if err := validateSessionMemoryDirectory(target.root, target.dir); err != nil {
+		return err
+	}
+	for _, reference := range references {
+		if err := validateSessionImageReference(reference); err != nil {
+			return err
+		}
+		digest := strings.TrimPrefix(reference.Digest, "sha256:")
+		sourcePath, err := sm.imageBlobPath(digest)
+		if err != nil {
+			return fmt.Errorf("invalid session image reference")
+		}
+		data, _, err := readVerifiedBlob(sourcePath, digest, maxSessionImageBlobBytes)
+		if err != nil || int64(len(data)) != reference.Size || protocol.ValidateImageBytes(reference.MediaType, data) != nil {
+			return fmt.Errorf("committed session image not found or invalid")
+		}
+		targetPath, err := target.imageBlobPath(digest)
+		if err != nil {
+			return fmt.Errorf("invalid session image reference")
+		}
+		if _, err := os.Lstat(targetPath); err == nil {
+			if _, _, verifyErr := readVerifiedBlob(targetPath, digest, maxSessionImageBlobBytes); verifyErr != nil {
+				return fmt.Errorf("target session image is invalid")
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect target session image")
+		}
+		count, total, err := target.imageUsageLocked()
+		if err != nil {
+			return err
+		}
+		if count >= maxSessionImageBlobs || total+int64(len(data)) > maxSessionImageStoreSize {
+			return fmt.Errorf("session image store quota exceeded")
+		}
+		if err := os.Link(sourcePath, targetPath); err == nil {
+			if err := syncSessionMemoryDirectory(target.dir); err != nil {
+				return err
+			}
+			if _, _, err := readVerifiedBlob(targetPath, digest, maxSessionImageBlobBytes); err != nil {
+				return fmt.Errorf("cloned session image is invalid")
+			}
+			continue
+		}
+		if err := target.storeImageBlobLocked(digest, data); err != nil {
+			return fmt.Errorf("clone committed session image")
+		}
+	}
+	return nil
+}
+
+func validateSessionImageReference(reference SessionImageReference) error {
+	if err := ValidateSessionImageReferences([]SessionMessage{{
+		Role: "user", Attachments: []SessionImageReference{reference},
+	}}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sm *SessionMemory) imageBlobPath(digest string) (string, error) {
+	if !validResultDigest(digest) || sm == nil || sm.dir == "" {
+		return "", fmt.Errorf("invalid session image digest")
+	}
+	path := filepath.Join(sm.dir, "image_"+digest+".blob")
+	relative, err := filepath.Rel(sm.dir, path)
+	if err != nil || relative != "image_"+digest+".blob" {
+		return "", fmt.Errorf("invalid session image path")
+	}
+	return path, nil
+}
+
+func (sm *SessionMemory) storeImageBlobLocked(digest string, data []byte) error {
+	if !validResultDigest(digest) || len(data) == 0 || len(data) > maxSessionImageBlobBytes {
+		return fmt.Errorf("invalid session image")
+	}
+	computed := sha256.Sum256(data)
+	if hex.EncodeToString(computed[:]) != digest {
+		return fmt.Errorf("session image digest mismatch")
+	}
+	target, err := sm.imageBlobPath(digest)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(target); err == nil {
+		existing, _, verifyErr := readVerifiedBlob(target, digest, maxSessionImageBlobBytes)
+		if verifyErr != nil || !bytes.Equal(existing, data) {
+			return fmt.Errorf("existing session image is invalid")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	count, total, err := sm.imageUsageLocked()
+	if err != nil {
+		return err
+	}
+	if count >= maxSessionImageBlobs || total+int64(len(data)) > maxSessionImageStoreSize {
+		return fmt.Errorf("session image store quota exceeded")
+	}
+	temp, err := sm.createBlobTempLocked()
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	cleanup := func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}
+	if _, err := io.Copy(temp, bytes.NewReader(data)); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := os.Link(tempPath, target); err != nil {
+		_ = os.Remove(tempPath)
+		if errors.Is(err, os.ErrExist) {
+			_, _, verifyErr := readVerifiedBlob(target, digest, maxSessionImageBlobBytes)
+			return verifyErr
+		}
+		return err
+	}
+	if err := os.Remove(tempPath); err != nil {
+		return err
+	}
+	if err := syncSessionMemoryDirectory(sm.dir); err != nil {
+		return err
+	}
+	_, _, err = readVerifiedBlob(target, digest, maxSessionImageBlobBytes)
+	return err
+}
+
+func (sm *SessionMemory) imageUsageLocked() (int, int64, error) {
+	entries, err := os.ReadDir(sm.dir)
+	if err != nil {
+		return 0, 0, err
+	}
+	count := 0
+	var total int64
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "image_") || !strings.HasSuffix(name, ".blob") {
+			continue
+		}
+		digest := strings.TrimSuffix(strings.TrimPrefix(name, "image_"), ".blob")
+		path, pathErr := sm.imageBlobPath(digest)
+		data, _, readErr := readVerifiedBlob(path, digest, maxSessionImageBlobBytes)
+		if pathErr != nil || readErr != nil {
+			return 0, 0, fmt.Errorf("session image store contains an invalid blob")
+		}
+		count++
+		total += int64(len(data))
+	}
+	return count, total, nil
+}
+
+// ImageStats returns the number and total size of verified images in this
+// session namespace.
+func (sm *SessionMemory) ImageStats() (int, int64) {
+	if sm == nil || sm.initErr != nil || sm.mu == nil {
+		return 0, 0
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	count, total, err := sm.imageUsageLocked()
+	if err != nil {
+		return 0, 0
+	}
+	return count, total
+}
+
 func (sm *SessionMemory) storeBlobLocked(id, result string) error {
 	target, err := sm.blobPath(id)
 	if err != nil {
@@ -252,8 +561,12 @@ func validResultDigest(id string) bool {
 }
 
 func readVerifiedResultBlob(path, expectedDigest string) ([]byte, os.FileInfo, error) {
+	return readVerifiedBlob(path, expectedDigest, maxSessionResultBlobBytes)
+}
+
+func readVerifiedBlob(path, expectedDigest string, maximum int64) ([]byte, os.FileInfo, error) {
 	lexical, err := os.Lstat(path)
-	if err != nil || lexical.Mode()&os.ModeSymlink != 0 || !lexical.Mode().IsRegular() || lexical.Size() <= 0 || lexical.Size() > maxSessionResultBlobBytes {
+	if err != nil || lexical.Mode()&os.ModeSymlink != 0 || !lexical.Mode().IsRegular() || lexical.Size() <= 0 || lexical.Size() > maximum {
 		return nil, nil, fmt.Errorf("invalid session result blob")
 	}
 	file, err := os.Open(path)
@@ -265,8 +578,8 @@ func readVerifiedResultBlob(path, expectedDigest string) ([]byte, os.FileInfo, e
 	if err != nil || !os.SameFile(lexical, opened) {
 		return nil, nil, fmt.Errorf("session result blob changed while opening")
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maxSessionResultBlobBytes+1))
-	if err != nil || int64(len(data)) != lexical.Size() || len(data) > maxSessionResultBlobBytes {
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil || int64(len(data)) != lexical.Size() || int64(len(data)) > maximum {
 		return nil, nil, fmt.Errorf("session result blob changed while reading")
 	}
 	digest := sha256.Sum256(data)
@@ -591,6 +904,17 @@ func (sm *SessionMemory) CleanupSafe() error {
 			info, infoErr := entry.Info()
 			if infoErr != nil || entry.Type()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 				return fmt.Errorf("unsafe session result temp entry")
+			}
+			paths = append(paths, path)
+			continue
+		}
+		if strings.HasPrefix(name, "image_") && strings.HasSuffix(name, ".blob") {
+			digest := strings.TrimSuffix(strings.TrimPrefix(name, "image_"), ".blob")
+			if !validResultDigest(digest) {
+				return fmt.Errorf("unrecognized session image entry")
+			}
+			if _, _, err := readVerifiedBlob(path, digest, maxSessionImageBlobBytes); err != nil {
+				return fmt.Errorf("invalid session image entry")
 			}
 			paths = append(paths, path)
 			continue

@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -361,9 +360,8 @@ func decodeDataURL(value string) (string, string, error) {
 		return "", "", NewError(400, "invalid_image_url", "data URL image media type is not supported")
 	}
 	data := value[comma+1:]
-	decoded, err := base64.StdEncoding.DecodeString(data)
-	if err != nil || len(decoded) > MaxStringBytes*4 {
-		return "", "", NewError(400, "invalid_image_url", "image data is invalid or exceeds the protocol limit")
+	if _, ok := decodeImageBase64(data); !ok {
+		return "", "", NewError(400, "invalid_image_url", "image data is invalid or exceeds the image byte limit")
 	}
 	return mediaType, data, nil
 }

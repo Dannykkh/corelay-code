@@ -51,13 +51,24 @@ func main() {
 		case "team":
 			runTeam(os.Args[2:])
 			return
+		case "version":
+			os.Exit(runVersion(os.Args[2:]))
+		case "doctor":
+			os.Exit(runDoctor(os.Args[2:]))
+		case "update":
+			os.Exit(runUpdate(os.Args[2:]))
+		case "update-helper":
+			os.Exit(runUpdateHelper(os.Args[2:]))
 		}
 	}
 
 	flag.Parse()
 
 	// Load saved config
-	cfg := config.Load()
+	cfg, _, err := config.LoadChecked()
+	if err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
 
 	// Apply defaults from config
 	if *port == 0 {
@@ -82,11 +93,13 @@ func main() {
 		*providerName, *model = interactiveSelect()
 
 		// Save choice
-		cfg.DefaultProvider = *providerName
-		cfg.DefaultModel = *model
-		cfg.Port = *port
-		cfg.RouterEnabled = *enableRouter
-		if err := config.Save(cfg); err != nil {
+		if _, err := config.Update(func(cfg *config.Config) error {
+			cfg.DefaultProvider = *providerName
+			cfg.DefaultModel = *model
+			cfg.Port = *port
+			cfg.RouterEnabled = *enableRouter
+			return nil
+		}); err != nil {
 			log.Printf("Warning: could not save config: %v", err)
 		} else {
 			fmt.Fprintf(os.Stderr, "  Config saved to %s\n", config.ConfigPath())
@@ -200,24 +213,43 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	// Auto-open the dashboard once on startup.
-	go tray.OpenBrowser(*port)
-
-	// System tray icon (Windows only; no-op elsewhere). Right-click → Open
-	// Dashboard / Quit Corelay Code. Quit pushes os.Interrupt into sigCh so the
-	// existing graceful drain path handles tear-down.
-	if err := tray.Run(*port,
-		func() { tray.OpenBrowser(*port) },
-		func() {
-			select {
-			case sigCh <- os.Interrupt:
-			default:
+	managedLeaseDir, managedIdleTimeout, managedChild := managedChildLeaseSettings()
+	var managedIdleLockCh chan *managedServerStartLock
+	var managedIdleDone chan struct{}
+	var cancelManagedIdle context.CancelFunc
+	if managedChild {
+		managedIdleLockCh = make(chan *managedServerStartLock, 1)
+		managedIdleDone = make(chan struct{})
+		idleCtx, cancel := context.WithCancel(context.Background())
+		cancelManagedIdle = cancel
+		go func() {
+			defer close(managedIdleDone)
+			if lock := waitForManagedChildIdle(idleCtx, managedLeaseDir, managedIdleTimeout); lock != nil {
+				managedIdleLockCh <- lock
+				select {
+				case sigCh <- os.Interrupt:
+				default:
+				}
 			}
-		},
-	); err != nil {
-		fmt.Fprintf(os.Stderr, "  Tray:      unavailable (%v)\n", err)
-	} else if tray.Active() {
-		fmt.Fprintf(os.Stderr, "  Tray:      enabled (right-click for menu)\n")
+		}()
+	} else {
+		// Auto-open and the system tray belong to an interactive server process.
+		// Managed chat children stay headless and shut down when their final client
+		// lease expires.
+		go tray.OpenBrowser(*port)
+		if err := tray.Run(*port,
+			func() { tray.OpenBrowser(*port) },
+			func() {
+				select {
+				case sigCh <- os.Interrupt:
+				default:
+				}
+			},
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "  Tray:      unavailable (%v)\n", err)
+		} else if tray.Active() {
+			fmt.Fprintf(os.Stderr, "  Tray:      enabled (right-click for menu)\n")
+		}
 	}
 
 	go func() {
@@ -227,6 +259,17 @@ func main() {
 	}()
 
 	<-sigCh
+	if cancelManagedIdle != nil {
+		cancelManagedIdle()
+		<-managedIdleDone
+	}
+	var managedIdleLock *managedServerStartLock
+	if managedIdleLockCh != nil {
+		select {
+		case managedIdleLock = <-managedIdleLockCh:
+		default:
+		}
+	}
 	fmt.Fprintf(os.Stderr, "\n  Shutting down...\n")
 	tray.Stop()
 
@@ -251,6 +294,16 @@ func main() {
 	}
 	srv.StopRuntimeQuotaCollectors()
 	agent.DisconnectAllMCP()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: HTTP server shutdown did not finish cleanly: %v\n", err)
+	}
+	cancelShutdown()
+	if managedIdleLock != nil {
+		if err := managedIdleLock.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not release managed server startup lock: %v\n", err)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "  Goodbye.\n")
 }
 
@@ -263,6 +316,9 @@ func printRootUsage(out io.Writer) {
 	fmt.Fprintln(out, "  corelaycode chat -p <prompt>      One-shot terminal client")
 	fmt.Fprintln(out, "  corelaycode worker [flags]        Run a worker client")
 	fmt.Fprintln(out, "  corelaycode team [flags]          Run a team client")
+	fmt.Fprintln(out, "  corelaycode version               Show CLI version and build commit")
+	fmt.Fprintln(out, "  corelaycode doctor [flags]        Inspect local capabilities and server health")
+	fmt.Fprintln(out, "  corelaycode update [flags]        Verify and install an explicit local artifact")
 	fmt.Fprintln(out, "\nServer flags:")
 	flag.CommandLine.SetOutput(out)
 	flag.CommandLine.PrintDefaults()

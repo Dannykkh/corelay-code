@@ -3,9 +3,9 @@
 // second agent loop: production execution delegates directly to
 // agent.RunLoopWithOptions.
 //
-// Client-supplied stdio MCP definitions remain in runtime session state and
-// are passed to the existing agent loop as an exact run-owned catalog. HTTP
-// and SSE MCP transports remain capability-gated and fail closed.
+// Client-supplied MCP definitions remain in runtime session state and are
+// passed to the existing agent loop as an exact run-owned catalog. HTTP uses
+// the bounded streamable transport; legacy SSE remains capability-gated.
 package acpbridge
 
 import (
@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -129,18 +130,19 @@ type Backend struct {
 }
 
 type runtimeSession struct {
-	persisted   agent.Session
-	toolResults *agent.SessionMemory
-	resultRefs  []agent.ToolResultReference
-	mcpServers  []agent.MCPServerSpec
-	mcpRuntime  agent.MCPRuntime
-	mcpCancel   context.CancelFunc
-	reasoning   string
-	cancel      context.CancelFunc
-	done        chan struct{}
-	activeID    string
-	loading     bool
-	quarantined bool
+	persisted      agent.Session
+	toolResults    *agent.SessionMemory
+	resultRefs     []agent.ToolResultReference
+	mcpServers     []agent.MCPServerSpec
+	mcpRuntime     agent.MCPRuntime
+	mcpCancel      context.CancelFunc
+	reasoning      string
+	cancel         context.CancelFunc
+	done           chan struct{}
+	activeID       string
+	loading        bool
+	promptStarting bool
+	quarantined    bool
 }
 
 // promptExecutionJournal is the ACP composition for the shared kernel's
@@ -446,10 +448,8 @@ func (b *Backend) Descriptor() acp.BackendDescriptor {
 			Title:   "Corelay Code",
 			Version: b.version,
 		},
-		// The current RunLoop accepts text prompts and stable stdio MCP. HTTP
-		// and SSE remain false until their transports have run-owned support.
 		PromptCapabilities: acp.PromptCapabilities{},
-		MCPCapabilities:    acp.MCPCapabilities{},
+		MCPCapabilities:    acp.MCPCapabilities{HTTP: true},
 	}
 }
 
@@ -476,11 +476,16 @@ func (b *Backend) NewSession(
 	if err != nil {
 		return acp.NewSessionResponse{}, invalidParams("invalid workspace")
 	}
+	executionPolicy, err := resolveSessionExecutionPolicy(workspace, agent.ExecutionPolicyRequest{})
+	if err != nil {
+		return acp.NewSessionResponse{}, internalFailure()
+	}
 	session := agent.Session{
-		Workspace: workspace,
-		Messages:  []agent.SessionMessage{},
-		Provider:  b.provider.Name(),
-		Model:     b.defaultModel,
+		Workspace:       workspace,
+		ExecutionPolicy: &executionPolicy,
+		Messages:        []agent.SessionMessage{},
+		Provider:        b.provider.Name(),
+		Model:           b.defaultModel,
 	}
 	if err := b.store.SaveExpected(&session, 0); err != nil {
 		return acp.NewSessionResponse{}, mapStoreError(err)
@@ -497,7 +502,9 @@ func (b *Backend) NewSession(
 	}
 	options := b.configOptionsLocked(b.sessions[session.ID])
 	b.mu.Unlock()
-	return acp.NewSessionResponse{SessionID: session.ID, ConfigOptions: options}, nil
+	return acp.NewSessionResponse{
+		SessionID: session.ID, Modes: sessionModeState(executionPolicy), ConfigOptions: options,
+	}, nil
 }
 
 func (b *Backend) LoadSession(
@@ -525,6 +532,21 @@ func (b *Backend) LoadSession(
 	if err := b.validateLoadable(*persisted); err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
+	if persisted.ExecutionPolicy == nil {
+		// Older durable sessions predate mode selection. They resume with the
+		// compatibility workspace policy; a later transcript or mode save makes
+		// that effective snapshot durable without silently selecting full mode.
+		defaultPolicy, policyErr := resolveSessionExecutionPolicy(
+			persisted.Workspace,
+			agent.ExecutionPolicyRequest{},
+		)
+		if policyErr != nil {
+			return acp.LoadSessionResponse{}, internalFailure()
+		}
+		persisted.ExecutionPolicy = &defaultPolicy
+	} else if err := agent.ValidateExecutionPolicySnapshot(*persisted.ExecutionPolicy); err != nil {
+		return acp.LoadSessionResponse{}, invalidRequest("session execution policy is invalid")
+	}
 	if persisted.Model == "" {
 		persisted.Model = b.defaultModel
 	}
@@ -538,7 +560,7 @@ func (b *Backend) LoadSession(
 
 	b.mu.Lock()
 	state := b.sessions[request.SessionID]
-	if state != nil && (state.cancel != nil || state.loading || state.quarantined) {
+	if state != nil && (state.cancel != nil || state.promptStarting || state.loading || state.quarantined) {
 		b.mu.Unlock()
 		return acp.LoadSessionResponse{}, invalidRequest("session is active or requires recovery")
 	}
@@ -549,18 +571,19 @@ func (b *Backend) LoadSession(
 		b.sessions[request.SessionID] = state
 	} else {
 		previous = runtimeSession{
-			persisted:   cloneSession(state.persisted),
-			toolResults: state.toolResults,
-			resultRefs:  append([]agent.ToolResultReference(nil), state.resultRefs...),
-			mcpServers:  cloneSessionMCPServers(state.mcpServers),
-			mcpRuntime:  state.mcpRuntime,
-			mcpCancel:   state.mcpCancel,
-			reasoning:   state.reasoning,
-			cancel:      state.cancel,
-			done:        state.done,
-			activeID:    state.activeID,
-			loading:     state.loading,
-			quarantined: state.quarantined,
+			persisted:      cloneSession(state.persisted),
+			toolResults:    state.toolResults,
+			resultRefs:     append([]agent.ToolResultReference(nil), state.resultRefs...),
+			mcpServers:     cloneSessionMCPServers(state.mcpServers),
+			mcpRuntime:     state.mcpRuntime,
+			mcpCancel:      state.mcpCancel,
+			reasoning:      state.reasoning,
+			cancel:         state.cancel,
+			done:           state.done,
+			activeID:       state.activeID,
+			loading:        state.loading,
+			promptStarting: state.promptStarting,
+			quarantined:    state.quarantined,
 		}
 		state.loading = true
 	}
@@ -594,6 +617,7 @@ func (b *Backend) LoadSession(
 		return acp.LoadSessionResponse{}, internalFailure()
 	}
 	state.loading = false
+	loadedPolicy := *state.persisted.ExecutionPolicy
 	b.mu.Unlock()
 	if previous.mcpCancel != nil {
 		previous.mcpCancel()
@@ -601,7 +625,94 @@ func (b *Backend) LoadSession(
 	if previous.mcpRuntime != nil {
 		previous.mcpRuntime.Close()
 	}
-	return acp.LoadSessionResponse{ConfigOptions: options}, nil
+	return acp.LoadSessionResponse{
+		Modes: sessionModeState(loadedPolicy), ConfigOptions: options,
+	}, nil
+}
+
+// SetSessionMode is the explicit user-choice boundary for durable ACP session
+// authority. Full mode is available only through this request and remains
+// bound to the current OS user's existing credentials.
+func (b *Backend) SetSessionMode(
+	ctx context.Context,
+	request acp.SetSessionModeRequest,
+	client acp.Client,
+) (acp.SetSessionModeResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return acp.SetSessionModeResponse{}, err
+	}
+	mode := agent.ExecutionMode(request.ModeID)
+	if mode != agent.ExecutionModeReadOnly && mode != agent.ExecutionModeWorkspace && mode != agent.ExecutionModeFull {
+		return acp.SetSessionModeResponse{}, invalidParams("execution mode is not available")
+	}
+
+	b.mu.Lock()
+	state := b.sessions[request.SessionID]
+	if state == nil {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, notFound("session not found")
+	}
+	if state.loading || state.quarantined || state.persisted.ReconcileRequired {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, invalidRequest("session requires explicit recovery")
+	}
+	if state.cancel != nil || state.promptStarting {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, invalidRequest("session has an active prompt")
+	}
+	currentPolicy := state.persisted.ExecutionPolicy
+	if currentPolicy == nil {
+		defaultPolicy, err := resolveSessionExecutionPolicy(
+			state.persisted.Workspace,
+			agent.ExecutionPolicyRequest{},
+		)
+		if err != nil {
+			b.mu.Unlock()
+			return acp.SetSessionModeResponse{}, internalFailure()
+		}
+		currentPolicy = &defaultPolicy
+	}
+	if currentPolicy.Revision == ^uint64(0) {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, invalidRequest("execution policy revision is exhausted")
+	}
+	nextPolicy, err := resolveSessionExecutionPolicy(
+		state.persisted.Workspace,
+		agent.ExecutionPolicyRequest{Mode: mode, Revision: currentPolicy.Revision + 1},
+	)
+	if err != nil {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, invalidParams("execution mode is not available")
+	}
+	candidate := cloneSession(state.persisted)
+	candidate.ExecutionPolicy = &nextPolicy
+	if err := b.store.SaveExpected(&candidate, state.persisted.Revision); err != nil {
+		b.mu.Unlock()
+		return acp.SetSessionModeResponse{}, mapStoreError(err)
+	}
+	state.persisted = cloneSession(candidate)
+	previousRuntime := state.mcpRuntime
+	previousCancel := state.mcpCancel
+	state.mcpRuntime = nil
+	state.mcpCancel = nil
+	b.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
+	if previousRuntime != nil {
+		previousRuntime.Close()
+	}
+
+	if err := client.SessionUpdate(ctx, acp.SessionNotification{
+		SessionID: request.SessionID,
+		Update: acp.SessionUpdate{
+			SessionUpdate: "current_mode_update",
+			CurrentModeID: string(nextPolicy.Mode),
+		},
+	}); err != nil {
+		return acp.SetSessionModeResponse{}, err
+	}
+	return acp.SetSessionModeResponse{}, nil
 }
 
 func (b *Backend) ListSessions(
@@ -702,7 +813,7 @@ func (b *Backend) DeleteSession(
 	}
 	state := b.sessions[request.SessionID]
 	if state != nil {
-		if state.loading || state.quarantined || state.cancel != nil {
+		if state.loading || state.quarantined || state.cancel != nil || state.promptStarting {
 			b.mu.Unlock()
 			return acp.DeleteSessionResponse{}, invalidRequest("session is active or requires recovery")
 		}
@@ -735,7 +846,7 @@ func (b *Backend) CloseSession(
 	state := b.sessions[request.SessionID]
 	var done <-chan struct{}
 	if state != nil {
-		if state.loading || state.quarantined {
+		if state.loading || state.quarantined || state.promptStarting {
 			b.mu.Unlock()
 			return acp.CloseSessionResponse{}, invalidRequest("session is loading or requires recovery")
 		}
@@ -793,7 +904,7 @@ func (b *Backend) SetSessionConfigOption(
 		b.mu.Unlock()
 		return acp.SetSessionConfigOptionResponse{}, invalidRequest("session requires explicit recovery")
 	}
-	if state.cancel != nil {
+	if state.cancel != nil || state.promptStarting {
 		b.mu.Unlock()
 		return acp.SetSessionConfigOptionResponse{}, invalidRequest("session has an active prompt")
 	}
@@ -860,15 +971,36 @@ func (b *Backend) Prompt(
 		b.mu.Unlock()
 		return acp.PromptResponse{}, invalidRequest("session requires explicit recovery before another prompt")
 	}
-	if state.cancel != nil {
+	if state.cancel != nil || state.promptStarting {
 		b.mu.Unlock()
 		return acp.PromptResponse{}, invalidRequest("session already has an active prompt")
 	}
 	persisted := cloneSession(state.persisted)
+	if err := validateACPWorkflowSupport(persisted); err != nil {
+		b.mu.Unlock()
+		return acp.PromptResponse{}, err
+	}
+	if persisted.ExecutionPolicy == nil || agent.ValidateExecutionPolicySnapshot(*persisted.ExecutionPolicy) != nil {
+		b.mu.Unlock()
+		return acp.PromptResponse{}, invalidRequest("session execution policy is unavailable")
+	}
+	state.promptStarting = true
+	executionPolicy := *persisted.ExecutionPolicy
 	reasoning := state.reasoning
 	toolResults := state.toolResults
 	resultRefs := append([]agent.ToolResultReference(nil), state.resultRefs...)
 	b.mu.Unlock()
+	startingReservation := true
+	defer func() {
+		if !startingReservation {
+			return
+		}
+		b.mu.Lock()
+		if current := b.sessions[request.SessionID]; current == state && current.promptStarting {
+			current.promptStarting = false
+		}
+		b.mu.Unlock()
+	}()
 
 	activeID, promptCtx, release, err := b.loops.Register(ctx, persisted.Workspace)
 	if err != nil {
@@ -884,12 +1016,14 @@ func (b *Backend) Prompt(
 	done := make(chan struct{})
 	cancel := func() { b.loops.Cancel(activeID) }
 	b.mu.Lock()
-	if current := b.sessions[request.SessionID]; current != state || current.cancel != nil {
+	if current := b.sessions[request.SessionID]; current != state || current.cancel != nil || !current.promptStarting {
 		b.mu.Unlock()
 		release()
 		return acp.PromptResponse{}, invalidRequest("session already has an active prompt")
 	}
 	state.cancel = cancel
+	state.promptStarting = false
+	startingReservation = false
 	state.done = done
 	state.activeID = activeID
 	b.mu.Unlock()
@@ -909,9 +1043,14 @@ func (b *Backend) Prompt(
 		return acp.PromptResponse{}, err
 	}
 
-	runMCP, err := b.sessionMCPRuntime(promptCtx, request.SessionID, state, persisted.Workspace)
-	if err != nil {
-		return acp.PromptResponse{}, err
+	var runMCP agent.MCPRuntime
+	if executionPolicy.Mode != agent.ExecutionModeReadOnly {
+		runMCP, err = b.sessionMCPRuntime(
+			promptCtx, request.SessionID, state, persisted.Workspace, executionPolicy,
+		)
+		if err != nil {
+			return acp.PromptResponse{}, err
+		}
 	}
 
 	messages := sessionMessagesForRun(persisted.Messages)
@@ -949,16 +1088,19 @@ func (b *Backend) Prompt(
 		persisted.Revision,
 		b.approvalTTL,
 	)
-	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(persisted.Workspace)
+	defer requester.Shutdown()
+	sandboxRunner, sandboxPolicy := agent.SandboxExecutionForMode(persisted.Workspace, executionPolicy.Mode)
 	executionJournal := newPromptExecutionJournal(
 		b, request.SessionID, state, activeID, persisted,
 	)
 	events, err := b.runner.Start(promptCtx, b.provider, persisted.Model, messages, persisted.Workspace, agent.RunOptions{
 		SessionID:            activeID,
+		SessionRevision:      persisted.Revision,
 		ApprovalRequester:    requester,
 		ResponseLang:         b.responseLang,
 		DisableWorkspaceMCP:  true,
 		MCPRuntime:           runMCP,
+		ExecutionPolicy:      &executionPolicy,
 		SandboxRunner:        sandboxRunner,
 		SandboxPolicy:        sandboxPolicy,
 		ToolResultStore:      toolResults,
@@ -1145,6 +1287,7 @@ func (b *Backend) sessionMCPRuntime(
 	sessionID string,
 	expected *runtimeSession,
 	workspace string,
+	executionPolicy agent.ExecutionPolicySnapshot,
 ) (agent.MCPRuntime, error) {
 	b.mu.Lock()
 	state := b.sessions[sessionID]
@@ -1156,6 +1299,9 @@ func (b *Backend) sessionMCPRuntime(
 		if state.mcpRuntime.Healthy() {
 			runtime := state.mcpRuntime
 			b.mu.Unlock()
+			if err := validateSessionMCPRuntime(runtime, executionPolicy); err != nil {
+				return nil, err
+			}
 			return runtime, nil
 		}
 		staleRuntime := state.mcpRuntime
@@ -1168,14 +1314,14 @@ func (b *Backend) sessionMCPRuntime(
 			staleCancel()
 		}
 		staleRuntime.Close()
-		return b.createSessionMCPRuntime(ctx, sessionID, expected, workspace, servers)
+		return b.createSessionMCPRuntime(ctx, sessionID, expected, workspace, servers, executionPolicy)
 	}
 	servers := cloneSessionMCPServers(state.mcpServers)
 	b.mu.Unlock()
 	if len(servers) == 0 {
 		return nil, nil
 	}
-	return b.createSessionMCPRuntime(ctx, sessionID, expected, workspace, servers)
+	return b.createSessionMCPRuntime(ctx, sessionID, expected, workspace, servers, executionPolicy)
 }
 
 func (b *Backend) createSessionMCPRuntime(
@@ -1184,13 +1330,32 @@ func (b *Backend) createSessionMCPRuntime(
 	expected *runtimeSession,
 	workspace string,
 	servers []agent.MCPServerSpec,
+	executionPolicy agent.ExecutionPolicySnapshot,
 ) (agent.MCPRuntime, error) {
 	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
-	execution := agent.DefaultMCPExecutionOptions(lifetimeCtx, workspace)
-	if configured := cloneMCPExecutionOptions(b.mcpExecution); configured != nil {
-		execution = *configured
-		execution.Context = lifetimeCtx
+	var execution agent.MCPExecutionOptions
+	switch executionPolicy.Mode {
+	case agent.ExecutionModeFull:
+		execution = agent.FullModeMCPExecutionOptions(lifetimeCtx, executionPolicy)
+	case agent.ExecutionModeWorkspace:
+		execution = agent.DefaultMCPExecutionOptions(lifetimeCtx, workspace)
+		if configured := cloneMCPExecutionOptions(b.mcpExecution); configured != nil {
+			execution = *configured
+			execution.Context = lifetimeCtx
+		}
+	default:
+		lifetimeCancel()
+		return nil, invalidRequest("read-only mode does not start MCP processes")
 	}
+	if execution.Runner == nil || (execution.Policy.Enforcement == "disabled" && executionPolicy.Mode != agent.ExecutionModeFull) {
+		lifetimeCancel()
+		return nil, invalidRequest("workspace MCP runner is unavailable")
+	}
+	if executionPolicy.Mode == agent.ExecutionModeWorkspace && requiresMCPFilesystemIsolation(servers) && !execution.Runner.Capabilities().FilesystemIsolation {
+		lifetimeCancel()
+		return nil, invalidRequest("workspace MCP execution requires filesystem isolation")
+	}
+	execution.ExecutionPolicy = executionPolicy
 	factory := b.mcpRuntimeFactory
 	if factory == nil {
 		factory = agent.NewMCPRuntime
@@ -1231,6 +1396,33 @@ func (b *Backend) createSessionMCPRuntime(
 	state.mcpCancel = lifetimeCancel
 	b.mu.Unlock()
 	return runtime, nil
+}
+
+func validateSessionMCPRuntime(
+	runtime agent.MCPRuntime,
+	executionPolicy agent.ExecutionPolicySnapshot,
+) error {
+	if executionPolicy.Mode != agent.ExecutionModeWorkspace || runtime == nil || runtime.ServerCount() == 0 {
+		return nil
+	}
+	provider, ok := runtime.(agent.MCPRuntimeExecutionCapabilityProvider)
+	requiresIsolation := true
+	if scope, scopeOK := runtime.(agent.MCPRuntimeFilesystemIsolationProvider); scopeOK {
+		requiresIsolation = scope.RequiresFilesystemIsolation()
+	}
+	if requiresIsolation && (!ok || !provider.ExecutionCapabilities().FilesystemIsolation) {
+		return invalidRequest("workspace MCP runtime cannot prove filesystem isolation")
+	}
+	return nil
+}
+
+func requiresMCPFilesystemIsolation(servers []agent.MCPServerSpec) bool {
+	for _, server := range servers {
+		if strings.TrimSpace(server.Type) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Backend) CancelSession(_ context.Context, notification acp.CancelNotification) error {
@@ -1721,6 +1913,9 @@ func (b *Backend) markInterrupted(sessionID string, marker agent.SessionInterrup
 }
 
 func (b *Backend) validateLoadable(session agent.Session) error {
+	if err := validateACPWorkflowSupport(session); err != nil {
+		return err
+	}
 	if session.Provider != "" && session.Provider != b.provider.Name() {
 		return invalidRequest("session belongs to another provider")
 	}
@@ -1736,6 +1931,13 @@ func (b *Backend) validateLoadable(session agent.Session) error {
 	}
 	if session.LifecycleStatus == agent.SessionLifecycleClosed {
 		return invalidRequest("session is closed")
+	}
+	return nil
+}
+
+func validateACPWorkflowSupport(session agent.Session) error {
+	if session.WorkstreamID != "" || session.PlanID != "" || session.PlanRevision != 0 || session.StageID != "" {
+		return invalidRequest("workflow-bound sessions are unsupported over ACP; use the HTTP/Web workflow execution surface")
 	}
 	return nil
 }
@@ -1759,6 +1961,37 @@ func (b *Backend) configOptionsLocked(state *runtimeSession) []acp.SessionConfig
 			Options: []acp.SessionConfigSelectOption{
 				{Value: defaultReasoningMode, Name: "Hidden"},
 				{Value: progressReasoningMode, Name: "Progress only"},
+			},
+		},
+	}
+}
+
+func resolveSessionExecutionPolicy(
+	workspace string,
+	request agent.ExecutionPolicyRequest,
+) (agent.ExecutionPolicySnapshot, error) {
+	runner, _ := agent.SandboxExecutionForMode(workspace, request.Mode)
+	return agent.ResolveExecutionPolicy(request, "", runner.Capabilities())
+}
+
+func sessionModeState(policy agent.ExecutionPolicySnapshot) *acp.SessionModeState {
+	return &acp.SessionModeState{
+		CurrentModeID: string(policy.Mode),
+		AvailableModes: []acp.SessionMode{
+			{
+				ID:          string(agent.ExecutionModeReadOnly),
+				Name:        "Read only",
+				Description: "Inspect and explain; changes and commands are blocked.",
+			},
+			{
+				ID:          string(agent.ExecutionModeWorkspace),
+				Name:        "Workspace",
+				Description: "Work within the selected workspace under its execution policy.",
+			},
+			{
+				ID:          string(agent.ExecutionModeFull),
+				Name:        "Full access",
+				Description: "Use the current OS user's permissions without elevating credentials.",
 			},
 		},
 	}
@@ -1935,6 +2168,10 @@ func sessionMessagesForRun(messages []agent.SessionMessage) []types.Message {
 
 func cloneSession(session agent.Session) agent.Session {
 	copySession := session
+	if session.ExecutionPolicy != nil {
+		policy := *session.ExecutionPolicy
+		copySession.ExecutionPolicy = &policy
+	}
 	copySession.Messages = append([]agent.SessionMessage(nil), session.Messages...)
 	return copySession
 }
@@ -1943,18 +2180,45 @@ func sessionMCPServerSpecs(servers []acp.MCPServer) ([]agent.MCPServerSpec, erro
 	specs := make([]agent.MCPServerSpec, 0, len(servers))
 	seenServers := make(map[string]struct{}, len(servers))
 	for _, server := range servers {
-		if server.Type != "" {
-			return nil, invalidParams("only stdio MCP servers are supported")
+		kind := strings.ToLower(strings.TrimSpace(server.Type))
+		if kind != "" && kind != "http" {
+			return nil, invalidParams("MCP server transport is not supported")
 		}
-		if !validMCPWireString(server.Name, 256) || !validMCPWireString(server.Command, 4096) ||
-			server.Args == nil || server.Env == nil || len(server.Args) > 256 || len(server.Env) > 256 ||
-			server.URL != "" || len(server.Headers) != 0 {
-			return nil, invalidParams("stdio MCP server configuration is invalid")
+		if !validMCPWireString(server.Name, 256) {
+			return nil, invalidParams("MCP server name is invalid")
 		}
 		if _, duplicate := seenServers[server.Name]; duplicate {
 			return nil, invalidParams("duplicate MCP server name")
 		}
 		seenServers[server.Name] = struct{}{}
+		if kind == "http" {
+			parsed, err := url.Parse(server.URL)
+			if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+				server.Command != "" || len(server.Args) != 0 || len(server.Env) != 0 || server.Headers == nil || len(server.Headers) > 128 {
+				return nil, invalidParams("HTTP MCP server configuration is invalid")
+			}
+			headers := make(map[string]string, len(server.Headers))
+			for _, header := range server.Headers {
+				if !validMCPWireString(header.Name, 256) || len(header.Value) > acp.MaxStringBytes || !utf8.ValidString(header.Value) {
+					return nil, invalidParams("HTTP MCP server header is invalid")
+				}
+				identity := strings.ToLower(header.Name)
+				if _, duplicate := headers[identity]; duplicate {
+					return nil, invalidParams("duplicate HTTP MCP header")
+				}
+				switch identity {
+				case "host", "content-length", "transfer-encoding", "connection", "upgrade":
+					return nil, invalidParams("reserved HTTP MCP header")
+				}
+				headers[header.Name] = header.Value
+			}
+			specs = append(specs, agent.MCPServerSpec{Name: server.Name, Type: "http", URL: server.URL, Headers: headers})
+			continue
+		}
+		if !validMCPWireString(server.Command, 4096) || server.Args == nil || server.Env == nil || len(server.Args) > 256 || len(server.Env) > 256 ||
+			server.URL != "" || len(server.Headers) != 0 {
+			return nil, invalidParams("stdio MCP server configuration is invalid")
+		}
 		args := append([]string(nil), server.Args...)
 		for _, argument := range args {
 			if len(argument) > 4096 || !utf8.ValidString(argument) || strings.IndexByte(argument, 0) >= 0 {
@@ -1980,11 +2244,11 @@ func sessionMCPServerSpecs(servers []acp.MCPServer) ([]agent.MCPServerSpec, erro
 			environment[variable.Name] = variable.Value
 		}
 		specs = append(specs, agent.MCPServerSpec{
-			Name: server.Name, Command: server.Command, Args: args, Env: environment,
+			Name: server.Name, Type: "", Command: server.Command, Args: args, Env: environment,
 		})
 	}
 	if err := agent.ValidateMCPServerSpecs(specs); err != nil {
-		return nil, invalidParams("stdio MCP server configuration violates the secure runtime policy")
+		return nil, invalidParams("MCP server configuration violates the secure runtime policy")
 	}
 	return specs, nil
 }
@@ -2006,9 +2270,21 @@ func cloneSessionMCPServers(servers []agent.MCPServerSpec) []agent.MCPServerSpec
 			environment[name] = value
 		}
 		cloned[index] = agent.MCPServerSpec{
-			Name: server.Name, Command: server.Command,
+			Name: server.Name, Type: server.Type, Command: server.Command,
 			Args: append([]string(nil), server.Args...), Env: environment,
+			URL: server.URL, Headers: cloneStringMap(server.Headers),
 		}
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
 	}
 	return cloned
 }

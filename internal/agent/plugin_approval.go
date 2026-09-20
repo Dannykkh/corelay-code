@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 )
 
 const (
@@ -19,14 +22,19 @@ const (
 )
 
 type pluginApprovalProof struct {
-	ApprovalID  string `json:"approval_id"`
-	SessionID   string `json:"session_id"`
-	RunID       string `json:"run_id"`
-	ToolName    string `json:"tool_name"`
-	ExecutorID  string `json:"executor_id"`
-	InputDigest string `json:"input_digest"`
-	ExpiresAt   int64  `json:"expires_at"`
-	Signature   string `json:"signature"`
+	ApprovalID              string                   `json:"approval_id"`
+	SessionID               string                   `json:"session_id"`
+	RunID                   string                   `json:"run_id"`
+	ToolCallID              string                   `json:"tool_call_id"`
+	ToolName                string                   `json:"tool_name"`
+	ExecutorID              string                   `json:"executor_id"`
+	ApprovalSource          approval.ApprovalSource  `json:"approval_source"`
+	ExecutionPolicy         executionpolicy.Snapshot `json:"execution_policy"`
+	ExecutionPolicyRevision uint64                   `json:"execution_policy_revision"`
+	FullSelectionRevision   uint64                   `json:"full_selection_revision"`
+	InputDigest             string                   `json:"input_digest"`
+	ExpiresAt               int64                    `json:"expires_at"`
+	Signature               string                   `json:"signature"`
 }
 
 type pluginApprovalExecutionEnvelope struct {
@@ -44,27 +52,37 @@ var pluginApprovalProofKey struct {
 var usedPluginApprovals sync.Map
 
 func mintPluginApproval(
-	approvalID string,
-	sessionID string,
-	runID string,
-	toolName string,
-	executorID string,
+	pending approval.Pending,
+	toolCallID string,
 	input json.RawMessage,
-	expiresAt time.Time,
+	policy ExecutionPolicySnapshot,
 ) (pluginApprovalProof, error) {
-	proof := pluginApprovalProof{
-		ApprovalID:  strings.TrimSpace(approvalID),
-		SessionID:   strings.TrimSpace(sessionID),
-		RunID:       strings.TrimSpace(runID),
-		ToolName:    strings.TrimSpace(toolName),
-		ExecutorID:  strings.TrimSpace(executorID),
-		InputDigest: pluginApprovalInputDigest(toolName, executorID, input),
-		ExpiresAt:   expiresAt.UnixNano(),
+	if err := validateApprovalProofMetadata(
+		pending,
+		toolCallID,
+		pending.ToolName,
+		pending.ExecutorID,
+		input,
+		policy,
+	); err != nil {
+		return pluginApprovalProof{}, err
 	}
-	if proof.ApprovalID == "" || proof.SessionID == "" || proof.RunID == "" ||
-		proof.ToolName == "" || !strings.HasPrefix(proof.ExecutorID, "plugin:sha256:") ||
-		expiresAt.IsZero() || !expiresAt.After(time.Now()) {
-		return pluginApprovalProof{}, errors.New("plugin approval metadata is incomplete")
+	if !strings.HasPrefix(strings.TrimSpace(pending.ExecutorID), "plugin:sha256:") {
+		return pluginApprovalProof{}, errors.New("plugin approval executor identity is invalid")
+	}
+	proof := pluginApprovalProof{
+		ApprovalID:              strings.TrimSpace(pending.ID),
+		SessionID:               strings.TrimSpace(pending.SessionID),
+		RunID:                   strings.TrimSpace(pending.RunID),
+		ToolCallID:              strings.TrimSpace(toolCallID),
+		ToolName:                strings.TrimSpace(pending.ToolName),
+		ExecutorID:              strings.TrimSpace(pending.ExecutorID),
+		ApprovalSource:          pending.ApprovalSource,
+		ExecutionPolicy:         policy,
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		InputDigest:             pending.InputDigest,
+		ExpiresAt:               pending.ExpiresAt.UnixNano(),
 	}
 	signature, err := signPluginApproval(proof)
 	if err != nil {
@@ -74,24 +92,41 @@ func mintPluginApproval(
 	return proof, nil
 }
 
-func validatePluginApproval(
+func validatePluginApprovalBound(
 	proof pluginApprovalProof,
 	toolName string,
 	executorID string,
 	input json.RawMessage,
 	expectedSessionID string,
 	expectedRunID string,
+	expectedToolCallID string,
+	policy *ExecutionPolicySnapshot,
 ) error {
-	if strings.TrimSpace(expectedSessionID) == "" || strings.TrimSpace(expectedRunID) == "" {
+	if policy == nil {
+		return errors.New("plugin approval execution policy is not configured")
+	}
+	if err := executionpolicy.ValidateSnapshot(*policy); err != nil {
+		return fmt.Errorf("plugin approval execution policy is invalid: %w", err)
+	}
+	if strings.TrimSpace(expectedSessionID) == "" || strings.TrimSpace(expectedRunID) == "" || strings.TrimSpace(expectedToolCallID) == "" {
 		return errors.New("plugin approval execution binding is not configured")
 	}
-	if proof.SessionID != expectedSessionID || proof.RunID != expectedRunID {
-		return errors.New("plugin approval is not bound to the active session and run")
+	if proof.SessionID != expectedSessionID || proof.RunID != expectedRunID || proof.ToolCallID != expectedToolCallID {
+		return errors.New("plugin approval is not bound to the active session, run, and tool call")
 	}
 	if proof.ToolName != toolName || proof.ExecutorID != executorID ||
-		proof.InputDigest != pluginApprovalInputDigest(toolName, executorID, input) {
+		proof.InputDigest != approvalToolInputDigest(toolName, input) {
 		return errors.New("plugin approval is not bound to this execution")
 	}
+	if proof.ExecutionPolicy != *policy ||
+		proof.ExecutionPolicyRevision != policy.Revision ||
+		proof.FullSelectionRevision != policy.FullSelectionRevision {
+		return errors.New("plugin approval is not bound to the active execution policy")
+	}
+	return consumePluginApprovalProof(proof)
+}
+
+func consumePluginApprovalProof(proof pluginApprovalProof) error {
 	if proof.ApprovalID == "" || proof.Signature == "" {
 		return errors.New("plugin approval metadata is incomplete")
 	}
@@ -146,15 +181,69 @@ func unwrapPluginApprovalExecutionInput(input json.RawMessage) (json.RawMessage,
 	return append(json.RawMessage(nil), envelope.Input...), envelope.Approval, true, nil
 }
 
-func pluginApprovalInputDigest(toolName, executorID string, input json.RawMessage) string {
-	value := make([]byte, 0, len(toolName)+len(executorID)+len(input)+2)
+func approvalToolInputDigest(toolName string, input json.RawMessage) string {
+	value := make([]byte, 0, len(toolName)+len(input)+1)
 	value = append(value, toolName...)
-	value = append(value, 0)
-	value = append(value, executorID...)
 	value = append(value, 0)
 	value = append(value, input...)
 	digest := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func validateApprovalProofMetadata(
+	pending approval.Pending,
+	toolCallID string,
+	toolName string,
+	executorID string,
+	input json.RawMessage,
+	policy ExecutionPolicySnapshot,
+) error {
+	if err := executionpolicy.ValidateSnapshot(policy); err != nil {
+		return fmt.Errorf("approval execution policy is invalid: %w", err)
+	}
+	if strings.TrimSpace(pending.ID) == "" || strings.TrimSpace(pending.SessionID) == "" ||
+		strings.TrimSpace(pending.RunID) == "" || strings.TrimSpace(toolCallID) == "" ||
+		strings.TrimSpace(toolName) == "" || strings.TrimSpace(executorID) == "" ||
+		strings.TrimSpace(pending.InputDigest) == "" || pending.ExpiresAt.IsZero() || !pending.ExpiresAt.After(time.Now()) {
+		return errors.New("approval metadata is incomplete or expired")
+	}
+	if pending.ToolCallID != toolCallID || pending.ToolName != toolName || pending.ExecutorID != executorID ||
+		pending.InputDigest != approvalToolInputDigest(toolName, input) ||
+		pending.ExecutionPolicyRevision != policy.Revision || pending.FullSelectionRevision != policy.FullSelectionRevision {
+		return errors.New("approval request is not bound to this tool call and execution policy")
+	}
+	if err := validateApprovalProofSource(pending.ApprovalSource, policy); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateApprovalProofSource(source approval.ApprovalSource, policy ExecutionPolicySnapshot) error {
+	switch source {
+	case approval.ApprovalSourceUser:
+		if policy.Mode == ExecutionModeFull {
+			return errors.New("full-mode approval must come from a user-selected full grant")
+		}
+	case approval.ApprovalSourceUserSelectedFull:
+		if policy.Mode != ExecutionModeFull || policy.FullSelectionRevision == 0 {
+			return errors.New("full-mode approval provenance is invalid")
+		}
+		switch policy.Source {
+		case executionpolicy.SourceUserSelected:
+			if policy.Revision == 0 || policy.FullSelectionRevision != policy.Revision {
+				return errors.New("full-mode approval provenance is invalid")
+			}
+		case executionpolicy.SourceInherited, executionpolicy.SourceChildRestriction:
+			if policy.ParentRevision == 0 || policy.ParentRevision != policy.Revision {
+				return errors.New("child full-mode approval is not bound to its parent selection")
+			}
+		default:
+			return errors.New("full-mode approval provenance is invalid")
+		}
+	default:
+		return errors.New("approval source is not an explicit user authorization")
+	}
+	return nil
 }
 
 func signPluginApproval(proof pluginApprovalProof) (string, error) {

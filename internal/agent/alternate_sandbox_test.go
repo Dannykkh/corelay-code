@@ -26,7 +26,9 @@ type concurrentSandboxRunner struct {
 }
 
 func newConcurrentSandboxRunner() *concurrentSandboxRunner {
-	return &concurrentSandboxRunner{capabilities: fakeBashCapabilities()}
+	capabilities := fakeBashCapabilities()
+	capabilities.FilesystemIsolation = true
+	return &concurrentSandboxRunner{capabilities: capabilities}
 }
 
 func (r *concurrentSandboxRunner) Name() string { return "concurrent-fake" }
@@ -194,13 +196,25 @@ func TestSubAgentMissingSandboxFailsClosed(t *testing.T) {
 			{text: "done"},
 		},
 	}
-	manager := NewSubAgentManager(provider, "test-model", t.TempDir())
+	approvalRequester := &allowingApprovalRequester{}
+	executionPolicy, err := ResolveExecutionPolicy(
+		ExecutionPolicyRequest{Mode: ExecutionModeWorkspace}, "", sandbox.Capabilities{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewSubAgentManagerWithOptions(provider, "test-model", t.TempDir(), SubAgentManagerOptions{
+		ApprovalRequester: approvalRequester,
+		SessionID:         "sub-blocked-session",
+		SessionRevision:   1,
+		ExecutionPolicy:   &executionPolicy,
+	})
 	task := &SubAgentTask{ID: "sub-blocked", Name: "blocked", Instruction: "do not degrade", Status: "pending"}
 
 	manager.run(task)
 
 	if len(task.Sandbox) != 1 || task.Sandbox[0].Report.Runner != "unavailable" || task.Sandbox[0].Report.Started {
-		t.Fatalf("task sandbox = %+v", task.Sandbox)
+		t.Fatalf("task sandbox = %+v status=%q result=%q toolCalls=%d approval=%+v", task.Sandbox, task.Status, task.Result, task.ToolCalls, approvalRequester.opened)
 	}
 }
 
@@ -446,7 +460,7 @@ func TestAlternateProductionPathsDoNotCallLegacyExecutionWrappers(t *testing.T) 
 			t.Fatalf("read %s: %v", path, err)
 		}
 		text := string(content)
-		for _, required := range []string{"DefaultSandboxExecution", "SandboxRunner:", "SandboxPolicy:"} {
+		for _, required := range []string{"resolveCLIExecutionPolicy", "SandboxRunner:", "SandboxPolicy:", "ExecutionPolicy:"} {
 			if !strings.Contains(text, required) {
 				t.Fatalf("%s is missing secure CLI composition %q", path, required)
 			}

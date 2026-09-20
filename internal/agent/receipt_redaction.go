@@ -70,10 +70,12 @@ type agentReceiptPayload struct {
 	PlanMode     bool                        `json:"planMode"`
 	Iterations   int                         `json:"iterations"`
 	EditedFiles  []string                    `json:"editedFiles"`
+	Skills       []ReceiptSkill              `json:"skills,omitempty"`
 	Artifacts    []ReceiptArtifact           `json:"artifacts,omitempty"`
 	Verification receiptVerificationPayload  `json:"verification"`
 	Completion   *CompletionContractSnapshot `json:"completion,omitempty"`
 	Recovery     *RunGuardSnapshot           `json:"recovery,omitempty"`
+	PlanBinding  *PlanExecutionBinding       `json:"planBinding,omitempty"`
 }
 
 type teamRunReceiptPayload struct {
@@ -97,6 +99,7 @@ type teamRunReceiptPayload struct {
 	ToolCalls           int                        `json:"toolCalls"`
 	Verification        receiptVerificationPayload `json:"verification"`
 	Tasks               []teamTaskReceiptPayload   `json:"tasks"`
+	PlanBinding         *PlanExecutionBinding      `json:"planBinding,omitempty"`
 }
 
 type teamTaskReceiptPayload struct {
@@ -159,6 +162,8 @@ func sanitizeAgentReceipt(workDir string, receipt AgentReceipt) agentReceiptPayl
 	completion := sanitizeCompletionContractSnapshot(receipt.Completion)
 	recovery := sanitizeRunGuardSnapshot(receipt.Recovery)
 	verification := sanitizeReceiptVerification(receipt.Verification)
+	planBinding := sanitizePlanExecutionBinding(receipt.PlanBinding)
+	skills := sanitizeReceiptSkills(receipt.Skills)
 	if completion != nil && (completion.Status == CompletionStatusIncomplete || completion.Status == CompletionStatusBlocked) {
 		verification.TerminalState = EvidenceTerminalBlocked
 	}
@@ -172,10 +177,76 @@ func sanitizeAgentReceipt(workDir string, receipt AgentReceipt) agentReceiptPayl
 		PlanMode:     receipt.PlanMode,
 		Iterations:   receipt.Iterations,
 		EditedFiles:  editedFiles,
+		Skills:       skills,
 		Artifacts:    artifacts,
 		Verification: verification,
 		Completion:   completion,
 		Recovery:     recovery,
+		PlanBinding:  planBinding,
+	}
+}
+
+func sanitizeReceiptSkills(values []ReceiptSkill) []ReceiptSkill {
+	if values == nil {
+		return nil
+	}
+	const maxReceiptSkills = 16
+	capacity := len(values)
+	if capacity > maxReceiptSkills {
+		capacity = maxReceiptSkills
+	}
+	result := make([]ReceiptSkill, 0, capacity)
+	seen := make(map[string]struct{}, capacity)
+	// Receipt data can also be marshalled by callers outside RunLoop. Bound
+	// both output size and validation work even if that caller supplies a huge
+	// or mostly-invalid slice.
+	if len(values) > maxReceiptSkills {
+		values = values[:maxReceiptSkills]
+	}
+	for _, value := range values {
+		id := strings.ToLower(strings.TrimSpace(value.ID))
+		if len(id) != 24 {
+			continue
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			continue
+		}
+		digest := strings.ToLower(strings.TrimSpace(value.Digest))
+		if len(digest) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(digest, "sha256:") {
+			continue
+		}
+		if _, err := hex.DecodeString(strings.TrimPrefix(digest, "sha256:")); err != nil {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, ReceiptSkill{
+			ID:        id,
+			Name:      sanitizeReceiptString(value.Name),
+			Source:    sanitizeReceiptString(value.Source),
+			Namespace: sanitizeReceiptString(value.Namespace),
+			Digest:    digest,
+		})
+		if len(result) >= maxReceiptSkills {
+			break
+		}
+	}
+	return result
+}
+
+func sanitizePlanExecutionBinding(value *PlanExecutionBinding) *PlanExecutionBinding {
+	if value == nil || value.WorkstreamID == "" || value.PlanID == "" || value.PlanRevision == 0 || value.StageID == "" || value.RunID == "" {
+		return nil
+	}
+	return &PlanExecutionBinding{
+		WorkstreamID:      sanitizeReceiptString(value.WorkstreamID),
+		PlanID:            sanitizeReceiptString(value.PlanID),
+		PlanRevision:      value.PlanRevision,
+		PlanStateRevision: value.PlanStateRevision,
+		StageID:           sanitizeReceiptString(value.StageID),
+		RunID:             sanitizeReceiptString(value.RunID),
 	}
 }
 
@@ -299,6 +370,7 @@ func sanitizeTeamRunReceipt(workDir string, receipt TeamRunReceipt) teamRunRecei
 			FinishedAt:    sanitizeReceiptString(task.FinishedAt),
 		})
 	}
+	planBinding := sanitizePlanExecutionBinding(receipt.PlanBinding)
 	return teamRunReceiptPayload{
 		Version:             receipt.Version,
 		Kind:                sanitizeReceiptString(receipt.Kind),
@@ -320,6 +392,7 @@ func sanitizeTeamRunReceipt(workDir string, receipt TeamRunReceipt) teamRunRecei
 		ToolCalls:           receipt.ToolCalls,
 		Verification:        sanitizeReceiptVerification(receipt.Verification),
 		Tasks:               tasks,
+		PlanBinding:         planBinding,
 	}
 }
 

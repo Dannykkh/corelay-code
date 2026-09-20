@@ -16,4 +16,7 @@ func TestStableV1StdioMCPAcceptsPATHCommandWithoutAdvertisingRemoteTransports(t 
 	if err := validateMCPServers([]MCPServer{remote}, MCPCapabilities{}); err == nil {
 		t.Fatal("HTTP MCP was accepted without advertised capability")
 	}
+	if err := validateMCPServers([]MCPServer{remote}, MCPCapabilities{HTTP: true}); err != nil {
+		t.Fatalf("HTTP MCP rejected when capability is advertised: %v", err)
+	}
 }

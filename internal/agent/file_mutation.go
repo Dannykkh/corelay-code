@@ -176,23 +176,24 @@ func mutationExecutionPath(
 	workDir string,
 	toolName string,
 	proof *fileMutationPrecondition,
+	policy *ExecutionPolicySnapshot,
 ) (string, error) {
-	resolved := resolvePath(rawPath, workDir)
-	absolute, err := filepath.Abs(resolved)
+	input, err := json.Marshal(map[string]string{"file_path": rawPath})
+	if err != nil {
+		return "", fmt.Errorf("encode mutation path: %w", err)
+	}
+	paths, err := executionToolWorkspacePathsWithPolicy(toolName, input, workDir, policy)
 	if err != nil {
 		return "", fmt.Errorf("resolve mutation path: %w", err)
 	}
+	absolute := paths.one("file_path")
 	if proof == nil {
-		return filepath.Clean(absolute), nil
+		return absolute, nil
 	}
 	if proof.ToolName != toolName {
 		return "", errors.New("file mutation precondition targets a different tool")
 	}
-	canonical, err := canonicalizeTarget(absolute)
-	if err != nil {
-		return "", fmt.Errorf("resolve mutation target: %w", err)
-	}
-	if !sameArtifactMutationPath(canonical, proof.CanonicalPath) {
+	if !sameArtifactMutationPath(absolute, proof.CanonicalPath) {
 		return "", errors.New("file mutation target changed after authorization")
 	}
 	return filepath.Clean(proof.CanonicalPath), nil

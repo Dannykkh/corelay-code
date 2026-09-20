@@ -27,7 +27,9 @@ func (r *sandboxLoopRecorder) SandboxReported(record SandboxExecutionRecord) {
 func TestRunLoopPropagatesSandboxOptionsAndTypedReport(t *testing.T) {
 	isolateEvidenceLoopTest(t)
 	workDir := t.TempDir()
-	runner := &fakeBashRunner{name: "loop-fake", capabilities: fakeBashCapabilities()}
+	capabilities := fakeBashCapabilities()
+	capabilities.FilesystemIsolation = true
+	runner := &fakeBashRunner{name: "loop-fake", capabilities: capabilities}
 	runner.run = func(_ context.Context, policy sandbox.Policy, _ sandbox.CommandSpec) (sandbox.Result, sandbox.Report) {
 		report := fakeBashReport(runner, policy)
 		report.Started = true

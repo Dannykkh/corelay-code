@@ -11,7 +11,88 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/agent"
 )
+
+func TestExecutionModeCLIHelpers(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  agent.ExecutionMode
+		bad   bool
+	}{
+		{value: "", want: ""},
+		{value: "read-only", want: agent.ExecutionModeReadOnly},
+		{value: "workspace", want: agent.ExecutionModeWorkspace},
+		{value: "full", want: agent.ExecutionModeFull},
+		{value: "unrestricted", bad: true},
+	} {
+		got, err := parseExecutionModeFlag(test.value)
+		if test.bad {
+			if err == nil {
+				t.Errorf("parseExecutionModeFlag(%q) = %q, want error", test.value, got)
+			}
+			continue
+		}
+		if err != nil || got != test.want {
+			t.Errorf("parseExecutionModeFlag(%q) = %q, %v; want %q", test.value, got, err, test.want)
+		}
+	}
+
+	request, err := json.Marshal(agentTurnRequest{
+		ExecutionPolicy: requestedExecutionPolicy(agent.ExecutionModeFull),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(request, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var policy map[string]json.RawMessage
+	if err := json.Unmarshal(payload["executionPolicy"], &policy); err != nil {
+		t.Fatal(err)
+	}
+	if len(policy) != 1 || string(policy["mode"]) != `"full"` {
+		t.Fatalf("executionPolicy = %s, want only mode=full", payload["executionPolicy"])
+	}
+
+	request, err = json.Marshal(agentTurnRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = nil
+	if err := json.Unmarshal(request, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["executionPolicy"]; exists {
+		t.Fatalf("default request unexpectedly sent executionPolicy: %s", request)
+	}
+}
+
+func TestResolveCLIExecutionPolicyUsesWorkspaceDefaultAndExplicitFullRunner(t *testing.T) {
+	runner, _, workspace, err := resolveCLIExecutionPolicy(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Mode != agent.ExecutionModeWorkspace || workspace.Source != "default-workspace" {
+		t.Fatalf("default snapshot = %#v, want default workspace", workspace)
+	}
+	if runner == nil {
+		t.Fatal("default runner is nil")
+	}
+
+	runner, fullPolicy, full, err := resolveCLIExecutionPolicy(t.TempDir(), agent.ExecutionModeFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.Mode != agent.ExecutionModeFull || full.Source != "user-selected" || full.FullSelectionRevision == 0 {
+		t.Fatalf("full snapshot = %#v, want explicitly selected full mode", full)
+	}
+	if runner == nil || runner.Name() != "unconfined" || fullPolicy.Enforcement != "disabled" {
+		t.Fatalf("full execution = runner %v, policy %#v; want unconfined + disabled", runner, fullPolicy)
+	}
+}
 
 func TestAgentStreamTransportAuthAndMetadataEndpoints(t *testing.T) {
 	t.Parallel()
@@ -79,6 +160,53 @@ func TestAgentStreamTransportAuthAndMetadataEndpoints(t *testing.T) {
 		if got := seen[path]; got != token {
 			t.Errorf("%s auth header = %q, want %q", path, got, token)
 		}
+	}
+}
+
+func TestAgentStreamTransportReconciliationEvidenceRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const token = "reconcile-secret"
+	digest := "sha256:" + strings.Repeat("c", 64)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Access-Token"); got != token {
+			t.Errorf("auth header = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/sessions/session-1/reconcile-preview":
+			if got := r.URL.Query().Get("expectedRevision"); got != "12" {
+				t.Errorf("preview revision = %q", got)
+			}
+			_, _ = fmt.Fprintf(w, `{"sessionId":"session-1","revision":12,"runId":"run-1","toolName":"Bash","evidenceDigest":%q,"checkpointStatus":"unavailable","sideEffectJudgment":"unknown","recordedExecutionState":"applied","manualConfirmationRequired":true,"manualConfirmationReason":"inspect shell effects","files":[{"path":"<checkpoint>","status":"unavailable"}],"unavailable":1}`, digest)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/sessions/session-1/reconcile":
+			var body struct {
+				ExpectedRevision               uint64 `json:"expectedRevision"`
+				EvidenceDigest                 string `json:"evidenceDigest"`
+				ManualConfirmationAcknowledged bool   `json:"manualConfirmationAcknowledged"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode reconcile request: %v", err)
+			}
+			if body.ExpectedRevision != 12 || body.EvidenceDigest != digest || !body.ManualConfirmationAcknowledged {
+				t.Errorf("reconcile body = %+v", body)
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"revision":13,"session":{"id":"session-1","revision":13,"lifecycleStatus":"active","lastReconciliation":{"version":1,"at":"2026-09-14T00:00:00Z","runId":"run-1","evidenceDigest":%q,"checkpointStatus":"unavailable","sideEffectJudgment":"unknown","fileCount":1,"unavailable":1,"manualConfirmationRequired":true,"manualConfirmationAcknowledged":true}}}`, digest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	transport := newAgentStreamTransport(server.URL, token, server.Client())
+	assessment, err := transport.ReconciliationPreview(context.Background(), "session-1", 12)
+	if err != nil || assessment.EvidenceDigest != digest || !assessment.ManualConfirmationRequired {
+		t.Fatalf("ReconciliationPreview() = %+v, %v", assessment, err)
+	}
+	session, err := transport.ReconcileSession(context.Background(), "session-1", 12, assessment.EvidenceDigest, true)
+	if err != nil || session == nil || session.Revision != 13 || session.LastReconciliation == nil ||
+		!session.LastReconciliation.ManualConfirmationAcknowledged {
+		t.Fatalf("ReconcileSession() = %+v, %v", session, err)
 	}
 }
 

@@ -98,6 +98,11 @@ func (r *Runner) Run(ctx context.Context, target TargetIdentity) (RunResult, err
 	if !target.Valid() {
 		return RunResult{}, ErrInvalidTarget
 	}
+	release, err := r.store.lockProfiling(target)
+	if err != nil {
+		return RunResult{}, err
+	}
+	defer release()
 	profile, err := r.profiler.Run(ctx, target, r.plan)
 	if err != nil {
 		return RunResult{}, err

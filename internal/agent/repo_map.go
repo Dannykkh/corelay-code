@@ -73,7 +73,7 @@ type repoMapEntry struct {
 }
 
 func executeRepoMap(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("RepoMap", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("RepoMap", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "RepoMap blocked: " + err.Error(), true
 	}
@@ -93,7 +93,7 @@ func executeRepoMap(input json.RawMessage, workDir string, opts ToolExecutionOpt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	entries, total, scanTruncated, err := buildRepoMap(ctx, workDir, paths.one("path"), includeSignatures, maximum)
+	entries, total, scanTruncated, err := buildRepoMapWithPolicy(ctx, workDir, paths.one("path"), includeSignatures, maximum, opts.ExecutionPolicy)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "RepoMap canceled before completion", true
@@ -104,6 +104,16 @@ func executeRepoMap(input json.RawMessage, workDir string, opts ToolExecutionOpt
 }
 
 func buildRepoMap(ctx context.Context, workDir, root string, includeSignatures bool, maximum int) ([]repoMapEntry, int, bool, error) {
+	return buildRepoMapWithPolicy(ctx, workDir, root, includeSignatures, maximum, nil)
+}
+
+func buildRepoMapWithPolicy(
+	ctx context.Context,
+	workDir, root string,
+	includeSignatures bool,
+	maximum int,
+	policy *ExecutionPolicySnapshot,
+) ([]repoMapEntry, int, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, false, err
 	}
@@ -118,8 +128,15 @@ func buildRepoMap(ctx context.Context, workDir, root string, includeSignatures b
 		return nil, 0, false, err
 	}
 	canonicalRoot, err := canonicalizeTarget(root)
-	if err != nil || !pathWithin(canonicalRoot, canonicalWorkDir) {
+	allowExternal := policy != nil && policy.Mode == ExecutionModeFull
+	if err != nil || (!allowExternal && !pathWithin(canonicalRoot, canonicalWorkDir)) {
 		return nil, 0, false, errors.New("repository map root is outside the workspace")
+	}
+	pathBase := canonicalWorkDir
+	if allowExternal && !pathWithin(canonicalRoot, canonicalWorkDir) {
+		// Keep external maps useful: workspace-relative names would all be
+		// rejected as parent traversals, so external maps are root-relative.
+		pathBase = canonicalRoot
 	}
 	rootInfo, err := os.Stat(canonicalRoot)
 	if err != nil || !rootInfo.IsDir() {
@@ -163,8 +180,8 @@ func buildRepoMap(ctx context.Context, workDir, root string, includeSignatures b
 		return nil, 0, scanTruncated, err
 	}
 	sort.Slice(paths, func(i, j int) bool {
-		left, _ := filepath.Rel(canonicalWorkDir, paths[i])
-		right, _ := filepath.Rel(canonicalWorkDir, paths[j])
+		left, _ := filepath.Rel(pathBase, paths[i])
+		right, _ := filepath.Rel(pathBase, paths[j])
 		return filepath.ToSlash(left) < filepath.ToSlash(right)
 	})
 	total := len(paths)
@@ -173,7 +190,7 @@ func buildRepoMap(ctx context.Context, workDir, root string, includeSignatures b
 	}
 	result := make([]repoMapEntry, 0, len(paths))
 	for _, path := range paths {
-		relative, err := filepath.Rel(canonicalWorkDir, path)
+		relative, err := filepath.Rel(pathBase, path)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			continue
 		}

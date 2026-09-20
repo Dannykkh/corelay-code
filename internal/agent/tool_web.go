@@ -43,7 +43,7 @@ type webFetchArgs struct {
 	URL      string `json:"url"`
 	Prompt   string `json:"prompt,omitempty"`
 	MaxChars int    `json:"max_chars,omitempty"`
-	Provider string `json:"provider,omitempty"` // auto, ollama, direct
+	Provider string `json:"provider,omitempty"` // auto, ollama, direct, browser
 }
 
 type webResearchArgs struct {
@@ -76,29 +76,41 @@ type webSearchResult struct {
 }
 
 type webFetchResult struct {
-	URL         string   `json:"url"`
-	FinalURL    string   `json:"final_url,omitempty"`
-	Title       string   `json:"title,omitempty"`
-	PublishedAt string   `json:"published_at,omitempty"`
-	UpdatedAt   string   `json:"updated_at,omitempty"`
-	Status      int      `json:"status,omitempty"`
-	ContentType string   `json:"content_type,omitempty"`
-	Content     string   `json:"content"`
-	Links       []string `json:"links,omitempty"`
-	Source      string   `json:"source"`
+	URL          string   `json:"url"`
+	FinalURL     string   `json:"final_url,omitempty"`
+	Title        string   `json:"title,omitempty"`
+	PublishedAt  string   `json:"published_at,omitempty"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+	Status       int      `json:"status,omitempty"`
+	ContentType  string   `json:"content_type,omitempty"`
+	Content      string   `json:"content"`
+	Links        []string `json:"links,omitempty"`
+	Source       string   `json:"source"`
+	LimitNotice  string   `json:"-"`
+	NeedsBrowser bool     `json:"-"`
 }
 
 // WebFetch fetches a URL and returns cleaned text content.
 func executeWebFetch(input json.RawMessage, _ string) (string, bool) {
+	return executeWebFetchWithContext(context.Background(), input)
+}
+
+func executeWebFetchWithContext(parent context.Context, input json.RawMessage) (string, bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	var args webFetchArgs
-	json.Unmarshal(input, &args)
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "Invalid WebFetch arguments", true
+	}
 	args.URL = strings.TrimSpace(args.URL)
 	if args.URL == "" {
 		return "URL is required", true
 	}
 	args.MaxChars = normalizePositiveLimit(args.MaxChars, defaultFetchChars, maxFetchChars)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	// Include first-use browser preparation; each HTTP/render operation has a shorter deadline.
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
 
 	result, err := fetchWeb(ctx, args)
@@ -218,7 +230,7 @@ func researchFetchProvider(args webResearchArgs) string {
 	if len(args.Providers) == 0 && strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
 		return "ollama"
 	}
-	return "direct"
+	return "auto"
 }
 
 func searchWeb(ctx context.Context, args webSearchArgs) ([]webSearchResult, string, string, error) {
@@ -227,27 +239,30 @@ func searchWeb(ctx context.Context, args webSearchArgs) ([]webSearchResult, stri
 
 func fetchWeb(ctx context.Context, args webFetchArgs) (webFetchResult, error) {
 	provider := strings.ToLower(strings.TrimSpace(args.Provider))
-	if provider == "" || provider == "auto" {
+	if provider == "" {
 		provider = webFetchDefaultProvider()
 	}
 
 	switch provider {
+	case "auto":
+		return autoWebFetch(ctx, args.URL)
 	case "ollama":
 		result, err := ollamaWebFetch(ctx, args.URL)
 		if err == nil {
-			result.Content = truncateString(result.Content, args.MaxChars)
 			return result, nil
 		}
 		if strings.EqualFold(strings.TrimSpace(args.Provider), "ollama") {
 			return webFetchResult{}, err
 		}
-		result, derr := directWebFetch(ctx, args.URL, args.MaxChars)
+		result, derr := directWebFetch(ctx, args.URL)
 		if derr != nil {
 			return webFetchResult{}, fmt.Errorf("ollama web_fetch failed: %v; direct fetch failed: %w", err, derr)
 		}
 		return result, nil
 	case "direct", "duckduckgo", "ddg":
-		return directWebFetch(ctx, args.URL, args.MaxChars)
+		return directWebFetch(ctx, args.URL)
+	case "browser":
+		return browserWebFetch(ctx, args.URL)
 	default:
 		return webFetchResult{}, fmt.Errorf("unsupported web fetch provider %q", args.Provider)
 	}
@@ -258,7 +273,7 @@ func webSearchDefaultProvider() string {
 }
 
 func webFetchDefaultProvider() string {
-	return "direct"
+	return "auto"
 }
 
 func ollamaWebSearch(ctx context.Context, query string, maxResults int) ([]webSearchResult, error) {
@@ -398,13 +413,13 @@ func duckDuckGoSearch(ctx context.Context, opts webSearchOptions) ([]webSearchRe
 	return results, nil
 }
 
-func directWebFetch(ctx context.Context, targetURL string, maxChars int) (webFetchResult, error) {
+func directWebFetch(ctx context.Context, targetURL string) (webFetchResult, error) {
 	client := &http.Client{Timeout: 35 * time.Second}
 	visited := map[string]bool{}
-	return directWebFetchRecursive(ctx, client, targetURL, maxChars, 0, visited)
+	return directWebFetchRecursive(ctx, client, targetURL, 0, visited)
 }
 
-func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL string, maxChars, depth int, visited map[string]bool) (webFetchResult, error) {
+func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL string, depth int, visited map[string]bool) (webFetchResult, error) {
 	originalURL := strings.TrimSpace(targetURL)
 	fetchURL := canonicalWebFetchURL(originalURL)
 	parsed, err := url.Parse(fetchURL)
@@ -447,17 +462,32 @@ func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL
 	publishedAt := ""
 	updatedAt := ""
 	links := []string{}
+	needsBrowser := false
 	if strings.Contains(strings.ToLower(contentType), "html") || looksLikeHTML(content) {
 		rawHTML := content
 		title = extractHTMLTitle(rawHTML)
 		publishedAt, updatedAt = extractHTMLDates(rawHTML)
 		links = extractLinks(rawHTML, resp.Request.URL)
-		content = htmlToText(rawHTML)
+		content = webHTMLToMarkdown(rawHTML, resp.Request.URL)
+		needsBrowser = webPageNeedsBrowser(rawHTML, content)
 
 		if shouldFetchFrames(rawHTML, content, depth) {
 			frameURLs := extractFrameSources(rawHTML, resp.Request.URL, maxFrameFetches)
 			for _, frameURL := range frameURLs {
-				frameResult, ferr := directWebFetchRecursive(ctx, client, frameURL, maxChars, depth+1, visited)
+				// Scope every redirect to the document that selected this frame.
+				// Copy the client so nested frames cannot mutate their parent's policy.
+				frameClient := *client
+				frameParent := resp.Request.URL
+				frameClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+					if len(via) >= 10 {
+						return fmt.Errorf("stopped after 10 redirects")
+					}
+					if !canFetchFrame(frameParent, req.URL) {
+						return fmt.Errorf("frame redirect leaves allowed origin")
+					}
+					return nil
+				}
+				frameResult, ferr := directWebFetchRecursive(ctx, &frameClient, frameURL, depth+1, visited)
 				if ferr != nil || strings.TrimSpace(frameResult.Content) == "" {
 					continue
 				}
@@ -475,21 +505,19 @@ func directWebFetchRecursive(ctx context.Context, client *http.Client, targetURL
 			}
 		}
 	}
-	if maxChars <= 0 {
-		maxChars = defaultFetchChars
-	}
-	content = truncateString(content, maxChars)
+	// Keep the bounded fetched body until relevance selection at the output boundary.
 	return webFetchResult{
-		URL:         originalURL,
-		FinalURL:    resp.Request.URL.String(),
-		Title:       title,
-		PublishedAt: publishedAt,
-		UpdatedAt:   updatedAt,
-		Status:      resp.StatusCode,
-		ContentType: contentType,
-		Content:     content,
-		Links:       links,
-		Source:      "direct",
+		URL:          originalURL,
+		FinalURL:     resp.Request.URL.String(),
+		Title:        title,
+		PublishedAt:  publishedAt,
+		UpdatedAt:    updatedAt,
+		Status:       resp.StatusCode,
+		ContentType:  contentType,
+		Content:      content,
+		Links:        links,
+		Source:       "direct",
+		NeedsBrowser: needsBrowser,
 	}, nil
 }
 
@@ -625,7 +653,22 @@ func resolveFrameURL(raw string, base *url.URL) (string, bool) {
 }
 
 func canFetchFrame(parent, child *url.URL) bool {
-	if parent == nil || child == nil {
+	if parent == nil || child == nil || child.User != nil || parent.Hostname() == "" || child.Hostname() == "" {
+		return false
+	}
+	if (child.Scheme != "http" && child.Scheme != "https") || parent.Scheme != child.Scheme {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	if port(parent) != port(child) {
 		return false
 	}
 	if !strings.EqualFold(parent.Hostname(), child.Hostname()) {
@@ -730,10 +773,8 @@ func formatSearchResults(query, provider, note string, results []webSearchResult
 }
 
 func formatFetchResult(result webFetchResult, prompt string, maxChars int) string {
-	content := result.Content
-	if strings.TrimSpace(prompt) != "" {
-		content = extractRelevantText(content, prompt, maxChars)
-	}
+	maxChars = normalizePositiveLimit(maxChars, defaultFetchChars, maxFetchChars)
+	content := extractRelevantText(result.Content, prompt, maxChars)
 	var b strings.Builder
 	fmt.Fprintf(&b, "WebFetch provider=%s\nURL: %s\n", result.Source, result.URL)
 	if result.FinalURL != "" && result.FinalURL != result.URL {
@@ -754,6 +795,9 @@ func formatFetchResult(result webFetchResult, prompt string, maxChars int) strin
 	if result.UpdatedAt != "" {
 		fmt.Fprintf(&b, "Updated-At: %s\n", result.UpdatedAt)
 	}
+	if result.LimitNotice != "" {
+		fmt.Fprintf(&b, "Limit: %s\n", result.LimitNotice)
+	}
 	if len(result.Links) > 0 {
 		fmt.Fprintf(&b, "Links: %s\n", strings.Join(limitStrings(result.Links, 10), ", "))
 	}
@@ -762,57 +806,7 @@ func formatFetchResult(result webFetchResult, prompt string, maxChars int) strin
 }
 
 func extractRelevantText(content, prompt string, maxChars int) string {
-	content = strings.TrimSpace(content)
-	if content == "" || strings.TrimSpace(prompt) == "" {
-		return truncateString(content, maxChars)
-	}
-	keywords := keywordSet(prompt)
-	if len(keywords) == 0 {
-		return truncateString(content, maxChars)
-	}
-	paragraphs := splitParagraphs(content)
-	type scored struct {
-		text  string
-		score int
-		idx   int
-	}
-	var ranked []scored
-	for i, p := range paragraphs {
-		lower := strings.ToLower(p)
-		score := 0
-		for kw := range keywords {
-			if strings.Contains(lower, kw) {
-				score++
-			}
-		}
-		if score > 0 {
-			ranked = append(ranked, scored{text: p, score: score, idx: i})
-		}
-	}
-	if len(ranked) == 0 {
-		return truncateString(content, maxChars)
-	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].score == ranked[j].score {
-			return ranked[i].idx < ranked[j].idx
-		}
-		return ranked[i].score > ranked[j].score
-	})
-	var selected []scored
-	total := 0
-	for _, p := range ranked {
-		if total+len(p.text) > maxChars && len(selected) > 0 {
-			break
-		}
-		selected = append(selected, p)
-		total += len(p.text) + 2
-	}
-	sort.SliceStable(selected, func(i, j int) bool { return selected[i].idx < selected[j].idx })
-	var parts []string
-	for _, p := range selected {
-		parts = append(parts, p.text)
-	}
-	return truncateString(strings.Join(parts, "\n\n"), maxChars)
+	return selectWebMarkdown(content, prompt, maxChars)
 }
 
 // htmlToText strips HTML tags and returns readable text.
@@ -993,18 +987,6 @@ func extractLinks(page string, base *url.URL) []string {
 func looksLikeHTML(s string) bool {
 	lower := strings.ToLower(s[:minInt(len(s), 512)])
 	return strings.Contains(lower, "<html") || strings.Contains(lower, "<body") || strings.Contains(lower, "<!doctype html")
-}
-
-func splitParagraphs(s string) []string {
-	raw := regexp.MustCompile(`\n{2,}`).Split(s, -1)
-	out := make([]string, 0, len(raw))
-	for _, p := range raw {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func keywordSet(s string) map[string]bool {

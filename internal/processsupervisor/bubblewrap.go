@@ -2,6 +2,8 @@ package processsupervisor
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
@@ -59,8 +61,20 @@ func buildBubblewrapSpec(path string, capabilities sandbox.Capabilities, policy 
 	}
 	args := []string{
 		"--die-with-parent", "--new-session", "--unshare-pid", "--unshare-uts", "--unshare-ipc",
-		"--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+		"--ro-bind", "/", "/",
 	}
+	command := spec.Executable
+	if pathWithin(command, "/tmp") {
+		// The isolated /tmp mount would hide test binaries and other legitimate
+		// executables created in the host temporary directory. Preserve only the
+		// requested executable as a read-only bind before replacing /tmp. A
+		// writable staging mount is needed because the root bind is read-only.
+		const stagedCommand = "/run/corelay-bwrap-command"
+		args = append(args, "--tmpfs", "/run")
+		args = append(args, "--ro-bind", command, stagedCommand)
+		command = stagedCommand
+	}
+	args = append(args, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp")
 	if denyNetwork {
 		args = append(args, "--unshare-net")
 	}
@@ -69,7 +83,7 @@ func buildBubblewrapSpec(path string, capabilities sandbox.Capabilities, policy 
 	} else {
 		args = append(args, "--ro-bind", workspace, workspace)
 	}
-	args = append(args, "--chdir", workingDir, "--", spec.Executable)
+	args = append(args, "--chdir", workingDir, "--", command)
 	args = append(args, spec.Args...)
 	applied := sandbox.Capabilities{FilesystemIsolation: true, ProcessIsolation: true}
 	if denyNetwork {
@@ -78,4 +92,20 @@ func buildBubblewrapSpec(path string, capabilities sandbox.Capabilities, policy 
 	return preparedSpec{Spec: Spec{
 		Executable: path, Args: args, Dir: workspace, Environment: cloneEnvironmentWithTemp(spec.Environment, "/tmp"),
 	}, Applied: applied}, nil
+}
+
+func pathWithin(path, root string) bool {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	base, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(base, absolute)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return relative != "."
 }

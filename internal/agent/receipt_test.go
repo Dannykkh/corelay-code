@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,55 @@ func TestWriteAgentReceiptToDir(t *testing.T) {
 	}
 	if got.Verification.Status != "passed" || got.Verification.Source != "auto-verify" {
 		t.Fatalf("verification = %+v", got.Verification)
+	}
+}
+
+func TestAgentReceiptPreservesOnlyValidAppliedSkillProvenance(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := t.TempDir()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	path, err := writeAgentReceiptToDir(baseDir, workDir, AgentReceipt{
+		Provider: "fixture", Model: "fixture-model",
+		Skills: []ReceiptSkill{
+			{ID: "0123456789abcdef01234567", Name: "browser-crawl", Source: "claude", Namespace: "project-claude", Digest: digest},
+			{ID: "invalid", Name: "not-a-skill", Source: "custom", Digest: "not-a-digest"},
+		},
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got AgentReceipt
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Skills) != 1 || got.Skills[0].ID != "0123456789abcdef01234567" ||
+		got.Skills[0].Digest != digest || got.Skills[0].Name != "browser-crawl" ||
+		got.Skills[0].Source != "claude" || got.Skills[0].Namespace != "project-claude" {
+		t.Fatalf("sanitized applied skill provenance = %+v", got.Skills)
+	}
+}
+
+func TestReceiptSkillSanitizerBoundsRowsAndRedactsMetadata(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("b", 64)
+	values := make([]ReceiptSkill, 17)
+	for i := range values {
+		values[i] = ReceiptSkill{
+			ID: fmt.Sprintf("%024x", i+1), Name: fmt.Sprintf("skill-%02d", i),
+			Source: "claude", Digest: digest,
+		}
+	}
+	values[0].Name = "browser password=topsecret"
+
+	got := sanitizeReceiptSkills(values)
+	if len(got) != 16 {
+		t.Fatalf("sanitized skill rows = %d, want max 16", len(got))
+	}
+	if strings.Contains(got[0].Name, "topsecret") || !strings.Contains(got[0].Name, "REDACTED") {
+		t.Fatalf("skill metadata was not redacted: %q", got[0].Name)
 	}
 }
 

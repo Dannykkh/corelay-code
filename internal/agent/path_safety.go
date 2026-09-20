@@ -69,11 +69,30 @@ func (r resolvedToolWorkspacePaths) many(name string) []string {
 }
 
 // executionToolWorkspacePaths is defense in depth for forced/direct executor
-// calls that did not traverse the permission broker. Configured blocked-path
-// policy remains the broker's responsibility; the immutable workspace and
-// unambiguous-JSON boundary is non-optional here.
+// calls that did not traverse the permission broker. Immutable default blocked
+// paths and workspace containment stay mandatory here; a dispatcher additionally
+// applies the user's configured blocked-path rules.
 func executionToolWorkspacePaths(toolName string, input json.RawMessage, workDir string) (resolvedToolWorkspacePaths, error) {
-	resolved, handled, err := resolveToolWorkspacePaths(toolName, input, workDir, PermissionConfig{})
+	return executionToolWorkspacePathsWithPolicy(toolName, input, workDir, nil)
+}
+
+// executionToolWorkspacePathsWithPolicy binds direct executor path resolution
+// to the immutable run policy. Full mode relaxes only workspace containment;
+// syntax, canonicalization, symlink, and blocked-path checks remain mandatory.
+func executionToolWorkspacePathsWithPolicy(
+	toolName string,
+	input json.RawMessage,
+	workDir string,
+	policy *ExecutionPolicySnapshot,
+) (resolvedToolWorkspacePaths, error) {
+	// Direct executor entrypoints do not have the run's custom permission
+	// configuration. Keep the product's immutable default blocked paths in
+	// force there; the dispatcher additionally applies any configured paths.
+	cfg := DefaultPermissionConfig()
+	if policy != nil && policy.Mode == ExecutionModeFull {
+		cfg.AllowExternalPaths = true
+	}
+	resolved, handled, err := resolveToolWorkspacePaths(toolName, input, workDir, cfg)
 	if !handled {
 		return resolvedToolWorkspacePaths{}, fmt.Errorf("tool %q has no filesystem path contract", toolName)
 	}
@@ -92,7 +111,7 @@ func resolveToolWorkspacePaths(
 ) (resolvedToolWorkspacePaths, bool, error) {
 	toolName = canonicalPermissionToolName(toolName)
 	switch toolName {
-	case "Read", "Write", "Edit", "Glob", "Grep", "LS", "RepoMap",
+	case "Read", "Write", "Edit", "Glob", "Grep", "LS", "RepoMap", "LSP",
 		"NotebookRead", "NotebookEdit", "ImageRead", "PDFRead",
 		"Lint", "Test", "Git", "GitDiff", "GitCommit", "Diff":
 	default:
@@ -109,7 +128,7 @@ func resolveToolWorkspacePaths(
 	}
 	resolved := resolvedToolWorkspacePaths{values: make(map[string][]string)}
 	canonicalize := func(name, raw string) error {
-		canonical, err := canonicalPathWithinWorkspace(raw, workDir, workspace, cfg)
+		canonical, err := canonicalPathForPolicy(raw, workDir, workspace, cfg)
 		if err != nil {
 			return err
 		}
@@ -118,7 +137,7 @@ func resolveToolWorkspacePaths(
 	}
 
 	switch toolName {
-	case "Read", "Write", "Edit", "NotebookRead", "ImageRead", "PDFRead":
+	case "Read", "Write", "Edit", "NotebookRead", "ImageRead", "PDFRead", "LSP":
 		path, err := oneStringField(object, true, "file_path", "filePath", "path")
 		if err != nil {
 			return resolved, true, fmt.Errorf("Invalid file path: %w", err)
@@ -161,7 +180,7 @@ func resolveToolWorkspacePaths(
 		if basePath == "" {
 			basePath = "."
 		}
-		base, err := canonicalPathWithinWorkspace(basePath, workDir, workspace, cfg)
+		base, err := canonicalPathForPolicy(basePath, workDir, workspace, cfg)
 		if err != nil {
 			return resolved, true, err
 		}
@@ -182,7 +201,7 @@ func resolveToolWorkspacePaths(
 		if basePath == "" {
 			basePath = "."
 		}
-		base, err := canonicalPathWithinWorkspace(basePath, workDir, workspace, cfg)
+		base, err := canonicalPathForPolicy(basePath, workDir, workspace, cfg)
 		if err != nil {
 			return resolved, true, err
 		}
@@ -220,6 +239,9 @@ func resolveToolWorkspacePaths(
 			return resolved, true, fmt.Errorf("Invalid git diff path: %w", err)
 		}
 		if path != "" {
+			if hasGitPathspecSyntax(path) {
+				return resolved, true, errors.New("GitDiff accepts literal file or directory paths only; wildcard and Git pathspec syntax are not supported")
+			}
 			if err := canonicalize("file", path); err != nil {
 				return resolved, true, err
 			}
@@ -237,8 +259,23 @@ func resolveToolWorkspacePaths(
 		if err != nil {
 			return resolved, true, fmt.Errorf("Invalid git commit paths: %w", err)
 		}
+		files = strings.TrimSpace(files)
+		scope, err := oneStringField(object, false, "scope")
+		if err != nil {
+			return resolved, true, fmt.Errorf("Invalid git commit scope: %w", err)
+		}
+		scope = strings.TrimSpace(scope)
+		if scope != "" && scope != "staged" {
+			return resolved, true, errors.New("GitCommit scope must be staged")
+		}
+		if files == "" && scope != "staged" {
+			return resolved, true, errors.New("GitCommit requires literal files or explicit scope=staged")
+		}
+		if files != "" && scope != "" {
+			return resolved, true, errors.New("GitCommit scope=staged cannot be combined with files")
+		}
 		for _, path := range strings.Fields(files) {
-			if strings.HasPrefix(path, "-") || strings.HasPrefix(path, ":(") || strings.HasPrefix(path, ":!") || strings.HasPrefix(path, ":^") {
+			if strings.HasPrefix(path, "-") || hasGitPathspecSyntax(path) {
 				return resolved, true, fmt.Errorf("Invalid git commit path %q: options and pathspec magic are not accepted", path)
 			}
 			if err := canonicalize("files", path); err != nil {
@@ -255,6 +292,11 @@ func resolveToolWorkspacePaths(
 	}
 
 	return resolved, true, nil
+}
+
+func hasGitPathspecSyntax(path string) bool {
+	normalized := filepath.ToSlash(path)
+	return strings.HasPrefix(normalized, ":") || strings.ContainsAny(normalized, "*?[")
 }
 
 func validateGitRevision(revision string) error {
@@ -314,7 +356,7 @@ func resolveGitToolArguments(
 			return nil, fmt.Errorf("Invalid git arguments: pathspec magic %q is not accepted", argument)
 		}
 		if pathOperand && (!strings.HasPrefix(argument, "-") || afterSeparator) {
-			canonical, err := canonicalPathWithinWorkspace(argument, workDir, workspace, cfg)
+			canonical, err := canonicalPathForPolicy(argument, workDir, workspace, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -483,6 +525,39 @@ func canonicalPathWithinWorkspace(rawPath, baseDir, workspace string, cfg Permis
 	return canonical, nil
 }
 
+// canonicalPathForPolicy retains syntax, symlink, and blocked-path checks in
+// every mode. Explicit full mode removes only the workspace containment check.
+func canonicalPathForPolicy(rawPath, baseDir, workspace string, cfg PermissionConfig) (string, error) {
+	if !cfg.AllowExternalPaths {
+		return canonicalPathWithinWorkspace(rawPath, baseDir, workspace, cfg)
+	}
+	if strings.TrimSpace(rawPath) == "" {
+		return "", errors.New("path is empty")
+	}
+	if blocked := matchingBlockedPath(rawPath, cfg.BlockedPaths); blocked != "" {
+		return "", fmt.Errorf("Blocked path: %s", blocked)
+	}
+	if err := validatePathSyntax(rawPath); err != nil {
+		return "", fmt.Errorf("unresolvable path: %w", err)
+	}
+	resolved := rawPath
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(baseDir, resolved)
+	}
+	absPath, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("unresolvable path: %w", err)
+	}
+	canonical, err := canonicalizeTarget(absPath)
+	if err != nil {
+		return "", fmt.Errorf("unresolvable path: %w", err)
+	}
+	if blocked := matchingBlockedPath(canonical, cfg.BlockedPaths); blocked != "" {
+		return "", fmt.Errorf("Blocked path: %s", blocked)
+	}
+	return canonical, nil
+}
+
 func canonicalizeTarget(target string) (string, error) {
 	current := filepath.Clean(target)
 	missing := make([]string, 0, 4)
@@ -541,7 +616,7 @@ func checkGlobPattern(pattern, baseDir, workspace string, cfg PermissionConfig) 
 	}
 
 	root := globLiteralRoot(pattern)
-	if _, err := canonicalPathWithinWorkspace(root, baseDir, workspace, cfg); err != nil {
+	if _, err := canonicalPathForPolicy(root, baseDir, workspace, cfg); err != nil {
 		return err
 	}
 	return nil

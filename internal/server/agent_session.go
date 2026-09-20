@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/protocol"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -19,6 +21,8 @@ const (
 )
 
 var errDurableTranscriptMismatch = errors.New("durable session transcript does not match the run request")
+var errDurableWorkspaceConflict = errors.New("durable session workspace does not match the run request")
+var errDurableImageHistoryBudget = errors.New("durable image history exceeds the request image budget")
 
 type durableSessionStore interface {
 	Get(string) (*agent.Session, error)
@@ -39,6 +43,8 @@ type durableAgentRun struct {
 	observer         *agent.DurableRunObserver
 	toolResultMemory *agent.SessionMemory
 	toolResultRefs   []agent.ToolResultReference
+	messages         []types.Message
+	pendingImages    *agent.Session
 	journalMu        sync.Mutex
 	journalMarker    *agent.SessionInterruption
 	journalEntries   []agent.ToolExecutionJournalEntry
@@ -63,24 +69,7 @@ func prepareDurableAgentRun(
 	if err != nil {
 		return nil, err
 	}
-	if session.Revision != expectedRevision {
-		return nil, &agent.SessionRevisionConflictError{
-			SessionID: session.ID,
-			Expected:  expectedRevision,
-			Current:   session.Revision,
-		}
-	}
-	if session.ReconcileRequired || session.LifecycleStatus == agent.SessionLifecycleInterrupted ||
-		session.LifecycleStatus == agent.SessionLifecycleRecoveryNeeded {
-		return nil, fmt.Errorf("%w: session %s", agent.ErrSessionReconcileRequired, session.ID)
-	}
-	if session.LifecycleStatus == agent.SessionLifecycleClosed {
-		return nil, fmt.Errorf("%w: closed session cannot start a run", agent.ErrSessionLifecycleInvalid)
-	}
-	if !sameDurableWorkspace(session.Workspace, workDir) {
-		return nil, fmt.Errorf("%w: durable session belongs to another workspace", agent.ErrSessionConflict)
-	}
-	if err := validateDurableRunTranscript(session.Messages, requestMessages); err != nil {
+	if err := validateDurableAgentSession(session, expectedRevision, workDir, requestMessages); err != nil {
 		return nil, err
 	}
 	toolResultMemory, toolResultRefs, err := store.OpenToolResultMemory(session.ID, workDir)
@@ -94,7 +83,259 @@ func prepareDurableAgentRun(
 		observer:         agent.NewDurableRunObserver(""),
 		toolResultMemory: toolResultMemory,
 		toolResultRefs:   append([]agent.ToolResultReference(nil), toolResultRefs...),
+		messages:         cloneCanonicalMessages(requestMessages),
 	}, nil
+}
+
+type durableImagePayload struct {
+	mediaType string
+	data      []byte
+}
+
+// PrepareImages commits the current turn's validated image bytes to the exact
+// durable session namespace, then rebuilds provider history from committed
+// references. It runs after the loop slot is acquired and before any provider
+// request or tool execution.
+func (run *durableAgentRun) PrepareImages(requestMessages []types.Message) error {
+	if run == nil || run.store == nil || run.toolResultMemory == nil {
+		return errors.New("durable session image store is unavailable")
+	}
+	if len(requestMessages) == 0 || requestMessages[len(requestMessages)-1].Role != "user" {
+		return errDurableTranscriptMismatch
+	}
+	images, err := canonicalImagesFromMessage(requestMessages[len(requestMessages)-1])
+	if err != nil {
+		return errDurableTranscriptMismatch
+	}
+	candidate := cloneDurableSession(run.session)
+	if len(images) > 0 {
+		messageIndex := -1
+		for index := range candidate.Messages {
+			if candidate.Messages[index].Role == "user" {
+				messageIndex = index
+			}
+		}
+		if messageIndex < 0 {
+			return errDurableTranscriptMismatch
+		}
+		references := make([]agent.SessionImageReference, 0, len(images))
+		for _, image := range images {
+			reference, storeErr := run.toolResultMemory.StoreImage(image.mediaType, image.data)
+			if storeErr != nil {
+				return errors.Join(storeErr, run.cleanupUnreferencedImages())
+			}
+			references = append(references, reference)
+		}
+		candidate.Messages[messageIndex].Attachments = references
+	}
+	hydrated, err := hydrateDurableImageHistory(candidate.Messages, requestMessages, run.toolResultMemory)
+	if err != nil {
+		return errors.Join(err, run.cleanupUnreferencedImages())
+	}
+	if err := protocol.ValidateCanonicalHistory(hydrated); err != nil {
+		budgetErr := fmt.Errorf("%w: %v", errDurableImageHistoryBudget, err)
+		return errors.Join(budgetErr, run.cleanupUnreferencedImages())
+	}
+	if len(images) > 0 {
+		run.pendingImages = &candidate
+	}
+	run.messages = hydrated
+	return nil
+}
+
+func (run *durableAgentRun) CommitImages() error {
+	if run == nil || run.pendingImages == nil {
+		return nil
+	}
+	if err := run.store.SaveExpected(run.pendingImages, run.expectedRevision); err != nil {
+		return errors.Join(err, run.DiscardPreparedImages())
+	}
+	run.session = cloneDurableSession(*run.pendingImages)
+	run.expectedRevision = run.pendingImages.Revision
+	run.pendingImages = nil
+	return nil
+}
+
+// DiscardPreparedImages removes only upload blobs that never became part of
+// the committed transcript. Plan preflight can fail after image preparation
+// but before the session revision is committed.
+func (run *durableAgentRun) DiscardPreparedImages() error {
+	if run == nil || run.pendingImages == nil {
+		return nil
+	}
+	run.pendingImages = nil
+	return run.cleanupUnreferencedImages()
+}
+
+func (run *durableAgentRun) cleanupUnreferencedImages() error {
+	if run == nil || run.store == nil || run.toolResultMemory == nil {
+		return nil
+	}
+	current, err := run.store.Get(run.session.ID)
+	if err != nil {
+		return err
+	}
+	return run.toolResultMemory.CleanupUnreferencedImages(current.Messages)
+}
+
+func canonicalImagesFromMessage(message types.Message) ([]durableImagePayload, error) {
+	if message.Role != "user" {
+		return nil, nil
+	}
+	var text string
+	if json.Unmarshal(message.Content, &text) == nil {
+		return nil, nil
+	}
+	var blocks []struct {
+		Type   string `json:"type"`
+		Source struct {
+			Type      string `json:"type"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
+		} `json:"source"`
+	}
+	if err := json.Unmarshal(message.Content, &blocks); err != nil {
+		return nil, err
+	}
+	images := make([]durableImagePayload, 0)
+	for _, block := range blocks {
+		if block.Type != "image" {
+			continue
+		}
+		if block.Source.Type != "base64" {
+			return nil, errors.New("invalid image source")
+		}
+		data, err := base64.StdEncoding.Strict().DecodeString(block.Source.Data)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, durableImagePayload{mediaType: block.Source.MediaType, data: data})
+	}
+	return images, nil
+}
+
+func hydrateDurableImageHistory(
+	persisted []agent.SessionMessage,
+	request []types.Message,
+	imageStore *agent.SessionMemory,
+) ([]types.Message, error) {
+	projected := make([]agent.SessionMessage, 0, len(persisted))
+	for _, message := range persisted {
+		if message.Role == "user" || message.Role == "assistant" {
+			projected = append(projected, message)
+		}
+	}
+	if len(projected) != len(request) {
+		return nil, errDurableTranscriptMismatch
+	}
+	result := cloneCanonicalMessages(request)
+	for index := range result {
+		if result[index].Role != "user" || len(projected[index].Attachments) == 0 {
+			continue
+		}
+		blocks, wasArray, err := contentBlocksWithoutImages(result[index].Content)
+		if err != nil {
+			return nil, errDurableTranscriptMismatch
+		}
+		if !wasArray {
+			var text string
+			if err := json.Unmarshal(result[index].Content, &text); err != nil {
+				return nil, errDurableTranscriptMismatch
+			}
+			if text != "" {
+				textBlock, _ := json.Marshal(map[string]string{"type": "text", "text": text})
+				blocks = append(blocks, textBlock)
+			}
+		}
+		for _, reference := range projected[index].Attachments {
+			data, err := imageStore.LoadImage(reference)
+			if err != nil {
+				return nil, fmt.Errorf("%w: referenced image cannot be resumed", agent.ErrSessionImageReferenceInvalid)
+			}
+			block, err := json.Marshal(types.ContentBlockParam{
+				Type: "image",
+				Source: &types.MediaSource{
+					Type: "base64", MediaType: reference.MediaType,
+					Data: base64.StdEncoding.EncodeToString(data),
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, block)
+		}
+		content, err := json.Marshal(blocks)
+		if err != nil {
+			return nil, err
+		}
+		result[index].Content = content
+	}
+	return result, nil
+}
+
+func contentBlocksWithoutImages(content json.RawMessage) ([]json.RawMessage, bool, error) {
+	var text string
+	if json.Unmarshal(content, &text) == nil {
+		return nil, false, nil
+	}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return nil, false, err
+	}
+	filtered := make([]json.RawMessage, 0, len(blocks))
+	for _, raw := range blocks {
+		var discriminator struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(raw, &discriminator) != nil {
+			return nil, false, errors.New("invalid content block")
+		}
+		if discriminator.Type != "image" {
+			filtered = append(filtered, append(json.RawMessage(nil), raw...))
+		}
+	}
+	return filtered, true, nil
+}
+
+func cloneCanonicalMessages(messages []types.Message) []types.Message {
+	if messages == nil {
+		return nil
+	}
+	cloned := make([]types.Message, len(messages))
+	copy(cloned, messages)
+	for index := range cloned {
+		cloned[index].Content = append(json.RawMessage(nil), messages[index].Content...)
+	}
+	return cloned
+}
+
+func validateDurableAgentSession(
+	session *agent.Session,
+	expectedRevision uint64,
+	requestedWorkDir string,
+	requestMessages []types.Message,
+) error {
+	if session == nil {
+		return errors.New("durable session is unavailable")
+	}
+	if session.Revision != expectedRevision {
+		return &agent.SessionRevisionConflictError{
+			SessionID: session.ID,
+			Expected:  expectedRevision,
+			Current:   session.Revision,
+		}
+	}
+	if session.ReconcileRequired || session.LifecycleStatus == agent.SessionLifecycleInterrupted ||
+		session.LifecycleStatus == agent.SessionLifecycleRecoveryNeeded {
+		return fmt.Errorf("%w: session %s", agent.ErrSessionReconcileRequired, session.ID)
+	}
+	if session.LifecycleStatus == agent.SessionLifecycleClosed {
+		return fmt.Errorf("%w: closed session cannot start a run", agent.ErrSessionLifecycleInvalid)
+	}
+	if strings.TrimSpace(requestedWorkDir) != "" && !sameDurableWorkspace(session.Workspace, requestedWorkDir) {
+		return fmt.Errorf("%w: %w", agent.ErrSessionConflict, errDurableWorkspaceConflict)
+	}
+	return validateDurableRunTranscript(session.Messages, requestMessages)
 }
 
 func (run *durableAgentRun) SetRuntimeRunID(id string) {
@@ -377,6 +618,12 @@ func validateDurableRunTranscript(persisted []agent.SessionMessage, request []ty
 	}
 	if incoming[len(incoming)-1].Role != "user" {
 		return errDurableTranscriptMismatch
+	}
+	for index := 0; index < len(request)-1; index++ {
+		images, imageErr := canonicalImagesFromMessage(request[index])
+		if imageErr != nil || len(images) > 0 {
+			return errDurableTranscriptMismatch
+		}
 	}
 	return nil
 }

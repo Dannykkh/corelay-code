@@ -12,12 +12,14 @@ const (
 	DangerSafe      DangerLevel = "safe"
 	DangerModerate  DangerLevel = "moderate"
 	DangerDangerous DangerLevel = "dangerous"
+	DangerUnknown   DangerLevel = "unknown"
 )
 
 type PermissionConfig struct {
-	AutoApprove     string   `json:"autoApprove"` // "safe", "moderate", "all", "none"
-	BlockedPaths    []string `json:"blockedPaths"`
-	BlockedCommands []string `json:"blockedCommands"`
+	AutoApprove        string   `json:"autoApprove"` // "safe", "moderate", "all", "none"
+	BlockedPaths       []string `json:"blockedPaths"`
+	BlockedCommands    []string `json:"blockedCommands"`
+	AllowExternalPaths bool     `json:"-"`
 }
 
 // PermissionDecision is the transport-neutral result consumed by the common
@@ -52,65 +54,25 @@ func DefaultPermissionConfig() PermissionConfig {
 	}
 }
 
-var dangerousBashPatterns = []string{
-	"rm -rf", "rm -r /", "sudo rm", "chmod 777", "mkfs", "dd if=",
-	":(){ :|:& };:", "> /dev/sda", "shutdown", "reboot", "kill -9 1",
-	"pkill -9", "> /dev/null 2>&1 &", "curl | sh", "wget | sh",
-}
-
-var moderateBashPatterns = []string{
-	"rm ", "mv ", "cp -r", "git push", "git reset --hard",
-	"npm publish", "docker rm", "pip install", "apt install",
-	"brew install", "chmod", "chown",
-}
-
 // ClassifyDanger returns the danger level for a tool call.
 func ClassifyDanger(toolName string, input json.RawMessage) (DangerLevel, string) {
 	toolName = canonicalPermissionToolName(toolName)
 	switch toolName {
-	case "Bash":
-		var args struct {
-			Command string `json:"command"`
+	case "Bash", "Git":
+		var object map[string]interface{}
+		if err := json.Unmarshal(input, &object); err != nil || object == nil {
+			level, reason := dangerForCommandEffect(unknownCommandEffect("invalid command input"))
+			return level, reason
 		}
-		json.Unmarshal(input, &args)
-		cmd := strings.ToLower(args.Command)
-
-		for _, p := range dangerousBashPatterns {
-			if strings.Contains(cmd, p) {
-				return DangerDangerous, "Dangerous command: " + p
-			}
-		}
-		for _, p := range moderateBashPatterns {
-			if strings.Contains(cmd, p) {
-				return DangerModerate, "Potentially risky: " + p
-			}
-		}
-		return DangerSafe, ""
+		return dangerForCommandEffect(classifyCommandEffect(toolName, object))
 
 	case "Write":
 		return DangerModerate, "Creating/overwriting file"
 
-	case "Git":
-		var args struct {
-			Command string `json:"command"`
-			Args    string `json:"args"`
-		}
-		json.Unmarshal(input, &args)
-		command := strings.ToLower(strings.TrimSpace(args.Command))
-		argv := strings.Fields(args.Args)
-
-		if dangerousGitInvocation(command, argv) {
-			return DangerDangerous, "Destructive git operation"
-		}
-		if mutatingGitInvocation(command, argv) {
-			return DangerModerate, "Git mutating command"
-		}
-		return DangerSafe, ""
-
 	case "Edit":
 		return DangerSafe, ""
 
-	case "Read", "Glob", "Grep", "LS", "RepoMap", loadToolResultToolName, reportCompletionToolName, "WebSearch", "WebFetch", "WebResearch",
+	case "Read", "Glob", "Grep", "LS", "RepoMap", "LSP", loadToolResultToolName, loadSkillToolName, reportCompletionToolName, "WebSearch", "WebFetch", "WebResearch",
 		"TaskCreate", "TaskUpdate", "TaskList",
 		"NotebookRead":
 		return DangerSafe, ""
@@ -274,7 +236,7 @@ func CheckPermission(toolName string, input json.RawMessage, workDir string, cfg
 	case "none":
 		return false, "Manual approval required", level
 	case "moderate":
-		if level == DangerDangerous {
+		if level == DangerDangerous || level == DangerUnknown {
 			return false, reason, level
 		}
 		return true, "", level
@@ -297,10 +259,25 @@ func ResolvePermission(
 	cfg PermissionConfig,
 	snapshotDecision string,
 ) PermissionResult {
+	return ResolvePermissionWithPolicy(toolName, input, workDir, cfg, snapshotDecision, nil)
+}
+
+// ResolvePermissionWithPolicy keeps the hard command/path checks intact and
+// applies the explicit full-mode authority only after explicit deny rules.
+func ResolvePermissionWithPolicy(
+	toolName string,
+	input json.RawMessage,
+	workDir string,
+	cfg PermissionConfig,
+	snapshotDecision string,
+	policy *ExecutionPolicySnapshot,
+) PermissionResult {
 	// AutoApprove=all isolates the non-overridable command and path checks from
 	// the configurable automatic-approval threshold.
 	hardCfg := cfg
 	hardCfg.AutoApprove = "all"
+	fullMode := policy != nil && policy.Mode == ExecutionModeFull
+	hardCfg.AllowExternalPaths = fullMode
 	hardAllowed, hardReason, danger := CheckPermission(toolName, input, workDir, hardCfg)
 	if !hardAllowed {
 		return PermissionResult{
@@ -320,6 +297,16 @@ func ResolvePermission(
 	case "allow":
 		return PermissionResult{Decision: PermissionAllow, Danger: danger}
 	}
+	if fullMode {
+		return PermissionResult{Decision: PermissionAllow, Danger: danger}
+	}
+	if requiresWorkspaceProcessApproval(toolName, policy) {
+		return PermissionResult{
+			Decision: PermissionApproval,
+			Reason:   "Workspace process isolation is unavailable; approve this host command explicitly",
+			Danger:   danger,
+		}
+	}
 
 	autoAllowed, autoReason, _ := CheckPermission(toolName, input, workDir, cfg)
 	if autoAllowed {
@@ -332,5 +319,17 @@ func ResolvePermission(
 		Decision: PermissionApproval,
 		Reason:   autoReason,
 		Danger:   danger,
+	}
+}
+
+func requiresWorkspaceProcessApproval(toolName string, policy *ExecutionPolicySnapshot) bool {
+	if policy == nil || policy.Mode != ExecutionModeWorkspace || policy.RuntimeCapabilities.FilesystemIsolation {
+		return false
+	}
+	switch canonicalPermissionToolName(toolName) {
+	case "Bash", "Git":
+		return true
+	default:
+		return false
 	}
 }

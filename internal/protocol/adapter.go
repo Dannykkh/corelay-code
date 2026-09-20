@@ -22,12 +22,18 @@ import (
 // adapter boundary must reject oversized HTTP frames before they enter the
 // provider/router kernel.
 const (
-	MaxRequestBytes = 8 << 20
-	MaxOutputBytes  = 16 << 20
-	MaxEvents       = 16_384
-	MaxMessages     = 2_048
-	MaxTools        = 256
-	MaxStringBytes  = 1 << 20
+	MaxRequestBytes      = 8 << 20
+	MaxOutputBytes       = 16 << 20
+	MaxEvents            = 16_384
+	MaxMessages          = 2_048
+	MaxTools             = 256
+	MaxStringBytes       = 1 << 20
+	MaxImageBytes        = 4 << 20
+	MaxTotalImageBytes   = 5 << 20
+	MaxImageBlocks       = 8
+	MaxImageDimension    = 8_192
+	MaxImagePixels       = 24_000_000
+	MaxImageEncodedBytes = 4 * ((MaxImageBytes + 2) / 3)
 )
 
 type Name string

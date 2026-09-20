@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -113,6 +114,26 @@ func TestBuildBubblewrapSpecPreservesArgvAndWorkspaceRules(t *testing.T) {
 	}
 	if _, mutated := original.Set["TMPDIR"]; mutated {
 		t.Fatal("builder mutated caller environment")
+	}
+}
+
+func TestBuildBubblewrapSpecStagesTemporaryExecutableBeforeIsolatingTmp(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("bubblewrap temporary mount layout is Linux-specific")
+	}
+	workspace := t.TempDir()
+	executable := filepath.Join(t.TempDir(), "mcp-helper")
+	prepared, err := buildBubblewrapSpec("/fixture/bwrap", sandbox.Capabilities{}, sandbox.Policy{
+		Enforcement: sandbox.EnforcementRequired, Workspace: workspace, WorkspaceAccess: sandbox.WorkspaceReadWrite,
+	}, Spec{Executable: executable, Dir: workspace})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !containsArgumentSequence(prepared.Spec.Args, []string{"--tmpfs", "/run", "--ro-bind", executable, "/run/corelay-bwrap-command"}) {
+		t.Fatalf("temporary executable was not staged before tmpfs: %#v", prepared.Spec.Args)
+	}
+	if !containsArgumentSequence(prepared.Spec.Args, []string{"--", "/run/corelay-bwrap-command"}) {
+		t.Fatalf("staged executable was not selected for launch: %#v", prepared.Spec.Args)
 	}
 }
 

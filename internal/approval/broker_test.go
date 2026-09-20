@@ -7,6 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 func testDraft(sessionID string) Draft {
@@ -488,6 +491,277 @@ func TestBrokerDefaultAndConfiguredTTL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func fullModeTestPolicy(t *testing.T, revision uint64) executionpolicy.Snapshot {
+	t.Helper()
+	policy, err := executionpolicy.Resolve(
+		executionpolicy.Request{Mode: executionpolicy.ModeFull, Revision: revision},
+		"",
+		sandbox.Capabilities{ProcessTreeKill: true},
+	)
+	if err != nil {
+		t.Fatalf("Resolve(full policy) = %v", err)
+	}
+	return policy
+}
+
+func fullModeTestDraft(policy executionpolicy.Snapshot) Draft {
+	return Draft{
+		SessionID:               "session-full",
+		SessionRevision:         12,
+		RunID:                   "run-full",
+		ToolCallID:              "call-full",
+		ToolName:                "plugin_write",
+		ExecutorID:              "plugin:sha256:" + strings.Repeat("b", 64),
+		RedactedInput:           `{"path":"outside.tmp"}`,
+		InputDigest:             "sha256:" + strings.Repeat("a", 64),
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		DangerLevel:             "moderate",
+		Scope:                   "outside.tmp",
+	}
+}
+
+func TestBrokerFullModeGrantIsScopedAndConsumedOnceWithoutPrompt(t *testing.T) {
+	broker := NewBroker(time.Minute)
+	t.Cleanup(broker.Shutdown)
+	policy := fullModeTestPolicy(t, 41)
+	draft := fullModeTestDraft(policy)
+
+	grant, err := broker.IssueFullModeGrant(draft, policy)
+	if err != nil {
+		t.Fatalf("IssueFullModeGrant() = %v", err)
+	}
+	if grant.ID == "" || grant.ApprovalSource != ApprovalSourceUserSelectedFull ||
+		grant.SessionID != draft.SessionID || grant.SessionRevision != draft.SessionRevision ||
+		grant.RunID != draft.RunID || grant.ToolCallID != draft.ToolCallID ||
+		grant.ToolName != draft.ToolName || grant.ExecutorID != draft.ExecutorID ||
+		grant.InputDigest != draft.InputDigest ||
+		grant.ExecutionPolicyRevision != policy.Revision ||
+		grant.FullSelectionRevision != policy.FullSelectionRevision ||
+		grant.RememberAllowed || grant.ExpiresAt.IsZero() || !grant.ExpiresAt.After(time.Now()) {
+		t.Fatalf("full-mode grant metadata = %#v", grant)
+	}
+	if _, err := broker.Await(context.Background(), draft.SessionID, grant.ID); !errors.Is(err, ErrApprovalNotFound) {
+		t.Fatalf("Await(full grant) = %v, want no UI approval request", err)
+	}
+	if err := broker.ConsumeFullModeGrant(grant, draft, policy); err != nil {
+		t.Fatalf("ConsumeFullModeGrant() = %v", err)
+	}
+	if err := broker.ConsumeFullModeGrant(grant, draft, policy); !errors.Is(err, ErrApprovalNotFound) {
+		t.Fatalf("replay ConsumeFullModeGrant() = %v, want not found", err)
+	}
+	if (Resolution{ApprovalID: grant.ID, Outcome: OutcomeAllowOnce, Reason: ResolutionReason("user-selected-full")}).Allowed() {
+		t.Fatal("a full-mode grant must not masquerade as a user prompt resolution")
+	}
+}
+
+func TestBrokerFullModeGrantRequiresExplicitFullSelectionAndExactMetadata(t *testing.T) {
+	full := fullModeTestPolicy(t, 52)
+	workspace, err := executionpolicy.Resolve(
+		executionpolicy.Request{Mode: executionpolicy.ModeWorkspace, Revision: full.Revision},
+		"",
+		sandbox.Capabilities{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultPolicy, err := executionpolicy.Resolve(executionpolicy.Request{}, "moderate", sandbox.Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inherited, err := executionpolicy.ResolveChild(full, "", sandbox.Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inheritedWithoutSelection := inherited
+	inheritedWithoutSelection.FullSelectionRevision = 0
+	invalidFullRevision := full
+	invalidFullRevision.FullSelectionRevision++
+	invalidSource := full
+	invalidSource.Source = executionpolicy.SourceLegacyMigration
+
+	tests := []struct {
+		name   string
+		policy executionpolicy.Snapshot
+		mutate func(*Draft)
+	}{
+		{name: "workspace mode", policy: workspace},
+		{name: "default workspace", policy: defaultPolicy},
+		{name: "inherited full without selected parent revision", policy: inheritedWithoutSelection},
+		{name: "wrong full selection revision", policy: invalidFullRevision},
+		{name: "non-user-selected source", policy: invalidSource},
+		{name: "missing session", policy: full, mutate: func(d *Draft) { d.SessionID = "" }},
+		{name: "missing run", policy: full, mutate: func(d *Draft) { d.RunID = "" }},
+		{name: "missing call id", policy: full, mutate: func(d *Draft) { d.ToolCallID = "" }},
+		{name: "missing tool", policy: full, mutate: func(d *Draft) { d.ToolName = "" }},
+		{name: "missing executor identity", policy: full, mutate: func(d *Draft) { d.ExecutorID = "" }},
+		{name: "malformed digest", policy: full, mutate: func(d *Draft) { d.InputDigest = "sha256:bad" }},
+		{name: "wrong policy revision", policy: full, mutate: func(d *Draft) { d.ExecutionPolicyRevision++ }},
+		{name: "wrong full selection revision", policy: full, mutate: func(d *Draft) { d.FullSelectionRevision++ }},
+		{name: "remember across calls", policy: full, mutate: func(d *Draft) { d.RememberAllowed = true }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker := NewBroker(time.Minute)
+			t.Cleanup(broker.Shutdown)
+			draft := fullModeTestDraft(test.policy)
+			if test.mutate != nil {
+				test.mutate(&draft)
+			}
+			if _, err := broker.IssueFullModeGrant(draft, test.policy); !errors.Is(err, ErrInvalidFullModeGrant) {
+				t.Fatalf("IssueFullModeGrant() = %v, want ErrInvalidFullModeGrant", err)
+			}
+		})
+	}
+
+	t.Run("inherited full with selected parent revision", func(t *testing.T) {
+		broker := NewBroker(time.Minute)
+		t.Cleanup(broker.Shutdown)
+		draft := fullModeTestDraft(inherited)
+		grant, err := broker.IssueFullModeGrant(draft, inherited)
+		if err != nil {
+			t.Fatalf("IssueFullModeGrant(inherited) = %v", err)
+		}
+		if grant.ApprovalSource != ApprovalSourceUserSelectedFull ||
+			grant.ExecutionPolicyRevision != inherited.Revision ||
+			grant.FullSelectionRevision != full.FullSelectionRevision {
+			t.Fatalf("inherited grant lost parent selection binding: %#v", grant)
+		}
+		if err := broker.ConsumeFullModeGrant(grant, draft, inherited); err != nil {
+			t.Fatalf("ConsumeFullModeGrant(inherited) = %v", err)
+		}
+	})
+}
+
+func TestBrokerFullModeGrantConsumeRejectsChangedCallOrPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		changeGrant func(*Pending)
+		changeDraft func(*Draft)
+		changeMode  func(*executionpolicy.Snapshot)
+	}{
+		{name: "session", changeDraft: func(d *Draft) { d.SessionID += "-other" }},
+		{name: "run", changeDraft: func(d *Draft) { d.RunID += "-other" }},
+		{name: "call id", changeDraft: func(d *Draft) { d.ToolCallID += "-other" }},
+		{name: "tool", changeDraft: func(d *Draft) { d.ToolName += "-other" }},
+		{name: "executor", changeDraft: func(d *Draft) { d.ExecutorID += "-other" }},
+		{name: "input digest", changeDraft: func(d *Draft) { d.InputDigest = "sha256:" + strings.Repeat("c", 64) }},
+		{name: "policy revision", changeMode: func(p *executionpolicy.Snapshot) { p.Revision++ }},
+		{name: "full selection revision", changeMode: func(p *executionpolicy.Snapshot) { p.FullSelectionRevision++ }},
+		{name: "runtime snapshot", changeMode: func(p *executionpolicy.Snapshot) { p.RuntimeCapabilities.ProcessTreeKill = false }},
+		{name: "approval source", changeGrant: func(p *Pending) { p.ApprovalSource = "user-prompt" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker := NewBroker(time.Minute)
+			t.Cleanup(broker.Shutdown)
+			policy := fullModeTestPolicy(t, 63)
+			draft := fullModeTestDraft(policy)
+			grant, err := broker.IssueFullModeGrant(draft, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changedGrant, changedDraft, changedPolicy := grant, draft, policy
+			if test.changeGrant != nil {
+				test.changeGrant(&changedGrant)
+			}
+			if test.changeDraft != nil {
+				test.changeDraft(&changedDraft)
+			}
+			if test.changeMode != nil {
+				test.changeMode(&changedPolicy)
+				if changedDraft.ExecutionPolicyRevision == policy.Revision &&
+					changedPolicy.Revision != policy.Revision {
+					changedDraft.ExecutionPolicyRevision = changedPolicy.Revision
+					changedDraft.FullSelectionRevision = changedPolicy.FullSelectionRevision
+				}
+			}
+			if err := broker.ConsumeFullModeGrant(changedGrant, changedDraft, changedPolicy); !errors.Is(err, ErrInvalidFullModeGrant) {
+				t.Fatalf("ConsumeFullModeGrant(changed) = %v, want ErrInvalidFullModeGrant", err)
+			}
+			if err := broker.ConsumeFullModeGrant(grant, draft, policy); err != nil {
+				t.Fatalf("valid grant was consumed by a mismatched attempt: %v", err)
+			}
+		})
+	}
+}
+
+func TestBrokerFullModeGrantExpiryCancellationAndConcurrentConsumption(t *testing.T) {
+	t.Run("expiry", func(t *testing.T) {
+		broker := NewBroker(time.Hour)
+		t.Cleanup(broker.Shutdown)
+		policy := fullModeTestPolicy(t, 70)
+		draft := fullModeTestDraft(policy)
+		grant, err := broker.IssueFullModeGrant(draft, policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		broker.mu.Lock()
+		entry := broker.fullModeGrants[grant.ID]
+		entry.pending.ExpiresAt = time.Now().Add(-time.Second)
+		broker.mu.Unlock()
+		if err := broker.ConsumeFullModeGrant(grant, draft, policy); !errors.Is(err, ErrApprovalExpired) {
+			t.Fatalf("ConsumeFullModeGrant(expired) = %v, want ErrApprovalExpired", err)
+		}
+	})
+
+	t.Run("session cancellation", func(t *testing.T) {
+		broker := NewBroker(time.Hour)
+		t.Cleanup(broker.Shutdown)
+		policy := fullModeTestPolicy(t, 71)
+		draft := fullModeTestDraft(policy)
+		grant, err := broker.IssueFullModeGrant(draft, policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		broker.CancelSession(draft.SessionID)
+		if err := broker.ConsumeFullModeGrant(grant, draft, policy); !errors.Is(err, ErrApprovalNotFound) {
+			t.Fatalf("ConsumeFullModeGrant(canceled) = %v, want invalidated grant", err)
+		}
+	})
+
+	t.Run("concurrent one-time consume", func(t *testing.T) {
+		broker := NewBroker(time.Minute)
+		t.Cleanup(broker.Shutdown)
+		policy := fullModeTestPolicy(t, 72)
+		draft := fullModeTestDraft(policy)
+		grant, err := broker.IssueFullModeGrant(draft, policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		const contenders = 32
+		start := make(chan struct{})
+		results := make(chan error, contenders)
+		var workers sync.WaitGroup
+		workers.Add(contenders)
+		for i := 0; i < contenders; i++ {
+			go func() {
+				defer workers.Done()
+				<-start
+				results <- broker.ConsumeFullModeGrant(grant, draft, policy)
+			}()
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		consumed, rejected := 0, 0
+		for err := range results {
+			switch {
+			case err == nil:
+				consumed++
+			case errors.Is(err, ErrApprovalNotFound):
+				rejected++
+			default:
+				t.Fatalf("concurrent ConsumeFullModeGrant() = %v", err)
+			}
+		}
+		if consumed != 1 || rejected != contenders-1 {
+			t.Fatalf("consumed=%d rejected=%d, want 1/%d", consumed, rejected, contenders-1)
+		}
+	})
 }
 
 func TestBrokerRejectsUnsafeOrIncompleteDrafts(t *testing.T) {

@@ -87,6 +87,7 @@ type runtimeModelInfo struct {
 	Group         runtimeplane.ProviderGroup `json:"group"`
 	ContextWindow int                        `json:"contextWindow,omitempty"`
 	MaxOutput     int                        `json:"maxOutput,omitempty"`
+	ImageInput    types.ImageInputCapability `json:"imageInput,omitempty"`
 }
 
 func (s *Server) handleRuntimeStatus(w http.ResponseWriter, _ *http.Request) {
@@ -349,5 +350,6 @@ func runtimeModelFromProvider(model types.ModelInfo) runtimeModelInfo {
 		Group:         runtimeplane.ClassifyModelGroup(model.ID),
 		ContextWindow: model.ContextWindow,
 		MaxOutput:     model.MaxOutput,
+		ImageInput:    model.ImageInput,
 	}
 }

@@ -6,11 +6,23 @@ import (
 )
 
 type ModelInfo struct {
-	ID            string `json:"id"`
-	DisplayName   string `json:"displayName"`
-	ContextWindow int    `json:"contextWindow,omitempty"`
-	MaxOutput     int    `json:"maxOutput,omitempty"`
+	ID            string               `json:"id"`
+	DisplayName   string               `json:"displayName"`
+	ContextWindow int                  `json:"contextWindow,omitempty"`
+	MaxOutput     int                  `json:"maxOutput,omitempty"`
+	ImageInput    ImageInputCapability `json:"imageInput,omitempty"`
 }
+
+// ImageInputCapability describes whether this Corelay provider/model path can
+// pass canonical image blocks through to the model. Empty is Unknown; the
+// transport alone being able to encode images is not enough to claim support.
+type ImageInputCapability string
+
+const (
+	ImageInputUnknown     ImageInputCapability = ""
+	ImageInputUnsupported ImageInputCapability = "unsupported"
+	ImageInputSupported   ImageInputCapability = "supported"
+)
 
 type ProviderConfig struct {
 	APIKey  string `json:"apiKey,omitempty"`

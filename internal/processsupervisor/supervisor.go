@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
@@ -20,22 +21,24 @@ const stopTimeout = 5 * time.Second
 // Spec is an immutable long-lived process description. Start clones every
 // collection before it crosses the runner boundary.
 type Spec struct {
-	Executable  string
-	Args        []string
-	Dir         string
-	Environment sandbox.EnvironmentSpec
+	Executable      string
+	Args            []string
+	Dir             string
+	Environment     sandbox.EnvironmentSpec
+	ExecutionPolicy executionpolicy.Snapshot
 }
 
 // Report is the immutable capability and policy snapshot captured at start.
 // It intentionally excludes argv, environment values, and process output.
 type Report struct {
-	Runner       string               `json:"runner"`
-	Policy       sandbox.Policy       `json:"policy"`
-	Capabilities sandbox.Capabilities `json:"capabilities"`
-	Applied      sandbox.Capabilities `json:"applied"`
-	Started      bool                 `json:"started"`
-	Failure      sandbox.FailureCode  `json:"failure,omitempty"`
-	Detail       string               `json:"detail,omitempty"`
+	Runner          string                   `json:"runner"`
+	Policy          sandbox.Policy           `json:"policy"`
+	Capabilities    sandbox.Capabilities     `json:"capabilities"`
+	Applied         sandbox.Capabilities     `json:"applied"`
+	ExecutionPolicy executionpolicy.Snapshot `json:"executionPolicy"`
+	Started         bool                     `json:"started"`
+	Failure         sandbox.FailureCode      `json:"failure,omitempty"`
+	Detail          string                   `json:"detail,omitempty"`
 }
 
 // Runner starts a supervised process with streaming stdio. Implementations
@@ -222,7 +225,13 @@ func (r *HostRunner) Capabilities() sandbox.Capabilities {
 }
 
 func (r *HostRunner) Start(ctx context.Context, policy sandbox.Policy, input Spec) (*Process, Report) {
-	report := Report{Runner: r.Name(), Policy: policy, Capabilities: r.Capabilities()}
+	capabilities := r.Capabilities()
+	report := Report{
+		Runner:          r.Name(),
+		Policy:          policy,
+		Capabilities:    capabilities,
+		ExecutionPolicy: executionPolicyForReport(input.ExecutionPolicy, capabilities),
+	}
 	fail := func(code sandbox.FailureCode, detail string) (*Process, Report) {
 		report.Failure = code
 		report.Detail = detail
@@ -231,7 +240,7 @@ func (r *HostRunner) Start(ctx context.Context, policy sandbox.Policy, input Spe
 	if policy.Enforcement != sandbox.EnforcementDisabled {
 		return fail(sandbox.FailureCapabilityUnavailable, "host runner requires explicitly disabled enforcement")
 	}
-	if err := sandbox.ValidatePolicy(policy, r.Capabilities()); err != nil {
+	if err := sandbox.ValidatePolicy(policy, capabilities); err != nil {
 		return fail(sandboxFailure(err), err.Error())
 	}
 	spec := cloneSpec(input)
@@ -280,7 +289,7 @@ func (r *HostRunner) Start(ctx context.Context, policy sandbox.Policy, input Spe
 
 	report.Started = true
 	report.Applied = sandbox.Capabilities{
-		ProcessTreeKill:      r.Capabilities().ProcessTreeKill,
+		ProcessTreeKill:      capabilities.ProcessTreeKill,
 		EnvironmentFiltering: true,
 		Timeouts:             true,
 	}
@@ -311,17 +320,47 @@ func NewUnavailableRunner(reason string) *UnavailableRunner {
 }
 func (r *UnavailableRunner) Name() string                       { return "unavailable" }
 func (r *UnavailableRunner) Capabilities() sandbox.Capabilities { return sandbox.Capabilities{} }
-func (r *UnavailableRunner) Start(_ context.Context, policy sandbox.Policy, _ Spec) (*Process, Report) {
+func (r *UnavailableRunner) Start(_ context.Context, policy sandbox.Policy, input Spec) (*Process, Report) {
 	detail := r.reason
 	if detail == "" {
 		detail = "no secure long-lived process adapter is configured"
 	}
+	capabilities := r.Capabilities()
 	return nil, Report{
-		Runner:       r.Name(),
-		Policy:       policy,
-		Capabilities: r.Capabilities(),
-		Failure:      sandbox.FailureRunnerUnavailable,
-		Detail:       detail,
+		Runner:          r.Name(),
+		Policy:          policy,
+		Capabilities:    capabilities,
+		ExecutionPolicy: executionPolicyForReport(input.ExecutionPolicy, capabilities),
+		Failure:         sandbox.FailureRunnerUnavailable,
+		Detail:          detail,
+	}
+}
+
+// executionPolicyForReport copies only the policy's non-secret identity fields
+// and binds capability facts to this runner. A caller-provided capability
+// claim is metadata only and must never be reported as a runtime fact.
+func executionPolicyForReport(snapshot executionpolicy.Snapshot, capabilities sandbox.Capabilities) executionpolicy.Snapshot {
+	mode := snapshot.Mode
+	switch mode {
+	case executionpolicy.ModeReadOnly, executionpolicy.ModeWorkspace, executionpolicy.ModeFull:
+	default:
+		mode = ""
+	}
+	source := snapshot.Source
+	switch source {
+	case executionpolicy.SourceDefault, executionpolicy.SourceLegacyMigration,
+		executionpolicy.SourceUserSelected, executionpolicy.SourceInherited,
+		executionpolicy.SourceChildRestriction:
+	default:
+		source = ""
+	}
+	return executionpolicy.Snapshot{
+		Mode:                  mode,
+		Revision:              snapshot.Revision,
+		RuntimeCapabilities:   capabilities,
+		ParentRevision:        snapshot.ParentRevision,
+		FullSelectionRevision: snapshot.FullSelectionRevision,
+		Source:                source,
 	}
 }
 

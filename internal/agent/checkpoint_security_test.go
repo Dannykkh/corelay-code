@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,16 +17,18 @@ type checkpointSecurityFixture struct {
 	outside   string
 	canonical string
 	dir       string
+	sessionID string
 }
 
 func newCheckpointSecurityFixture(t *testing.T) checkpointSecurityFixture {
 	t.Helper()
 	root := t.TempDir()
 	fixture := checkpointSecurityFixture{
-		root:     root,
-		workDir:  filepath.Join(root, "workspace"),
-		stateDir: filepath.Join(root, "state"),
-		outside:  filepath.Join(root, "outside"),
+		root:      root,
+		workDir:   filepath.Join(root, "workspace"),
+		stateDir:  filepath.Join(root, "state"),
+		outside:   filepath.Join(root, "outside"),
+		sessionID: "checkpoint-security-session",
 	}
 	t.Setenv("ANICLEW_CONFIG_DIR", fixture.stateDir)
 	for _, dir := range []string{fixture.workDir, fixture.stateDir, fixture.outside} {
@@ -38,7 +41,7 @@ func newCheckpointSecurityFixture(t *testing.T) checkpointSecurityFixture {
 		t.Fatalf("canonical workspace: %v", err)
 	}
 	fixture.canonical = canonical
-	fixture.dir = checkpointDir(fixture.workDir)
+	fixture.dir = checkpointDir(fixture.workDir, fixture.sessionID)
 	if fixture.dir == "" {
 		t.Fatal("checkpointDir returned an empty path")
 	}
@@ -70,11 +73,34 @@ func writeCheckpointSecurityManifest(t *testing.T, fixture checkpointSecurityFix
 }
 
 func validCheckpointSecurityManifest(fixture checkpointSecurityFixture, files map[string]ckptFile) ckptManifest {
-	return ckptManifest{
-		Version: checkpointManifestVersion,
-		WorkDir: fixture.canonical,
-		Files:   files,
+	for rel, entry := range files {
+		if entry.PreimageDigest == "" {
+			entry.PreimageDigest = checkpointStateRevision(entry.Existed, []byte("checkpoint-security-preimage"))
+		}
+		if entry.PostimageDigest == "" {
+			entry.PostimageDigest = checkpointStateRevision(false, nil)
+		}
+		if entry.Existed && entry.PreimageMode == nil {
+			mode := uint32(0o600)
+			entry.PreimageMode = &mode
+		}
+		entry.PostimageCaptured = true
+		files[rel] = entry
 	}
+	return ckptManifest{
+		Version:         checkpointManifestVersion,
+		WorkDir:         fixture.canonical,
+		SessionDigest:   checkpointSessionDigest(fixture.sessionID),
+		SessionRevision: 1,
+		RunID:           "run-checkpoint-security",
+		Generation:      "checkpoint_run-checkpoint-security",
+		CheckpointKey:   checkpointManifestKey(fixture.canonical, checkpointSessionDigest(fixture.sessionID), "run-checkpoint-security", "checkpoint_run-checkpoint-security"),
+		Files:           files,
+	}
+}
+
+func checkpointSecurityOwner(fixture checkpointSecurityFixture) checkpointOwner {
+	return newCheckpointOwner(fixture.sessionID, 1, "run-checkpoint-security")
 }
 
 func TestUndoCheckpointSecureRestoresValidManifest(t *testing.T) {
@@ -83,13 +109,33 @@ func TestUndoCheckpointSecureRestoresValidManifest(t *testing.T) {
 	created := filepath.Join(fixture.workDir, "created.txt")
 	writeCheckpointSecurityFile(t, existing, "before")
 
-	startCheckpoint(fixture.workDir)
-	checkpointFile(fixture.workDir, "existing.txt", existing)
+	owner := checkpointSecurityOwner(fixture)
+	if err := startCheckpoint(fixture.workDir, owner); err != nil {
+		t.Fatalf("startCheckpoint: %v", err)
+	}
+	if err := checkpointFile(fixture.workDir, "existing.txt", existing, owner); err != nil {
+		t.Fatalf("checkpoint existing file: %v", err)
+	}
 	writeCheckpointSecurityFile(t, existing, "after")
-	checkpointFile(fixture.workDir, "created.txt", created)
+	if err := checkpointFile(fixture.workDir, "created.txt", created, owner); err != nil {
+		t.Fatalf("checkpoint created file: %v", err)
+	}
 	writeCheckpointSecurityFile(t, created, "created")
+	var mutations []committedFileMutation
+	for _, path := range []string{existing, created} {
+		revision, err := readLedgerFileRevision(path)
+		if err != nil {
+			t.Fatalf("read final revision for %s: %v", path, err)
+		}
+		mutations = append(mutations, committedFileMutation{
+			Snapshot: fileMutationSnapshot{Path: path}, PostRevision: revision,
+		})
+	}
+	if err := recordCheckpointPostimages(fixture.workDir, owner, mutations); err != nil {
+		t.Fatalf("record checkpoint postimages: %v", err)
+	}
 
-	reverted, ok, err := undoCheckpointSecure(fixture.workDir)
+	reverted, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID)
 	if err != nil {
 		t.Fatalf("undoCheckpointSecure: %v", err)
 	}
@@ -118,7 +164,7 @@ func TestUndoCheckpointPreflightsAllEntriesBeforeMutation(t *testing.T) {
 		"z/../../outside-canary.txt": {Existed: false},
 	}))
 
-	if reverted, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok || len(reverted) != 0 {
+	if reverted, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok || len(reverted) != 0 {
 		t.Fatalf("unsafe manifest result = %#v, %v, %v; want rejected before mutation", reverted, ok, err)
 	}
 	if data, err := os.ReadFile(createdCanary); err != nil || string(data) != "must remain" {
@@ -138,7 +184,7 @@ func TestUndoCheckpointClearsValidExhaustedCreatedEntry(t *testing.T) {
 		"already-absent.txt": {Existed: false},
 	}))
 
-	if reverted, ok, err := undoCheckpointSecure(fixture.workDir); err != nil || ok || len(reverted) != 0 {
+	if reverted, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err != nil || ok || len(reverted) != 0 {
 		t.Fatalf("exhausted manifest result = %#v, %v, %v", reverted, ok, err)
 	}
 	if _, err := os.Stat(fixture.dir); !os.IsNotExist(err) {
@@ -166,7 +212,7 @@ func TestUndoCheckpointRejectsUnsafeManifestTargets(t *testing.T) {
 				test.target(fixture): {Existed: false},
 			}))
 
-			if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+			if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 				t.Fatalf("unsafe target was not rejected: ok=%v err=%v", ok, err)
 			}
 			if data, err := os.ReadFile(canary); err != nil || string(data) != "unchanged" {
@@ -188,7 +234,7 @@ func TestUndoCheckpointRejectsTargetAndBackupSymlinkEscapes(t *testing.T) {
 			filepath.Join("escape", "canary.txt"): {Existed: false},
 		}))
 
-		if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+		if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 			t.Fatalf("target symlink escape was not rejected: ok=%v err=%v", ok, err)
 		}
 		if data, err := os.ReadFile(outsideCanary); err != nil || string(data) != "outside" {
@@ -209,7 +255,7 @@ func TestUndoCheckpointRejectsTargetAndBackupSymlinkEscapes(t *testing.T) {
 			"victim.txt": {Existed: true, Backup: "escape.bak"},
 		}))
 
-		if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+		if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 			t.Fatalf("backup symlink escape was not rejected: ok=%v err=%v", ok, err)
 		}
 		if data, err := os.ReadFile(victim); err != nil || string(data) != "current" {
@@ -238,7 +284,7 @@ func TestUndoCheckpointRejectsUnsafeBackupPathsBeforeMutation(t *testing.T) {
 				"victim.txt": {Existed: true, Backup: test.backup(fixture)},
 			}))
 
-			if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+			if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 				t.Fatalf("unsafe backup was not rejected: ok=%v err=%v", ok, err)
 			}
 			if data, err := os.ReadFile(victim); err != nil || string(data) != "current" {
@@ -256,13 +302,30 @@ func TestUndoCheckpointRejectsVersionWorkspaceAndControlState(t *testing.T) {
 		m := validCheckpointSecurityManifest(fixture, map[string]ckptFile{"canary.txt": {Existed: false}})
 		m.Version++
 		writeCheckpointSecurityManifest(t, fixture, m)
-		if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+		if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 			t.Fatalf("unsupported version was not rejected: ok=%v err=%v", ok, err)
 		}
 		if data, _ := os.ReadFile(canary); string(data) != "keep" {
 			t.Fatalf("version rejection changed canary: %q", data)
 		}
 	})
+
+	for _, version := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("legacy version %d", version), func(t *testing.T) {
+			fixture := newCheckpointSecurityFixture(t)
+			canary := filepath.Join(fixture.workDir, "canary.txt")
+			writeCheckpointSecurityFile(t, canary, "keep")
+			m := validCheckpointSecurityManifest(fixture, map[string]ckptFile{"canary.txt": {Existed: false}})
+			m.Version = version
+			writeCheckpointSecurityManifest(t, fixture, m)
+			if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
+				t.Fatalf("legacy checkpoint version %d was not rejected: ok=%v err=%v", version, ok, err)
+			}
+			if data, _ := os.ReadFile(canary); string(data) != "keep" {
+				t.Fatalf("legacy rejection changed canary: %q", data)
+			}
+		})
+	}
 
 	t.Run("workspace binding", func(t *testing.T) {
 		fixture := newCheckpointSecurityFixture(t)
@@ -279,7 +342,7 @@ func TestUndoCheckpointRejectsVersionWorkspaceAndControlState(t *testing.T) {
 		m := validCheckpointSecurityManifest(fixture, map[string]ckptFile{"canary.txt": {Existed: false}})
 		m.WorkDir = otherCanonical
 		writeCheckpointSecurityManifest(t, fixture, m)
-		if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+		if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 			t.Fatalf("foreign workspace manifest was not rejected: ok=%v err=%v", ok, err)
 		}
 		if data, _ := os.ReadFile(canary); string(data) != "keep" {
@@ -294,13 +357,44 @@ func TestUndoCheckpointRejectsVersionWorkspaceAndControlState(t *testing.T) {
 		writeCheckpointSecurityManifest(t, fixture, validCheckpointSecurityManifest(fixture, map[string]ckptFile{
 			"victim.txt": {Existed: true, Backup: "manifest.json"},
 		}))
-		if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+		if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 			t.Fatalf("manifest-as-backup was not rejected: ok=%v err=%v", ok, err)
 		}
 		if data, _ := os.ReadFile(victim); string(data) != "current" {
 			t.Fatalf("control-path rejection changed victim: %q", data)
 		}
 	})
+}
+
+func TestUndoCheckpointRejectsInvalidPreimageModes(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry ckptFile
+	}{
+		{name: "missing existing-file mode", entry: ckptFile{Existed: true}},
+		{name: "mode has non-permission bits", entry: func() ckptFile { mode := uint32(0o1000); return ckptFile{Existed: true, PreimageMode: &mode} }()},
+		{name: "created file carries a mode", entry: func() ckptFile { mode := uint32(0o600); return ckptFile{Existed: false, PreimageMode: &mode} }()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newCheckpointSecurityFixture(t)
+			canary := filepath.Join(fixture.workDir, "canary.txt")
+			writeCheckpointSecurityFile(t, canary, "keep")
+			m := validCheckpointSecurityManifest(fixture, map[string]ckptFile{"canary.txt": tt.entry})
+			if tt.name == "missing existing-file mode" {
+				entry := m.Files["canary.txt"]
+				entry.PreimageMode = nil
+				m.Files["canary.txt"] = entry
+			}
+			writeCheckpointSecurityManifest(t, fixture, m)
+			if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
+				t.Fatalf("invalid preimage mode was not rejected: ok=%v err=%v", ok, err)
+			}
+			if data, _ := os.ReadFile(canary); string(data) != "keep" {
+				t.Fatalf("invalid mode rejection changed canary: %q", data)
+			}
+		})
+	}
 }
 
 func TestUndoCheckpointRejectsAgentAndRepositoryControlTargets(t *testing.T) {
@@ -314,7 +408,7 @@ func TestUndoCheckpointRejectsAgentAndRepositoryControlTargets(t *testing.T) {
 			writeCheckpointSecurityManifest(t, fixture, validCheckpointSecurityManifest(fixture, map[string]ckptFile{
 				canaryRel: {Existed: false},
 			}))
-			if _, ok, err := undoCheckpointSecure(fixture.workDir); err == nil || ok {
+			if _, ok, err := undoCheckpointSecure(fixture.workDir, fixture.sessionID); err == nil || ok {
 				t.Fatalf("control target was not rejected: ok=%v err=%v", ok, err)
 			}
 			if data, _ := os.ReadFile(canary); string(data) != "keep" {
@@ -339,6 +433,9 @@ func TestExplicitUndoRequestRequiresTopLevelUserConsent(t *testing.T) {
 		want     bool
 	}{
 		{"exact user command", []types.Message{stringMessage("user", " /UNDO ")}, RunOptions{}, true},
+		{"list command", []types.Message{stringMessage("user", "/undo --list")}, RunOptions{}, true},
+		{"selected restore command", []types.Message{stringMessage("user", "/undo --select 012345abcdef")}, RunOptions{}, true},
+		{"incomplete selected restore remains explicit", []types.Message{stringMessage("user", "/undo --select")}, RunOptions{}, true},
 		{"assistant cannot consent", []types.Message{stringMessage("assistant", "/undo")}, RunOptions{}, false},
 		{"worker prompt is not user consent", []types.Message{stringMessage("user", "/undo")}, RunOptions{WorkerID: "worker-model-task"}, false},
 		{"ordinary user text", []types.Message{stringMessage("user", "/undo please")}, RunOptions{}, false},

@@ -200,7 +200,7 @@ func TestContextPlannerReductionOrderAndCatalogPairing(t *testing.T) {
 			tokens += 4_000
 		}
 		tokens += len(input.Request.Tools) * 1_000
-		if strings.Contains(text, "Historical tool result reference") {
+		if strings.Contains(text, "Historical tool result preview; full result was not stored") {
 			tokens += 200
 		} else if strings.Contains(text, "RAW_LARGE_RESULT") {
 			tokens += 5_000

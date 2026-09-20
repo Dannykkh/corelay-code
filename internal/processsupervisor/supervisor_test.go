@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
@@ -76,6 +78,72 @@ func TestUnavailableRunnerFailsClosed(t *testing.T) {
 	}, Spec{Executable: os.Args[0], Dir: t.TempDir()})
 	if process != nil || report.Started || report.Failure != sandbox.FailureRunnerUnavailable {
 		t.Fatalf("process=%v report=%+v", process, report)
+	}
+}
+
+func TestHostRunnerReportsSanitizedExecutionPolicyAndActualCapabilities(t *testing.T) {
+	requestedCapabilities := sandbox.Capabilities{
+		ProcessIsolation: true, ProcessLimits: true, MemoryLimits: true,
+		NetworkIsolation: true, FilesystemIsolation: true, ProcessTreeKill: true,
+		EnvironmentFiltering: true, Timeouts: true,
+	}
+	snapshot := executionpolicy.Snapshot{
+		Mode: executionpolicy.ModeFull, Revision: 17, RuntimeCapabilities: requestedCapabilities,
+		FullSelectionRevision: 17, Source: executionpolicy.SourceUserSelected,
+	}
+	runner := NewHostRunner()
+	process, report := runner.Start(context.Background(), disabledTestPolicy(), Spec{
+		Executable: os.Args[0], Args: []string{"-test.run=^TestProcessSupervisorHelper$"},
+		Dir: t.TempDir(), ExecutionPolicy: snapshot,
+	})
+	if process == nil || !report.Started {
+		t.Fatalf("start report: %+v", report)
+	}
+	if _, err := io.Copy(io.Discard, process.Stdout()); err != nil {
+		t.Fatalf("drain helper stdout: %v", err)
+	}
+	if err := process.Wait(context.Background()); err != nil {
+		t.Fatalf("wait helper: %v", err)
+	}
+	metadata := report.ExecutionPolicy
+	if metadata.Mode != executionpolicy.ModeFull || metadata.Revision != 17 ||
+		metadata.Source != executionpolicy.SourceUserSelected || metadata.FullSelectionRevision != 17 {
+		t.Fatalf("execution policy metadata = %+v", metadata)
+	}
+	if report.Capabilities != runner.Capabilities() || metadata.RuntimeCapabilities != runner.Capabilities() {
+		t.Fatalf("capabilities were not sourced from runner: report=%+v metadata=%+v runner=%+v", report.Capabilities, metadata.RuntimeCapabilities, runner.Capabilities())
+	}
+	if metadata.RuntimeCapabilities == requestedCapabilities {
+		t.Fatal("caller-provided runtime capability claim was reported as fact")
+	}
+}
+
+func TestUnavailableRunnerPropagatesOnlySanitizedPolicyMetadata(t *testing.T) {
+	const secret = "secret-must-not-be-reported"
+	runner := NewUnavailableRunner("adapter absent")
+	process, report := runner.Start(context.Background(), sandbox.Policy{
+		Enforcement: sandbox.EnforcementRequired,
+	}, Spec{ExecutionPolicy: executionpolicy.Snapshot{
+		Mode: executionpolicy.ModeWorkspace, Revision: 23,
+		RuntimeCapabilities: sandbox.Capabilities{NetworkIsolation: true},
+		Source:              executionpolicy.Source(secret),
+	}})
+	if process != nil || report.Failure != sandbox.FailureRunnerUnavailable {
+		t.Fatalf("process=%v report=%+v", process, report)
+	}
+	metadata := report.ExecutionPolicy
+	if metadata.Mode != executionpolicy.ModeWorkspace || metadata.Revision != 23 || metadata.Source != "" {
+		t.Fatalf("execution policy metadata = %+v", metadata)
+	}
+	if report.Capabilities != runner.Capabilities() || metadata.RuntimeCapabilities != runner.Capabilities() {
+		t.Fatalf("capabilities were not sourced from runner: report=%+v metadata=%+v runner=%+v", report.Capabilities, metadata.RuntimeCapabilities, runner.Capabilities())
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("raw policy metadata leaked in report: %s", encoded)
 	}
 }
 

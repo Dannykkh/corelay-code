@@ -91,7 +91,7 @@ func TestDefaultPlanIsValidAndVersioned(t *testing.T) {
 	if !plan.Valid() || plan.Version() != DefaultProbePlanVersion || plan.Attempts() == 0 {
 		t.Fatalf("invalid default plan: version=%q attempts=%d", plan.Version(), plan.Attempts())
 	}
-	if got, want := plan.Version(), "corelay-capability-probes-v2"; got != want {
+	if got, want := plan.Version(), "corelay-capability-probes-v4"; got != want {
 		t.Fatalf("default plan version=%q want=%q", got, want)
 	}
 	categories := make(map[ProbeCategory]bool)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -12,11 +13,27 @@ import (
 
 type Store struct {
 	workspace string
-	mu        sync.Mutex
+	mu        *sync.Mutex
 }
 
+// HTTP requests and background runs construct independent Store instances.
+// Share their in-process read/modify/write lock by canonical workspace so
+// disjoint patches and timeline writes cannot race through the same files.
+var workspaceStoreLocks sync.Map
+
+const (
+	maxWorkstreamDecisions     = 64
+	maxWorkstreamDecisionBytes = 4096
+)
+
 func NewStore(workspace string) *Store {
-	return &Store{workspace: filepath.Clean(workspace)}
+	workspace = canonicalWorkspace(workspace)
+	key := workspace
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	lock, _ := workspaceStoreLocks.LoadOrStore(key, &sync.Mutex{})
+	return &Store{workspace: workspace, mu: lock.(*sync.Mutex)}
 }
 
 func (s *Store) Workspace() string {
@@ -39,6 +56,10 @@ func (s *Store) Create(req CreateRequest) (*Workstream, error) {
 	if id != sanitizeID(id) {
 		return nil, fmt.Errorf("workstream: invalid id")
 	}
+	decisions, err := normalizeDecisionList(req.Decisions)
+	if err != nil {
+		return nil, err
+	}
 	path := StatePath(s.workspace, id)
 	if _, err := os.Stat(path); err == nil {
 		return nil, fmt.Errorf("workstream: id already exists: %s", id)
@@ -52,6 +73,7 @@ func (s *Store) Create(req CreateRequest) (*Workstream, error) {
 		Status:     StatusActive,
 		Summary:    strings.TrimSpace(req.Summary),
 		NextAction: strings.TrimSpace(req.NextAction),
+		Decisions:  decisions,
 		Tags:       append([]string(nil), req.Tags...),
 		Goal:       req.Goal,
 		CreatedAt:  now,
@@ -118,6 +140,13 @@ func (s *Store) Patch(id string, patch Patch) (*Workstream, error) {
 	if err != nil {
 		return nil, err
 	}
+	var normalizedDecisions []string
+	if patch.Decisions != nil || patch.HasDecisions {
+		normalizedDecisions, err = normalizeDecisionList(patch.Decisions)
+		if err != nil {
+			return nil, err
+		}
+	}
 	changed := map[string]string{}
 	if patch.Status != nil {
 		if !patch.Status.Valid() {
@@ -133,6 +162,10 @@ func (s *Store) Patch(id string, patch Patch) (*Workstream, error) {
 	if patch.NextAction != nil {
 		ws.NextAction = strings.TrimSpace(*patch.NextAction)
 		changed["nextAction"] = ws.NextAction
+	}
+	if patch.Decisions != nil || patch.HasDecisions {
+		ws.Decisions = normalizedDecisions
+		changed["decisionCount"] = fmt.Sprintf("%d", len(ws.Decisions))
 	}
 	if patch.OpenQuestions != nil {
 		ws.OpenQuestions = append([]string(nil), patch.OpenQuestions...)
@@ -160,6 +193,8 @@ func (s *Store) Patch(id string, patch Patch) (*Workstream, error) {
 	eventType := "updated"
 	if _, ok := changed["verification"]; ok {
 		eventType = "verification_updated"
+	} else if _, ok := changed["decisionCount"]; ok {
+		eventType = "decision_updated"
 	}
 	if err := s.appendEventLocked(ws.ID, TimelineEvent{
 		Type:    eventType,
@@ -169,6 +204,24 @@ func (s *Store) Patch(id string, patch Patch) (*Workstream, error) {
 		return nil, err
 	}
 	return ws, nil
+}
+
+func normalizeDecisionList(decisions []string) ([]string, error) {
+	if len(decisions) > maxWorkstreamDecisions {
+		return nil, fmt.Errorf("workstream: at most %d decisions are allowed", maxWorkstreamDecisions)
+	}
+	normalized := make([]string, 0, len(decisions))
+	for _, decision := range decisions {
+		decision = strings.TrimSpace(decision)
+		if decision == "" {
+			continue
+		}
+		if len(decision) > maxWorkstreamDecisionBytes {
+			return nil, fmt.Errorf("workstream: each decision must be at most %d bytes", maxWorkstreamDecisionBytes)
+		}
+		normalized = append(normalized, decision)
+	}
+	return normalized, nil
 }
 
 func (s *Store) AppendEvent(id string, event TimelineEvent) error {
@@ -198,10 +251,31 @@ func (s *Store) getLocked(id string) (*Workstream, error) {
 	if err := readJSON(StatePath(s.workspace, cleanID), &ws); err != nil {
 		return nil, err
 	}
-	if ws.Workspace != s.workspace {
+	if !sameWorkspace(ws.Workspace, s.workspace) {
 		return nil, fmt.Errorf("workstream: workspace mismatch")
 	}
 	return &ws, nil
+}
+
+func canonicalWorkspace(workspace string) string {
+	absolute, err := filepath.Abs(workspace)
+	if err != nil {
+		return filepath.Clean(workspace)
+	}
+	absolute = filepath.Clean(absolute)
+	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+		absolute = filepath.Clean(resolved)
+	}
+	return absolute
+}
+
+func sameWorkspace(left, right string) bool {
+	left = canonicalWorkspace(left)
+	right = canonicalWorkspace(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func (s *Store) appendEventLocked(id string, event TimelineEvent) error {

@@ -76,6 +76,32 @@ func TestHandleRuntimeStatusReportsActiveTargetAndScheduler(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelInfoPreservesImageInputCapability(t *testing.T) {
+	got := runtimeModelFromProvider(types.ModelInfo{
+		ID:          "gpt-4.1",
+		DisplayName: "GPT-4.1",
+		ImageInput:  types.ImageInputSupported,
+	})
+	if got.ImageInput != types.ImageInputSupported {
+		t.Fatalf("image input capability = %q, want supported", got.ImageInput)
+	}
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"imageInput":"supported"`) {
+		t.Fatalf("runtime model omitted image capability: %s", data)
+	}
+
+	unknown, err := json.Marshal(runtimeModelFromProvider(types.ModelInfo{ID: "custom-model"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unknown), `"imageInput"`) {
+		t.Fatalf("unknown model capability must remain omitted: %s", unknown)
+	}
+}
+
 func TestHandleRuntimeTelemetryPushesQuotaSnapshot(t *testing.T) {
 	isolateConfigHome(t)
 	cfg := config.DefaultConfig()

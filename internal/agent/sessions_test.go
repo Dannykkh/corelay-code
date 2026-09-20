@@ -534,6 +534,160 @@ func TestSessionStoreMigratesLegacySessionOnNextSave(t *testing.T) {
 	}
 }
 
+func TestSessionStoreMigratesVersionOneSessionAndPreservesAssociationsAndPolicy(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	store := NewSessionStore(base)
+	dir, err := store.workspaceDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := &ExecutionPolicySnapshot{
+		Mode: ExecutionModeWorkspace, Revision: 3, Source: "default-workspace",
+	}
+	legacy := Session{
+		Version: legacyVersionedSession, Revision: 4,
+		ID: opaqueTestSessionID("c"), Title: "v1 session", Workspace: workspace,
+		Provider: "openai", Model: "model-v1", ExecutionPolicy: policy,
+		LifecycleStatus: SessionLifecycleActive, LastCommittedRevision: 4,
+		Messages: []SessionMessage{{Role: "user", Content: "keep this transcript"}},
+	}
+	writeLegacySession(t, dir, legacy)
+	path := filepath.Join(dir, legacy.ID+".json")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get(v1) = %v", err)
+	}
+	if loaded.Version != legacyVersionedSession || loaded.Revision != 4 || loaded.Model != "model-v1" ||
+		loaded.ExecutionPolicy == nil || *loaded.ExecutionPolicy != *policy ||
+		loaded.WorkstreamID != "" || loaded.PlanID != "" || loaded.StageID != "" {
+		t.Fatalf("loaded v1 session = %#v", loaded)
+	}
+
+	failed := *loaded
+	failed.Title = "must not persist"
+	failed.Messages = []SessionMessage{{Role: "tool", ToolInput: make(chan int)}}
+	if err := store.SaveExpected(&failed, loaded.Revision); err == nil {
+		t.Fatal("SaveExpected(unencodable v1 migration) = nil, want error")
+	}
+	afterFailure, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(afterFailure, original) {
+		t.Fatalf("failed migration changed source bytes: equal=%v error=%v", bytes.Equal(afterFailure, original), err)
+	}
+	reloaded, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Version != legacyVersionedSession || reloaded.Revision != loaded.Revision || reloaded.Title != legacy.Title {
+		t.Fatalf("failed migration changed v1 session: %#v", reloaded)
+	}
+
+	reloaded.WorkstreamID = "ws-roadmap"
+	reloaded.PlanID = "plan-01"
+	reloaded.PlanRevision = 1
+	reloaded.StageID = "stage-02"
+	if err := store.SaveExpected(reloaded, reloaded.Revision); err != nil {
+		t.Fatalf("SaveExpected(v1→v3) = %v", err)
+	}
+	if reloaded.Version != currentSessionVersion || reloaded.Revision != 5 {
+		t.Fatalf("migrated session schema/revision = v%d/r%d", reloaded.Version, reloaded.Revision)
+	}
+	migrated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Version != currentSessionVersion || migrated.WorkstreamID != "ws-roadmap" ||
+		migrated.PlanID != "plan-01" || migrated.PlanRevision != 1 || migrated.StageID != "stage-02" ||
+		migrated.Provider != legacy.Provider || migrated.Model != legacy.Model ||
+		migrated.ExecutionPolicy == nil || *migrated.ExecutionPolicy != *policy {
+		t.Fatalf("migrated session lost targets or policy: %#v", migrated)
+	}
+	summaries := store.List(workspace)
+	if len(summaries) != 1 || summaries[0].WorkstreamID != migrated.WorkstreamID ||
+		summaries[0].PlanID != migrated.PlanID || summaries[0].PlanRevision != migrated.PlanRevision || summaries[0].StageID != migrated.StageID {
+		t.Fatalf("association summary = %#v", summaries)
+	}
+	partialUpdate := *migrated
+	partialUpdate.WorkstreamID = ""
+	partialUpdate.PlanID = ""
+	partialUpdate.PlanRevision = 0
+	partialUpdate.StageID = ""
+	partialUpdate.Provider = ""
+	partialUpdate.Model = ""
+	partialUpdate.Title = "partial update"
+	if err := store.SaveExpected(&partialUpdate, migrated.Revision); err != nil {
+		t.Fatalf("SaveExpected(partial association update) = %v", err)
+	}
+	preserved, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.WorkstreamID != migrated.WorkstreamID || preserved.PlanID != migrated.PlanID ||
+		preserved.PlanRevision != migrated.PlanRevision || preserved.StageID != migrated.StageID || preserved.ExecutionPolicy == nil ||
+		*preserved.ExecutionPolicy != *policy || preserved.Provider != legacy.Provider || preserved.Model != legacy.Model {
+		t.Fatalf("partial update lost associations or execution target: %#v", preserved)
+	}
+}
+
+func TestSessionStoreRejectsStageWithoutPlanWithoutChangingSource(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	store := NewSessionStore(base)
+	session := &Session{Workspace: workspace, Messages: []SessionMessage{{Role: "user", Content: "keep"}}}
+	if err := store.Save(session); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := store.workspaceDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, session.ID+".json")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update.StageID = "stage-without-plan"
+	if err := store.SaveExpected(update, update.Revision); !errors.Is(err, ErrSessionAssociationInvalid) {
+		t.Fatalf("SaveExpected(stage without plan) = %v, want ErrSessionAssociationInvalid", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, original) {
+		t.Fatalf("invalid association changed source bytes: equal=%v error=%v", bytes.Equal(after, original), err)
+	}
+}
+
+func TestSessionStoreRejectsAssociationsOnLegacySchemas(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	store := NewSessionStore(base)
+	dir, err := store.workspaceDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []int{0, legacyVersionedSession} {
+		session := Session{
+			Version: version, Revision: 1, ID: opaqueTestSessionID(string(rune('d' + version))),
+			Workspace: workspace, WorkstreamID: "ws-stale-schema",
+		}
+		if version == 0 {
+			session.Revision = 0
+		}
+		writeLegacySession(t, dir, session)
+		if _, err := store.Get(session.ID); !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("Get(v%d association) = %v, want ErrSessionCorrupt", version, err)
+		}
+	}
+}
+
 func TestSessionStoreTerminalMetadataValidationAndRoundTrip(t *testing.T) {
 	base := t.TempDir()
 	workspace := filepath.Join(base, "workspace")

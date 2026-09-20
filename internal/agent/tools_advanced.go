@@ -2,9 +2,10 @@ package agent
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/protocol"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -21,11 +23,11 @@ func AdvancedToolDefs() []types.ToolDef {
 	return []types.ToolDef{
 		{
 			Name:        "ImageRead",
-			Description: "Read an image file and return its metadata. For vision-capable models, the image content is included.",
+			Description: "Read a PNG, JPEG, GIF, or WebP file and attach its validated image content to the next model request. Unsupported image formats are rejected.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
-					"file_path": {"type": "string", "description": "Path to image file (png, jpg, svg, webp)"}
+					"file_path": {"type": "string", "description": "Path to image file (png, jpg/jpeg, gif, or webp)"}
 				},
 				"required": ["file_path"]
 			}`),
@@ -66,25 +68,26 @@ func AdvancedToolDefs() []types.ToolDef {
 		},
 		{
 			Name:        "GitDiff",
-			Description: "Show git diff with context. More user-friendly than raw git diff.",
+			Description: "Show git diff with context. More user-friendly than raw git diff. The optional file target must be a literal file or directory path; wildcard and Git pathspec syntax are not supported.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"staged": {"type": "boolean", "description": "Show staged changes only"},
-					"file": {"type": "string", "description": "Specific file to diff"},
+					"file": {"type": "string", "description": "Specific literal file or directory path to diff; wildcard and Git pathspec syntax are rejected"},
 					"commit": {"type": "string", "description": "Compare with specific commit"}
 				}
 			}`),
 		},
 		{
 			Name:        "GitCommit",
-			Description: "Stage and commit changes with a message. Shows diff before committing.",
+			Description: "Commit selected literal workspace paths from the working tree with a message. Unrelated staged changes stay staged. Partial staging on selected paths is rejected. To commit the entire existing staged index, omit files and explicitly set scope=staged.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"message": {"type": "string", "description": "Commit message"},
-					"files": {"type": "string", "description": "Files to stage (space-separated, or '.' for all)"},
-					"amend": {"type": "boolean", "description": "Amend the last commit"}
+					"files": {"type": "string", "description": "Literal workspace paths separated by spaces; glob and Git pathspec syntax are not accepted"},
+					"scope": {"type": "string", "enum": ["staged"], "description": "Explicitly commit the entire existing staged index; required when files is omitted"},
+					"amend": {"type": "boolean", "description": "Explicitly amend the last commit; selected-path and staged-index safeguards still apply"}
 				},
 				"required": ["message"]
 			}`),
@@ -128,7 +131,7 @@ func ExecuteAdvancedTool(name string, input json.RawMessage, workDir string) (st
 func ExecuteAdvancedToolWithOptions(name string, input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool, bool) {
 	switch name {
 	case "ImageRead":
-		r, e := executeImageRead(input, workDir)
+		r, e := executeImageReadWithOptions(input, workDir, opts)
 		return r, e, true
 	case "PDFRead":
 		r, e := executePDFRead(input, workDir, opts)
@@ -159,7 +162,11 @@ func ExecuteAdvancedToolWithOptions(name string, input json.RawMessage, workDir 
 // ── Image Read ──
 
 func executeImageRead(input json.RawMessage, workDir string) (string, bool) {
-	paths, err := executionToolWorkspacePaths("ImageRead", input, workDir)
+	return executeImageReadWithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeImageReadWithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
+	paths, err := executionToolWorkspacePathsWithPolicy("ImageRead", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Image read blocked: " + err.Error(), true
 	}
@@ -170,27 +177,46 @@ func executeImageRead(input json.RawMessage, workDir string) (string, bool) {
 		return "Image read blocked: invalid input: " + err.Error(), true
 	}
 
+	if opts.imageReadSink == nil || opts.ToolCallID == "" {
+		return "Image read blocked: image payload transport is unavailable for this run", true
+	}
 	path := paths.one("file_path")
-	info, err := os.Stat(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
 	}
-
-	ext := strings.ToLower(filepath.Ext(path))
-	data, err := os.ReadFile(path)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
-		return fmt.Sprintf("Error reading: %v", err), true
+		return "Image read blocked: file metadata is unavailable", true
 	}
-
-	b64 := base64.StdEncoding.EncodeToString(data)
-	return fmt.Sprintf("Image: %s\nType: %s\nSize: %s\nBase64 length: %d chars\n\n[Image data available for vision models]",
-		args.FilePath, ext, formatSize(info.Size()), len(b64)), false
+	if !info.Mode().IsRegular() {
+		return "Image read blocked: target is not a regular file", true
+	}
+	data, err := io.ReadAll(io.LimitReader(file, protocol.MaxImageBytes+1))
+	if err != nil {
+		return "Image read failed: file contents are unavailable", true
+	}
+	if len(data) > protocol.MaxImageBytes {
+		return "Image read blocked: image exceeds the 4 MiB file limit", true
+	}
+	block, err := opts.imageReadSink.store(opts.ToolCallID, data)
+	if err != nil {
+		_, _, detail := protocol.ErrorDetails(err)
+		return "Image read blocked: " + detail, true
+	}
+	mediaType := ""
+	if block.Source != nil {
+		mediaType = block.Source.MediaType
+	}
+	return fmt.Sprintf("Image: %s\nMedia type: %s\nSize: %s\nValidated image content is attached to the next model request.",
+		args.FilePath, mediaType, formatSize(info.Size())), false
 }
 
 // ── PDF Read ──
 
 func executePDFRead(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("PDFRead", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("PDFRead", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "PDF read blocked: " + err.Error(), true
 	}
@@ -243,7 +269,7 @@ func executePDFRead(input json.RawMessage, workDir string, opts ToolExecutionOpt
 // ── Auto Lint ──
 
 func executeLint(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("Lint", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("Lint", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Lint blocked: " + err.Error(), true
 	}
@@ -394,7 +420,7 @@ func executeTest(input json.RawMessage, workDir string) (string, bool) {
 }
 
 func executeTestWithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("Test", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("Test", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Test blocked: " + err.Error(), true
 	}
@@ -478,7 +504,7 @@ func executeTestWithOptions(input json.RawMessage, workDir string, opts ToolExec
 // ── Git Diff (formatted) ──
 
 func executeGitDiff(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("GitDiff", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("GitDiff", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Git diff blocked: " + err.Error(), true
 	}
@@ -525,46 +551,410 @@ func executeGitDiff(input json.RawMessage, workDir string, opts ToolExecutionOpt
 // ── Git Commit ──
 
 func executeGitCommit(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("GitCommit", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("GitCommit", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Git commit blocked: " + err.Error(), true
 	}
 	var args struct {
 		Message string `json:"message"`
 		Files   string `json:"files"`
+		Scope   string `json:"scope"`
 		Amend   bool   `json:"amend"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "Git commit blocked: invalid input: " + err.Error(), true
 	}
 
-	// Stage files
-	if args.Files != "" {
-		files := paths.many("files")
-		add := runToolProcess(
-			opts,
-			"GitCommit stage",
-			workDir,
-			"git",
-			append([]string{"add", "--"}, files...),
-			defaultToolProcessTimeout,
-		)
-		if add.policyOrContextFailure() || !add.Started || add.ExitCode != 0 || add.Err != nil {
-			return "Stage failed: " + add.setupOrExecutionError("git add failed"), true
+	files := paths.many("files")
+	if len(files) > 0 {
+		relativeFiles, pathErr := gitCommitRelativePaths(workDir, files)
+		if pathErr != nil {
+			return "Git commit blocked: " + pathErr.Error(), true
 		}
+		output, commitErr := executeGitCommitSelectedPaths(workDir, relativeFiles, args.Message, args.Amend, opts)
+		if commitErr != nil {
+			return commitErr.Error(), true
+		}
+		return output, false
 	}
-
-	// Commit
-	commitArgs := []string{"commit", "-m", args.Message}
+	if strings.TrimSpace(args.Scope) != "staged" {
+		return "Git commit blocked: committing the existing index requires explicit scope=staged.", true
+	}
+	if err := requireGitCommitWorkspaceRoot(opts, workDir); err != nil {
+		return "Git commit blocked: " + err.Error(), true
+	}
+	commitArgs := []string{"--literal-pathspecs", "commit"}
 	if args.Amend {
 		commitArgs = append(commitArgs, "--amend")
 	}
-
-	commit := runToolProcess(opts, "GitCommit", workDir, "git", commitArgs, defaultToolProcessTimeout)
-	if commit.policyOrContextFailure() || !commit.Started || commit.ExitCode != 0 || commit.Err != nil {
-		return commit.setupOrExecutionError("git commit failed"), true
+	commitArgs = append(commitArgs, "-m", args.Message)
+	output, commitErr := executeGitCommitCommand(workDir, commitArgs, nil, "", "", false, nil, opts)
+	if commitErr != nil {
+		return commitErr.Error(), true
 	}
-	return commit.combinedOutput(), false
+	return output, false
+}
+
+func requireGitCommitWorkspaceRoot(opts ToolExecutionOptions, workDir string) error {
+	result := runToolProcess(opts, "GitCommit repository root", workDir, "git", []string{"rev-parse", "--show-toplevel"}, defaultToolProcessTimeout)
+	if err := gitCommitProcessError(result, "unable to identify the Git repository root"); err != nil {
+		return err
+	}
+	root := strings.TrimSpace(result.combinedOutput())
+	if root == "" {
+		return fmt.Errorf("Git returned an empty repository root")
+	}
+	root, err := canonicalizeTarget(root)
+	if err != nil {
+		return fmt.Errorf("resolve Git repository root: %w", err)
+	}
+	workspace, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("resolve workspace: %w", err)
+	}
+	if !pathWithin(root, workspace) || !pathWithin(workspace, root) {
+		return fmt.Errorf("scope=staged affects the entire Git index and is allowed only when the selected workspace is the Git repository root")
+	}
+	return nil
+}
+
+func executeGitCommitSelectedPaths(workDir string, paths []string, message string, amend bool, opts ToolExecutionOptions) (string, error) {
+	transaction, err := beginGitCommitIndexTransaction(opts, workDir)
+	if err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %w", err)
+	}
+	defer transaction.close()
+	if !transaction.indexExisted {
+		initialize := runToolProcessWithGitIndex(opts, "GitCommit empty-index initialization", workDir, []string{"read-tree", "--empty"}, defaultToolProcessTimeout, transaction.snapshotPath)
+		if err := gitCommitProcessError(initialize, "unable to initialize the Git index snapshot"); err != nil {
+			return "", fmt.Errorf("Git commit preflight failed: %w", err)
+		}
+	}
+	head, hasHead, err := gitCommitOptionalHead(opts, workDir)
+	if err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %w", err)
+	}
+	preflightArgs := []string{"diff", "--cached", "--quiet"}
+	if hasHead {
+		preflightArgs = append(preflightArgs, head)
+	}
+	preflightArgs = append(preflightArgs, "--")
+	preflightArgs = append(preflightArgs, paths...)
+	preflight := runToolProcessWithGitIndex(opts, "GitCommit staged-conflict check", workDir, preflightArgs, defaultToolProcessTimeout, transaction.snapshotPath)
+	if preflight.policyOrContextFailure() || !preflight.Started || preflight.Err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %s", preflight.setupOrExecutionError("unable to inspect staged changes"))
+	}
+	switch preflight.ExitCode {
+	case 0:
+		// No selected path has staged changes relative to the current base.
+	case 1:
+		return "", fmt.Errorf("Git commit blocked: staged_conflict: selected paths already contain staged changes; commit or unstage those paths first")
+	default:
+		return "", fmt.Errorf("Git commit preflight failed: %s", preflight.setupOrExecutionError("unable to inspect staged changes"))
+	}
+	untracked, err := gitCommitUntrackedPaths(opts, workDir, paths, transaction.snapshotPath)
+	if err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %w", err)
+	}
+	if len(untracked) > 0 {
+		addArgs := append([]string{"--literal-pathspecs", "add", "--all", "--"}, untracked...)
+		add := runToolProcessWithGitIndex(opts, "GitCommit untracked-path staging", workDir, addArgs, defaultToolProcessTimeout, transaction.snapshotPath)
+		if err := gitCommitProcessError(add, "git add failed"); err != nil {
+			return "", fmt.Errorf("Git commit preparation failed: %w", err)
+		}
+	}
+	hookPaths, err := gitCommitRepositoryRelativePaths(opts, workDir, paths)
+	if err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %w", err)
+	}
+	hooksPath, cleanupHooks, err := prepareGitCommitHookGuard(opts, workDir, transaction.indexPath, transaction.snapshotPath, head, hasHead, hookPaths)
+	if err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: %w", err)
+	}
+	defer cleanupHooks()
+	if len(untracked) > 0 {
+		if err := transaction.publishSnapshot(); err != nil {
+			return "", fmt.Errorf("Git commit preflight failed: %w", err)
+		}
+	} else if err := transaction.releaseLock(); err != nil {
+		return "", fmt.Errorf("Git commit preflight failed: release index lock: %w", err)
+	}
+
+	// Configured hook commands run before the traditional hook-directory entry.
+	// Serialize commit hooks so the guard runs after every hook has had its turn.
+	commitArgs := []string{
+		"-c", "core.hooksPath=" + hooksPath,
+		"-c", "hook.jobs=1",
+		"-c", "hook.pre-commit.jobs=1",
+		"-c", "hook.prepare-commit-msg.jobs=1",
+		"-c", "hook.commit-msg.jobs=1",
+		"--literal-pathspecs", "commit",
+	}
+	if amend {
+		commitArgs = append(commitArgs, "--amend")
+	}
+	commitArgs = append(commitArgs, "--only", "-m", message, "--")
+	commitArgs = append(commitArgs, paths...)
+	return executeGitCommitCommand(workDir, commitArgs, paths, transaction.snapshotPath, head, hasHead, untracked, opts)
+}
+
+func executeGitCommitCommand(
+	workDir string,
+	commitArgs []string,
+	indexPaths []string,
+	expectedIndexPath string,
+	expectedHead string,
+	hasExpectedHead bool,
+	rollbackPaths []string,
+	opts ToolExecutionOptions,
+) (string, error) {
+	if expectedIndexPath == "" {
+		var err error
+		expectedHead, hasExpectedHead, err = gitCommitOptionalHead(opts, workDir)
+		if err != nil {
+			return "", fmt.Errorf("Git commit preflight failed: %w", err)
+		}
+	}
+	if opts.Context != nil && opts.Context.Err() != nil {
+		cause := fmt.Errorf("Git commit canceled before execution: %w", opts.Context.Err())
+		if len(rollbackPaths) > 0 {
+			if rollbackErr := rollbackGitCommitAddedPaths(withoutToolContextCancellation(opts), workDir, expectedIndexPath, expectedHead, hasExpectedHead, rollbackPaths); rollbackErr != nil {
+				return "", fmt.Errorf("%w; selected-path index cleanup failed: %v", cause, rollbackErr)
+			}
+		}
+		return "", cause
+	}
+	// Once the commit process starts, let Git finish its index/ref lock protocol
+	// even if the caller cancels. Stopping it mid-transaction can leave an
+	// ambiguous result; the bounded process timeout still applies.
+	commitOpts := withoutToolContextCancellation(opts)
+	commit := runToolProcess(commitOpts, "GitCommit", workDir, "git", commitArgs, defaultToolProcessTimeout)
+	if err := gitCommitProcessError(commit, "git commit failed"); err != nil {
+		// Git commits update the index and HEAD through Git's own lock protocol.
+		// Preserve the stage if HEAD or the selected index moved after preparation.
+		committedHead, hasCommittedHead, stateErr := gitCommitOptionalHead(commitOpts, workDir)
+		headChanged := stateErr == nil && (hasExpectedHead != hasCommittedHead || (hasExpectedHead && hasCommittedHead && committedHead != expectedHead))
+		if len(rollbackPaths) > 0 && !headChanged && stateErr == nil {
+			if rollbackErr := rollbackGitCommitAddedPaths(commitOpts, workDir, expectedIndexPath, expectedHead, hasExpectedHead, rollbackPaths); rollbackErr != nil {
+				return "", fmt.Errorf("%w; selected-path index cleanup failed: %v", err, rollbackErr)
+			}
+		}
+		if headChanged {
+			return "", fmt.Errorf("%w; HEAD advanced to %s, so selected-path index staging was preserved for review", err, committedHead)
+		} else if stateErr != nil && len(rollbackPaths) > 0 {
+			return "", fmt.Errorf("%w; HEAD could not be inspected, so selected-path index staging was preserved: %v", err, stateErr)
+		}
+		return "", err
+	}
+	if err := verifyGitCommitIndex(commitOpts, workDir, indexPaths); err != nil {
+		return "", fmt.Errorf("Git commit completed but index entries do not match HEAD: %w", err)
+	}
+	return commit.combinedOutput(), nil
+}
+
+func gitCommitUntrackedPaths(opts ToolExecutionOptions, workDir string, paths []string, indexPath string) ([]string, error) {
+	args := append([]string{"--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--"}, paths...)
+	result := runToolProcessWithGitIndex(opts, "GitCommit untracked-path check", workDir, args, defaultToolProcessTimeout, indexPath)
+	if result.policyOrContextFailure() || !result.Started || result.Err != nil || result.ExitCode != 0 {
+		return nil, fmt.Errorf("%s", result.setupOrExecutionError("unable to inspect untracked selected paths"))
+	}
+	pathsFound := strings.Split(string(result.Stdout), "\x00")
+	untracked := make([]string, 0, len(pathsFound))
+	for _, path := range pathsFound {
+		if path != "" {
+			untracked = append(untracked, path)
+		}
+	}
+	return untracked, nil
+}
+
+func rollbackGitCommitAddedPaths(
+	opts ToolExecutionOptions,
+	workDir string,
+	expectedIndexPath string,
+	expectedHead string,
+	hasExpectedHead bool,
+	paths []string,
+) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	transaction, err := beginGitCommitIndexTransaction(opts, workDir)
+	if err != nil {
+		return err
+	}
+	defer transaction.close()
+	currentHead, hasCurrentHead, err := gitCommitOptionalHead(opts, workDir)
+	if err != nil {
+		return err
+	}
+	if hasCurrentHead != hasExpectedHead || (hasExpectedHead && currentHead != expectedHead) {
+		return fmt.Errorf("HEAD changed; selected staging was preserved")
+	}
+	currentDiff, err := gitCommitRawCachedDiff(opts, workDir, transaction.snapshotPath, expectedHead, hasExpectedHead, paths)
+	if err != nil {
+		return err
+	}
+	expectedDiff, err := gitCommitRawCachedDiff(opts, workDir, expectedIndexPath, expectedHead, hasExpectedHead, paths)
+	if err != nil {
+		return err
+	}
+	if currentDiff != expectedDiff {
+		return fmt.Errorf("selected index changed; staged data was preserved")
+	}
+	var args []string
+	if hasCurrentHead {
+		args = append([]string{"--literal-pathspecs", "reset", "--quiet", currentHead, "--"}, paths...)
+	} else {
+		args = append([]string{"--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "-r", "--"}, paths...)
+	}
+	result := runToolProcessWithGitIndex(opts, "GitCommit untracked-path rollback", workDir, args, defaultToolProcessTimeout, transaction.snapshotPath)
+	if err := gitCommitProcessError(result, "unable to rollback selected-path staging"); err != nil {
+		return err
+	}
+	verify := []string{"diff", "--cached", "--quiet"}
+	if hasCurrentHead {
+		verify = append(verify, currentHead)
+	}
+	verify = append(verify, "--")
+	verify = append(verify, paths...)
+	check := runToolProcessWithGitIndex(opts, "GitCommit rollback verification", workDir, verify, defaultToolProcessTimeout, transaction.snapshotPath)
+	if check.policyOrContextFailure() || !check.Started || check.Err != nil || check.ExitCode != 0 {
+		return fmt.Errorf("%s", check.setupOrExecutionError("selected paths remain staged after rollback"))
+	}
+	return transaction.publishSnapshot()
+}
+
+func gitCommitRawCachedDiff(opts ToolExecutionOptions, workDir, indexPath, head string, hasHead bool, paths []string) (string, error) {
+	args := []string{"--literal-pathspecs", "diff", "--cached", "--raw", "--no-abbrev"}
+	if hasHead {
+		args = append(args, head)
+	}
+	args = append(args, "--")
+	args = append(args, paths...)
+	result := runToolProcessWithGitIndex(opts, "GitCommit index snapshot comparison", workDir, args, defaultToolProcessTimeout, indexPath)
+	if result.policyOrContextFailure() || !result.Started || result.Err != nil || result.ExitCode != 0 {
+		return "", fmt.Errorf("%s", result.setupOrExecutionError("unable to compare selected Git index entries"))
+	}
+	return string(result.Stdout), nil
+}
+
+func gitCommitProcessError(result toolProcessResult, fallback string) error {
+	if result.policyOrContextFailure() || !result.Started || result.Err != nil || result.ExitCode != 0 {
+		return fmt.Errorf("%s", result.setupOrExecutionError(fallback))
+	}
+	return nil
+}
+
+func gitCommitOptionalHead(opts ToolExecutionOptions, workDir string) (string, bool, error) {
+	result := runToolProcess(opts, "GitCommit HEAD snapshot", workDir, "git", []string{"rev-parse", "--verify", "--quiet", "HEAD"}, defaultToolProcessTimeout)
+	if result.policyOrContextFailure() || !result.Started || result.Err != nil {
+		return "", false, fmt.Errorf("unable to read HEAD: %s", result.setupOrExecutionError("git rev-parse failed"))
+	}
+	if result.ExitCode == 1 {
+		return "", false, nil
+	}
+	if result.ExitCode != 0 {
+		return "", false, fmt.Errorf("unable to read HEAD: %s", result.setupOrExecutionError("git rev-parse failed"))
+	}
+	head := strings.TrimSpace(result.combinedOutput())
+	if head == "" {
+		return "", false, fmt.Errorf("git rev-parse returned an empty HEAD")
+	}
+	return head, true, nil
+}
+
+func verifyGitCommitIndex(opts ToolExecutionOptions, workDir string, paths []string) error {
+	verifyArgs := []string{"diff", "--cached", "--quiet", "HEAD"}
+	if len(paths) > 0 {
+		verifyArgs = append(verifyArgs, "--")
+		verifyArgs = append(verifyArgs, paths...)
+	}
+	verify := runToolProcess(opts, "GitCommit selected-index verification", workDir, "git", verifyArgs, defaultToolProcessTimeout)
+	if verify.policyOrContextFailure() || !verify.Started || verify.Err != nil || verify.ExitCode != 0 {
+		return fmt.Errorf("%s", verify.setupOrExecutionError("selected paths remain staged relative to HEAD"))
+	}
+	return nil
+}
+
+func withoutToolContextCancellation(opts ToolExecutionOptions) ToolExecutionOptions {
+	if opts.Context != nil {
+		opts.Context = context.WithoutCancel(opts.Context)
+	}
+	return opts
+}
+
+func gitCommitRelativePaths(workDir string, paths []string) ([]string, error) {
+	workspace, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace: %w", err)
+	}
+	relative := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		canonical, err := canonicalizeTarget(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve selected path: %w", err)
+		}
+		if !pathWithin(canonical, workspace) {
+			return nil, fmt.Errorf("selected path is outside workspace: %s", path)
+		}
+		local, err := filepath.Rel(workspace, canonical)
+		if err != nil {
+			return nil, fmt.Errorf("resolve selected path relative to workspace: %w", err)
+		}
+		local = filepath.ToSlash(local)
+		if _, exists := seen[local]; exists {
+			continue
+		}
+		seen[local] = struct{}{}
+		relative = append(relative, local)
+	}
+	if len(relative) == 0 {
+		return nil, fmt.Errorf("no selected paths were provided")
+	}
+	return relative, nil
+}
+
+func gitCommitRepositoryRelativePaths(opts ToolExecutionOptions, workDir string, paths []string) ([]string, error) {
+	result := runToolProcess(opts, "GitCommit repository-relative hook paths", workDir, "git", []string{"rev-parse", "--show-toplevel"}, defaultToolProcessTimeout)
+	if err := gitCommitProcessError(result, "unable to identify the Git repository root for hook scope checks"); err != nil {
+		return nil, err
+	}
+	root := strings.TrimSpace(result.combinedOutput())
+	if root == "" {
+		return nil, fmt.Errorf("Git returned an empty repository root for hook scope checks")
+	}
+	root, err := canonicalizeTarget(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Git repository root for hook scope checks: %w", err)
+	}
+	workspace, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace for hook scope checks: %w", err)
+	}
+	relative := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, selected := range paths {
+		absolute, err := canonicalizeTarget(filepath.Join(workspace, filepath.FromSlash(selected)))
+		if err != nil {
+			return nil, fmt.Errorf("resolve selected path for hook scope check: %w", err)
+		}
+		if !pathWithin(absolute, root) {
+			return nil, fmt.Errorf("selected path is outside the Git repository: %s", selected)
+		}
+		local, err := filepath.Rel(root, absolute)
+		if err != nil {
+			return nil, fmt.Errorf("resolve selected path relative to Git root: %w", err)
+		}
+		local = filepath.ToSlash(local)
+		if _, exists := seen[local]; exists {
+			continue
+		}
+		seen[local] = struct{}{}
+		relative = append(relative, local)
+	}
+	return relative, nil
 }
 
 // ── HTTP Request ──
@@ -611,7 +1001,7 @@ func executeHTTPRequest(input json.RawMessage, workDir string, opts ToolExecutio
 // ── File Diff ──
 
 func executeDiff(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("Diff", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("Diff", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Diff blocked: " + err.Error(), true
 	}

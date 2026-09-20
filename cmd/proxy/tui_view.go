@@ -182,7 +182,7 @@ func calculateTUIGeometry(width, height, overlayHeight int) tuiGeometry {
 		geometry.MainHeight = 3
 	}
 	if width >= 120 && height >= 28 {
-		geometry.RailWidth = 30
+		geometry.RailWidth = 38
 	}
 	geometry.TranscriptOuterWidth = width
 	if geometry.RailWidth > 0 {
@@ -301,11 +301,7 @@ func (m tuiModel) renderRail(theme tuiTheme, geometry tuiGeometry) string {
 		"TARGET  " + fitDisplay(strings.Trim(singleLineTUIText(m.server.Provider+"/"+m.server.Model, 512), "/"), width-12),
 		"URL     " + fitDisplay(singleLineTUIText(m.opts.BaseURL, 1024), width-12),
 	}
-	session := []string{
-		m.sessionStateLabel(),
-		m.sessionIdentity(width - 4),
-		m.sessionRevision(),
-	}
+	session := m.sessionRailLines()
 	panels := []string{
 		renderRailPanel(theme, "CONTEXT", contextLines, width, heights[0]),
 		renderRailPanel(theme, "ACTIVITY", activity, width, heights[1]),
@@ -585,18 +581,40 @@ func (m tuiModel) sessionStateLabel() string {
 	return strings.ToUpper(state)
 }
 
-func (m tuiModel) sessionIdentity(width int) string {
-	if m.current == nil {
-		return "ID  —"
-	}
-	return "ID  " + fitDisplay(singleLineTUIText(m.current.ID, 256), maxInt(1, width-4))
-}
+func (m tuiModel) sessionRailLines() []string {
+	identity := "EPHEMERAL · ID — · REV —"
+	workstream := "—"
+	plan := "—"
+	stage := "—"
+	if m.current != nil {
+		id := singleLineTUIText(m.current.ID, 256)
+		if id == "" {
+			id = "—"
+		}
+		identity = fmt.Sprintf("%s · ID %s · r%d · T%d", m.sessionStateLabel(), id, m.current.Revision, m.current.Turns)
 
-func (m tuiModel) sessionRevision() string {
-	if m.current == nil {
-		return "REV —"
+		if value := singleLineTUIText(m.current.WorkstreamID, 256); value != "" {
+			workstream = value
+		}
+		if value := singleLineTUIText(m.current.PlanID, 256); value != "" {
+			plan = value + "@—"
+			if m.current.PlanRevision > 0 {
+				plan = fmt.Sprintf("%s@%d", value, m.current.PlanRevision)
+			}
+		}
+		if value := singleLineTUIText(m.current.StageID, 256); value != "" {
+			stage = value
+		}
 	}
-	return fmt.Sprintf("REV %d · TURNS %d", m.current.Revision, m.current.Turns)
+	permission := "—"
+	if m.permission.known && validEffectiveExecutionPolicy(m.permission.mode, m.permission.revision) {
+		permission = fmt.Sprintf("%s@%d", m.permission.mode, m.permission.revision)
+	}
+	return []string{
+		identity,
+		"WS " + workstream + " · PLAN " + plan,
+		"STAGE " + stage + " · PERM " + permission,
+	}
 }
 
 func (m tuiModel) statusHint() string {

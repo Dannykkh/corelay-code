@@ -2,6 +2,7 @@ package providers
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -54,7 +55,13 @@ func CreateWithOptions(name string, cfg *types.ProviderConfig, opts CreateOption
 			return newOllama(merged, opts), nil
 		}
 		if strings.HasPrefix(name, "openai") {
-			return newOpenAI(merged, opts), nil
+			provider := newOpenAI(merged, opts).(*OpenAICompat)
+			// A custom OpenAI-compatible endpoint can implement a different
+			// subset of models and modalities than api.openai.com.
+			for i := range provider.ModelList {
+				provider.ModelList[i].ImageInput = types.ImageInputUnknown
+			}
+			return provider, nil
 		}
 		// Default to OpenAI-compatible
 		return &OpenAICompat{
@@ -105,26 +112,44 @@ func newOpenAI(cfg *types.ProviderConfig, opts CreateOptions) types.Provider {
 	if key == "" {
 		key = os.Getenv("OPENAI_API_KEY")
 	}
-	return &OpenAICompat{
+	baseURL := coalesce(cfg.BaseURL, "https://api.openai.com")
+	provider := &OpenAICompat{
 		ProviderName: "openai",
 		ProviderDisp: "OpenAI",
-		BaseURL:      coalesce(cfg.BaseURL, "https://api.openai.com"),
+		BaseURL:      baseURL,
 		AuthHeader:   func() (string, string) { return "Authorization", "Bearer " + key },
 		HTTPDoer:     httpDoerOrDefault(opts.HTTPDoer),
 		ModelList: []types.ModelInfo{
-			{ID: "gpt-5.5", DisplayName: "GPT-5.5 (최신 플래그십)", ContextWindow: 1000000},
+			{ID: "gpt-5.5", DisplayName: "GPT-5.5 (최신 플래그십)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
 			{ID: "gpt-5.5-mini", DisplayName: "GPT-5.5 Mini", ContextWindow: 1000000},
 			{ID: "gpt-5.5-codex", DisplayName: "GPT-5.5 Codex (코딩 특화)", ContextWindow: 1000000},
 			{ID: "gpt-5.4", DisplayName: "GPT-5.4 (legacy)", ContextWindow: 1000000},
 			{ID: "gpt-5.4-mini", DisplayName: "GPT-5.4 Mini (legacy)", ContextWindow: 1000000},
 			{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex (legacy)", ContextWindow: 1000000},
-			{ID: "gpt-4.1", DisplayName: "GPT-4.1 (legacy)", ContextWindow: 128000},
-			{ID: "gpt-4o", DisplayName: "GPT-4o (legacy)", ContextWindow: 128000},
-			{ID: "gpt-4o-mini", DisplayName: "GPT-4o Mini (legacy)", ContextWindow: 128000},
-			{ID: "o4-mini", DisplayName: "o4 Mini (추론)", ContextWindow: 200000},
-			{ID: "o3", DisplayName: "o3 (추론 legacy)", ContextWindow: 200000},
+			{ID: "gpt-4.1", DisplayName: "GPT-4.1 (legacy)", ContextWindow: 128000, ImageInput: types.ImageInputSupported},
+			{ID: "gpt-4o", DisplayName: "GPT-4o (legacy)", ContextWindow: 128000, ImageInput: types.ImageInputSupported},
+			{ID: "gpt-4o-mini", DisplayName: "GPT-4o Mini (legacy)", ContextWindow: 128000, ImageInput: types.ImageInputSupported},
+			{ID: "o4-mini", DisplayName: "o4 Mini (추론)", ContextWindow: 200000, ImageInput: types.ImageInputSupported},
+			{ID: "o3", DisplayName: "o3 (추론 legacy)", ContextWindow: 200000, ImageInput: types.ImageInputSupported},
 		},
 	}
+	if !isNativeOpenAIEndpoint(baseURL) {
+		for i := range provider.ModelList {
+			provider.ModelList[i].ImageInput = types.ImageInputUnknown
+		}
+	}
+	return provider
+}
+
+func isNativeOpenAIEndpoint(raw string) bool {
+	endpoint, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(endpoint.Scheme, "https") || !strings.EqualFold(endpoint.Hostname(), "api.openai.com") {
+		return false
+	}
+	if endpoint.Port() != "" && endpoint.Port() != "443" {
+		return false
+	}
+	return endpoint.User == nil && endpoint.RawQuery == "" && endpoint.Fragment == "" && endpoint.Opaque == ""
 }
 
 func NewOllama(cfg *types.ProviderConfig) types.Provider {

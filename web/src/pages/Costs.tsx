@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON, type UsageEntry } from '../lib/api';
+import { streamSSE } from '../lib/sse';
 
 type RunTrace = {
   id: string;
@@ -587,28 +588,15 @@ async function readRegressionReplay(res: Response): Promise<RegressionRun | null
   if (!contentType.includes('text/event-stream')) {
     return res.json() as Promise<RegressionRun>;
   }
-  const reader = res.body?.getReader();
-  if (!reader) return null;
-  const decoder = new TextDecoder();
-  let buffer = '';
   let result: RegressionRun | null = null;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data: ')) continue;
-      try {
-        const event = JSON.parse(trimmed.slice(6)) as SSEEvent;
-        if (event.type === 'regression_result') {
-          result = event.data as RegressionRun;
-        }
-      } catch {
-        // Ignore malformed stream fragments.
+  for await (const frame of streamSSE(res)) {
+    try {
+      const event = JSON.parse(frame.data) as SSEEvent;
+      if (event.type === 'regression_result') {
+        result = event.data as RegressionRun;
       }
+    } catch {
+      // Ignore malformed stream frames.
     }
   }
   return result;

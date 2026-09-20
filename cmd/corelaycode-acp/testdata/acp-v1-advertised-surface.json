@@ -17,13 +17,12 @@
     "promptImage": false,
     "promptAudio": false,
     "promptEmbeddedContext": false,
-    "mcpHttp": false,
+    "mcpHttp": true,
     "mcpSse": false,
     "authLogout": false
   },
   "unadvertisedMethods": [
     "authenticate",
-    "logout",
-    "session/set_mode"
+    "logout"
   ]
 }

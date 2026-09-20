@@ -2,11 +2,16 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
+
+var processConfigMu sync.Mutex
 
 type ProviderSettings struct {
 	APIKey  string `json:"apiKey,omitempty"`
@@ -25,8 +30,10 @@ type RuntimeQuotaSource struct {
 }
 
 type Project struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
+	Path        string   `json:"path"`
+	Name        string   `json:"name"`
+	SkillSource string   `json:"skillSource,omitempty"` // optional project override; blank inherits global
+	SkillDirs   []string `json:"skillDirs,omitempty"`   // optional additional roots
 }
 
 type Config struct {
@@ -59,6 +66,11 @@ type Config struct {
 	// iteration cap with no answer). 0 → built-in default (5). Set very high to
 	// effectively disable the guard. Action tasks (edit/fix/create) are exempt.
 	ReadOnlyExploreRounds int `json:"readOnlyExploreRounds,omitempty"`
+
+	// LSPExecutable selects the configured read-only language server executable
+	// (currently gopls for Go). An empty value uses the gopls name resolved from
+	// PATH; the application never installs a language server automatically.
+	LSPExecutable string `json:"lspExecutable,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -126,29 +138,136 @@ func configPath() string {
 	return filepath.Join(configDir(), "config.json")
 }
 
+// Load preserves the legacy default-on-error behavior. Security-sensitive code
+// and state mutations must use LoadChecked or Update instead.
 func Load() Config {
-	cfg := DefaultConfig()
-	data, err := os.ReadFile(configPath())
+	cfg, _, err := LoadChecked()
 	if err != nil {
-		return cfg
-	}
-	json.Unmarshal(data, &cfg)
-	if cfg.Providers == nil {
-		cfg.Providers = map[string]ProviderSettings{}
+		return DefaultConfig()
 	}
 	return cfg
 }
 
+// LoadChecked distinguishes a missing first-run config from an unreadable or
+// malformed existing config. Security-sensitive callers must not use Load,
+// which keeps the historical default-on-error behavior for compatibility.
+func LoadChecked() (Config, bool, error) {
+	return loadConfigUnlocked()
+}
+
+// Save replaces a complete validated snapshot. Production read-modify-write
+// paths should use Update so concurrent changes are not lost.
 func Save(cfg Config) error {
+	return withConfigLock(func() error {
+		if _, _, err := loadConfigUnlocked(); err != nil {
+			return err
+		}
+		return writeConfigUnlocked(cfg)
+	})
+}
+
+// Update serializes a complete read-modify-write transaction across goroutines
+// and processes. The callback runs against the latest valid snapshot. A failed
+// read, callback, or replacement leaves the previously published file intact.
+func Update(update func(*Config) error) (Config, error) {
+	if update == nil {
+		return Config{}, errors.New("config update callback is required")
+	}
+	var updated Config
+	err := withConfigLock(func() error {
+		cfg, _, err := loadConfigUnlocked()
+		if err != nil {
+			return err
+		}
+		if err := update(&cfg); err != nil {
+			return err
+		}
+		if cfg.Providers == nil {
+			cfg.Providers = map[string]ProviderSettings{}
+		}
+		if err := writeConfigUnlocked(cfg); err != nil {
+			return err
+		}
+		updated = cfg
+		return nil
+	})
+	return updated, err
+}
+
+func loadConfigUnlocked() (Config, bool, error) {
+	cfg := DefaultConfig()
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cfg, false, nil
+		}
+		return Config{}, false, fmt.Errorf("read config: %w", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return Config{}, true, fmt.Errorf("parse config: %w", err)
+	}
+	if object == nil {
+		return Config{}, true, errors.New("parse config: expected a JSON object")
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, true, fmt.Errorf("parse config: %w", err)
+	}
+	if cfg.Providers == nil {
+		cfg.Providers = map[string]ProviderSettings{}
+	}
+	return cfg, true, nil
+}
+
+func writeConfigUnlocked(cfg Config) error {
 	dir := configDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure temporary config: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary config: %w", err)
+	}
+	if err := replaceConfigFile(tmpPath, configPath()); err != nil {
+		return fmt.Errorf("publish config: %w", err)
+	}
+	return nil
+}
+
+func withConfigLock(run func() error) error {
+	processConfigMu.Lock()
+	defer processConfigMu.Unlock()
+	dir := configDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	lock, err := acquireConfigFileLock(filepath.Join(dir, ".config.lock"))
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(), data, 0644)
+	defer lock()
+	return run()
 }
 
 func ConfigPath() string {

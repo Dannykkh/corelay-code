@@ -442,9 +442,17 @@ func TestACPExecutionJournalSurvivesHardProcessExit(t *testing.T) {
 	}, client); !isInvalidRequest(err) {
 		t.Fatalf("fresh ResumeSession() error = %#v, want reconciliation block", err)
 	}
-	reconciled, err := store.MarkReconciled(sessionID, persisted.Revision)
+	assessment, err := agent.AssessSessionReconciliation(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := agent.NewSessionReconciliationReceipt(assessment, true, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := store.MarkReconciledWithReceipt(sessionID, persisted.Revision, assessment.RunID, receipt)
 	if err != nil || reconciled.ReconcileRequired {
-		t.Fatalf("MarkReconciled() = (%#v, %v)", reconciled, err)
+		t.Fatalf("MarkReconciledWithReceipt() = (%#v, %v)", reconciled, err)
 	}
 	if _, err := backend.LoadSession(context.Background(), load, client); err != nil {
 		t.Fatalf("LoadSession() after explicit reconciliation: %v", err)

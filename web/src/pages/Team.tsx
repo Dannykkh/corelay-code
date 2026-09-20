@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { fetchJSON, postJSON, type ProviderInfo } from '../lib/api';
 import { listWorkstreams, type Workstream } from '../lib/workstreams';
+import { streamSSE } from '../lib/sse';
 
 type GatewayUser = {
   id: string;
@@ -237,34 +238,22 @@ export function TeamPage() {
         throw new Error('Empty team stream');
       }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const event = JSON.parse(line.slice(6)) as TeamSSEEvent;
-            if (event.type === 'status' || event.type === 'text' || event.type === 'error') {
-              const msg = stringifyEventData(event.data);
-              if (msg) setTeamLog((prev) => [...prev, msg]);
-            } else if (event.type === 'session') {
-              const data = event.data as { traceId?: string };
-              if (data.traceId) setTeamLog((prev) => [...prev, `Trace: ${data.traceId}`]);
-            } else if (event.type === 'workstream') {
-              const data = event.data as { title?: string; id?: string };
-              const label = data.title || data.id;
-              if (label) setTeamLog((prev) => [...prev, `Workstream: ${label}`]);
-            }
-          } catch {
-            setTeamLog((prev) => [...prev, line.slice(6)]);
+      for await (const frame of streamSSE(res)) {
+        try {
+          const event = JSON.parse(frame.data) as TeamSSEEvent;
+          if (event.type === 'status' || event.type === 'text' || event.type === 'error') {
+            const msg = stringifyEventData(event.data);
+            if (msg) setTeamLog((prev) => [...prev, msg]);
+          } else if (event.type === 'session') {
+            const data = event.data as { traceId?: string };
+            if (data.traceId) setTeamLog((prev) => [...prev, `Trace: ${data.traceId}`]);
+          } else if (event.type === 'workstream') {
+            const data = event.data as { title?: string; id?: string };
+            const label = data.title || data.id;
+            if (label) setTeamLog((prev) => [...prev, `Workstream: ${label}`]);
           }
+        } catch {
+          setTeamLog((prev) => [...prev, frame.data]);
         }
       }
     } catch (err) {

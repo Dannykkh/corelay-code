@@ -84,7 +84,7 @@ type acpSecureMCPRunner struct{}
 func (*acpSecureMCPRunner) Name() string { return "acp-test-secure-mcp" }
 func (*acpSecureMCPRunner) Capabilities() sandbox.Capabilities {
 	return sandbox.Capabilities{
-		ProcessIsolation: true, ProcessTreeKill: true,
+		ProcessIsolation: true, FilesystemIsolation: true, ProcessTreeKill: true,
 		EnvironmentFiltering: true, Timeouts: true,
 	}
 }
@@ -130,6 +130,13 @@ type countedMCPRuntime struct {
 func (r *countedMCPRuntime) Close() {
 	r.closes.Add(1)
 	r.MCPRuntime.Close()
+}
+
+func (r *countedMCPRuntime) ExecutionCapabilities() sandbox.Capabilities {
+	if provider, ok := r.MCPRuntime.(agent.MCPRuntimeExecutionCapabilityProvider); ok {
+		return provider.ExecutionCapabilities()
+	}
+	return sandbox.Capabilities{}
 }
 
 type recordingMCPRuntimeFactory struct {
@@ -448,6 +455,7 @@ func TestACPCancelDuringMCPInitializationIsTypedAndCancelsLifetime(t *testing.T)
 		Provider:     &fakeProvider{models: []types.ModelInfo{{ID: "model-a"}}},
 		DefaultModel: "model-a",
 		Store:        store,
+		MCPExecution: acpSecureMCPExecution(),
 		MCPRuntimeFactory: func(
 			ctx context.Context,
 			_ string,
@@ -629,6 +637,9 @@ func (*inertMCPRuntime) Generation() string                  { return "inert-gen
 func (*inertMCPRuntime) Healthy() bool                       { return true }
 func (*inertMCPRuntime) Reports() []processsupervisor.Report { return nil }
 func (r *inertMCPRuntime) Close()                            { r.closes.Add(1) }
+func (*inertMCPRuntime) ExecutionCapabilities() sandbox.Capabilities {
+	return sandbox.Capabilities{FilesystemIsolation: true}
+}
 
 func TestACPClientMCPRawSpecsRemainMemoryOnly(t *testing.T) {
 	const commandSecret = "raw-command-secret"
@@ -640,6 +651,7 @@ func TestACPClientMCPRawSpecsRemainMemoryOnly(t *testing.T) {
 	backend, err := New(Options{
 		Provider:     &fakeProvider{models: []types.ModelInfo{{ID: "model-a"}}},
 		DefaultModel: "model-a", Store: store,
+		MCPExecution: acpSecureMCPExecution(),
 		Runner: RunnerFunc(func(
 			_ context.Context, _ types.Provider, _ string, _ []types.Message, _ string, options agent.RunOptions,
 		) (<-chan agent.Event, error) {
@@ -708,7 +720,7 @@ func TestACPRejectsUnsupportedAndDuplicateMCPDeclarations(t *testing.T) {
 		name    string
 		servers []acp.MCPServer
 	}{
-		{name: "HTTP is capability gated", servers: []acp.MCPServer{{Type: "http", Name: "remote", URL: "https://example.invalid", Headers: []acp.HTTPHeader{}}}},
+		{name: "legacy SSE is capability gated", servers: []acp.MCPServer{{Type: "sse", Name: "remote", URL: "https://example.invalid", Headers: []acp.HTTPHeader{}}}},
 		{name: "duplicate server", servers: []acp.MCPServer{valid, valid}},
 		{name: "duplicate environment", servers: []acp.MCPServer{{
 			Name: "env", Command: executable, Args: []string{},

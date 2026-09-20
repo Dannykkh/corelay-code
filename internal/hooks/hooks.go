@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
@@ -55,51 +56,58 @@ type HookMetadata struct {
 type HookFailureCode string
 
 const (
-	HookFailureNone                  HookFailureCode = ""
-	HookFailureConfigInvalid         HookFailureCode = "hook_config_invalid"
-	HookFailureEnvironmentInvalid    HookFailureCode = "hook_environment_invalid"
-	HookFailurePolicyInvalid         HookFailureCode = "hook_sandbox_policy_invalid"
-	HookFailureCapabilityUnavailable HookFailureCode = "hook_sandbox_capability_unavailable"
-	HookFailureRunnerUnavailable     HookFailureCode = "hook_sandbox_unavailable"
-	HookFailureCommandInvalid        HookFailureCode = "hook_command_invalid"
-	HookFailureStartFailed           HookFailureCode = "hook_start_failed"
-	HookFailureTimedOut              HookFailureCode = "hook_timeout"
-	HookFailureCanceled              HookFailureCode = "hook_canceled"
-	HookFailureOutputLimit           HookFailureCode = "hook_output_limit"
-	HookFailureNonZeroExit           HookFailureCode = "hook_nonzero_exit"
-	HookFailureExecution             HookFailureCode = "hook_execution_failed"
-	HookFailureReportInvalid         HookFailureCode = "hook_sandbox_report_invalid"
+	HookFailureNone                   HookFailureCode = ""
+	HookFailureConfigInvalid          HookFailureCode = "hook_config_invalid"
+	HookFailureEnvironmentInvalid     HookFailureCode = "hook_environment_invalid"
+	HookFailurePolicyInvalid          HookFailureCode = "hook_sandbox_policy_invalid"
+	HookFailureCapabilityUnavailable  HookFailureCode = "hook_sandbox_capability_unavailable"
+	HookFailureRunnerUnavailable      HookFailureCode = "hook_sandbox_unavailable"
+	HookFailureCommandInvalid         HookFailureCode = "hook_command_invalid"
+	HookFailureStartFailed            HookFailureCode = "hook_start_failed"
+	HookFailureTimedOut               HookFailureCode = "hook_timeout"
+	HookFailureCanceled               HookFailureCode = "hook_canceled"
+	HookFailureOutputLimit            HookFailureCode = "hook_output_limit"
+	HookFailureNonZeroExit            HookFailureCode = "hook_nonzero_exit"
+	HookFailureExecution              HookFailureCode = "hook_execution_failed"
+	HookFailureReportInvalid          HookFailureCode = "hook_sandbox_report_invalid"
+	HookFailureReadOnlyPolicy         HookFailureCode = "hook_execution_policy_read_only"
+	HookFailureExecutionPolicyInvalid HookFailureCode = "hook_execution_policy_invalid"
 )
 
 // HookResult contains bounded, redacted output and typed sandbox evidence. It
 // never includes the raw command, environment values, or runner error.
 type HookResult struct {
-	Hook            HookMetadata    `json:"hook"`
-	Output          string          `json:"output,omitempty"`
-	Error           string          `json:"error,omitempty"`
-	Failure         HookFailureCode `json:"failure,omitempty"`
-	ExitCode        int             `json:"exitCode"`
-	Duration        time.Duration   `json:"duration"`
-	Blocked         bool            `json:"blocked"`
-	OutputTruncated bool            `json:"outputTruncated,omitempty"`
-	StdoutDigest    string          `json:"stdoutDigest,omitempty"`
-	StderrDigest    string          `json:"stderrDigest,omitempty"`
-	Sandbox         sandbox.Report  `json:"sandbox"`
+	Hook                    HookMetadata         `json:"hook"`
+	Output                  string               `json:"output,omitempty"`
+	Error                   string               `json:"error,omitempty"`
+	Failure                 HookFailureCode      `json:"failure,omitempty"`
+	ExitCode                int                  `json:"exitCode"`
+	Duration                time.Duration        `json:"duration"`
+	Blocked                 bool                 `json:"blocked"`
+	OutputTruncated         bool                 `json:"outputTruncated,omitempty"`
+	StdoutDigest            string               `json:"stdoutDigest,omitempty"`
+	StderrDigest            string               `json:"stderrDigest,omitempty"`
+	Sandbox                 sandbox.Report       `json:"sandbox"`
+	ExecutionPolicyMode     executionpolicy.Mode `json:"executionPolicyMode,omitempty"`
+	ExecutionPolicyRevision uint64               `json:"executionPolicyRevision,omitempty"`
 }
 
 // RegistryOptions configures the process boundary. A zero policy selects the
 // secure default. Legacy host execution is accepted only when the caller
 // explicitly supplies both an UnconfinedRunner and EnforcementDisabled.
 type RegistryOptions struct {
-	Runner    sandbox.Runner
-	Policy    sandbox.Policy
-	ShellPath string
+	Runner          sandbox.Runner
+	Policy          sandbox.Policy
+	ShellPath       string
+	ExecutionPolicy executionpolicy.Snapshot
 }
 
 type registrySnapshot struct {
-	hooks       []Hook
-	workDir     string
-	loadFailure HookFailureCode
+	hooks                  []Hook
+	workDir                string
+	loadFailure            HookFailureCode
+	executionPolicy        executionpolicy.Snapshot
+	executionPolicyFailure HookFailureCode
 }
 
 // Registry manages one immutable-at-execution hook snapshot. Load swaps the
@@ -108,26 +116,32 @@ type Registry struct {
 	mu       sync.RWMutex
 	snapshot registrySnapshot
 
-	runtimeOnce sync.Once
-	runner      sandbox.Runner
-	policy      sandbox.Policy
-	shellPath   string
-	runtimeErr  HookFailureCode
+	runtimeOnce            sync.Once
+	runner                 sandbox.Runner
+	policy                 sandbox.Policy
+	shellPath              string
+	runtimeErr             HookFailureCode
+	executionPolicy        executionpolicy.Snapshot
+	executionPolicyFailure HookFailureCode
 }
 
 // NewRegistry returns a fail-closed registry backed by sandbox.AutoRunner.
 func NewRegistry() *Registry {
-	return &Registry{}
+	policy, failure := normalizeExecutionPolicy(executionpolicy.Snapshot{})
+	return &Registry{executionPolicy: policy, executionPolicyFailure: failure}
 }
 
 // NewRegistryWithOptions creates a registry with an explicit runner seam.
 // Invalid combinations are retained as a typed fail-closed runtime error so a
 // project hook can never be silently skipped or downgraded.
 func NewRegistryWithOptions(options RegistryOptions) *Registry {
+	executionPolicy, executionPolicyFailure := normalizeExecutionPolicy(options.ExecutionPolicy)
 	return &Registry{
-		runner:    options.Runner,
-		policy:    options.Policy,
-		shellPath: options.ShellPath,
+		runner:                 options.Runner,
+		policy:                 options.Policy,
+		shellPath:              options.ShellPath,
+		executionPolicy:        executionPolicy,
+		executionPolicyFailure: executionPolicyFailure,
 	}
 }
 
@@ -140,10 +154,31 @@ func (r *Registry) Load(workDir string, skillSource string) error {
 		snapshot.hooks = nil
 		snapshot.loadFailure = HookFailureConfigInvalid
 	}
+	r.mu.RLock()
+	executionPolicy := r.executionPolicy
+	executionPolicyFailure := r.executionPolicyFailure
+	r.mu.RUnlock()
+	if executionPolicy.Mode == "" && executionPolicyFailure == HookFailureNone {
+		executionPolicy, executionPolicyFailure = normalizeExecutionPolicy(executionpolicy.Snapshot{})
+	}
+	snapshot.executionPolicy = executionPolicy
+	snapshot.executionPolicyFailure = executionPolicyFailure
 	r.mu.Lock()
 	r.snapshot = snapshot
 	r.mu.Unlock()
 	return err
+}
+
+// SetExecutionPolicy binds the run-level authority snapshot to this registry.
+// Call it before Load so the immutable hook snapshot captures the same run
+// policy that ExecuteContext will enforce. Runtime capabilities are discarded
+// here and resolved from this registry's concrete runner during execution.
+func (r *Registry) SetExecutionPolicy(policy executionpolicy.Snapshot) {
+	policy, failure := normalizeExecutionPolicy(policy)
+	r.mu.Lock()
+	r.executionPolicy = policy
+	r.executionPolicyFailure = failure
+	r.mu.Unlock()
 }
 
 // Execute is the compatibility wrapper. It retains the secure default and does
@@ -168,10 +203,10 @@ func (r *Registry) ExecuteContext(ctx context.Context, hookType HookType, env ma
 	}
 	snapshot := r.snapshotCopy()
 	if snapshot.loadFailure != HookFailureNone {
-		return []HookResult{syntheticHookResult(hookType, snapshot.loadFailure)}
+		return []HookResult{withExecutionPolicy(syntheticHookResult(hookType, snapshot.loadFailure), snapshot.executionPolicy)}
 	}
 	if !validHookType(hookType) {
-		return []HookResult{syntheticHookResult(hookType, HookFailureConfigInvalid)}
+		return []HookResult{withExecutionPolicy(syntheticHookResult(hookType, HookFailureConfigInvalid), snapshot.executionPolicy)}
 	}
 
 	candidates := make([]Hook, 0, len(snapshot.hooks))
@@ -183,6 +218,25 @@ func (r *Registry) ExecuteContext(ctx context.Context, hookType HookType, env ma
 	if len(candidates) == 0 {
 		return nil
 	}
+	if snapshot.executionPolicyFailure != HookFailureNone {
+		result := syntheticHookResult(hookType, snapshot.executionPolicyFailure)
+		result.Hook = metadataForHook(candidates[0])
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
+	}
+	if snapshot.executionPolicy.Mode == executionpolicy.ModeReadOnly {
+		// Read-only runs do not invoke project hooks at all. This is enforced
+		// before environment processing or runner execution so even lifecycle
+		// hooks such as SessionStart and SessionEnd cannot cause side effects.
+		r.ensureRuntime()
+		if r.runner != nil {
+			// Resolve runtime facts from this registry even though the policy will
+			// prevent the command from being started.
+			snapshot.executionPolicy.RuntimeCapabilities = r.runner.Capabilities()
+		}
+		result := syntheticHookResult(hookType, HookFailureReadOnlyPolicy)
+		result.Hook = metadataForHook(candidates[0])
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
+	}
 	if err := ctx.Err(); err != nil {
 		failure := HookFailureCanceled
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -190,53 +244,58 @@ func (r *Registry) ExecuteContext(ctx context.Context, hookType HookType, env ma
 		}
 		result := syntheticHookResult(hookType, failure)
 		result.Hook = metadataForHook(candidates[0])
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
 
 	environment, envFailure := buildHookEnvironment(env, snapshot.workDir)
 	if envFailure != HookFailureNone {
 		result := syntheticHookResult(hookType, envFailure)
 		result.Hook = metadataForHook(candidates[0])
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
 	matching, matchFailure := matchingHooks(candidates, environment.Set)
 	if matchFailure != HookFailureNone {
 		result := syntheticHookResult(hookType, matchFailure)
 		result.Hook = metadataForHook(candidates[0])
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
 	if len(matching) == 0 {
 		return nil
 	}
 
 	r.ensureRuntime()
+	if r.runner != nil {
+		// Runtime capability claims supplied by the parent are descriptive only;
+		// bind this execution to the concrete runner owned by the registry.
+		snapshot.executionPolicy.RuntimeCapabilities = r.runner.Capabilities()
+	}
 	if r.runtimeErr != HookFailureNone {
 		result := syntheticHookResult(hookType, r.runtimeErr)
 		result.Hook = metadataForHook(matching[0])
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
 	policy, policyFailure := r.policyForWorkspace(snapshot.workDir)
 	if policyFailure != HookFailureNone {
 		result := syntheticHookResult(hookType, policyFailure)
 		result.Hook = metadataForHook(matching[0])
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
-	if err := sandbox.ValidatePolicy(policy, r.runner.Capabilities()); err != nil {
+	if err := sandbox.ValidatePolicy(policy, snapshot.executionPolicy.RuntimeCapabilities); err != nil {
 		failure := hookFailureFromPolicyValidation(err)
 		result := syntheticHookResult(hookType, failure)
 		result.Hook = metadataForHook(matching[0])
 		result.Sandbox = safeSandboxReport(sandbox.Report{
 			Runner:               r.runner.Name(),
 			RequestedEnforcement: policy.Enforcement,
-			Capabilities:         r.runner.Capabilities(),
+			Capabilities:         snapshot.executionPolicy.RuntimeCapabilities,
 			Failure:              sandboxFailureForHookFailure(failure),
 		})
-		return []HookResult{result}
+		return []HookResult{withExecutionPolicy(result, snapshot.executionPolicy)}
 	}
 
 	results := make([]HookResult, 0, len(matching))
 	for _, hook := range matching {
-		result := r.runHook(ctx, hook, snapshot.workDir, environment, policy)
+		result := r.runHook(ctx, hook, snapshot.workDir, environment, policy, snapshot.executionPolicy)
 		results = append(results, result)
 		if hookType == HookPreToolUse && result.Blocked {
 			break
@@ -294,10 +353,17 @@ func (r *Registry) ensureRuntime() {
 			r.runtimeErr = HookFailureCommandInvalid
 			return
 		}
+		fullMode := r.snapshot.executionPolicy.Mode == executionpolicy.ModeFull
+		_, unconfined := r.runner.(*sandbox.UnconfinedRunner)
+		if fullMode && (!unconfined || r.policy.Enforcement != sandbox.EnforcementDisabled) {
+			r.runtimeErr = HookFailurePolicyInvalid
+			return
+		}
+		if !fullMode && r.policy.Enforcement == sandbox.EnforcementDisabled {
+			r.runtimeErr = HookFailurePolicyInvalid
+			return
+		}
 		if r.policy.Enforcement == sandbox.EnforcementDisabled {
-			if _, ok := r.runner.(*sandbox.UnconfinedRunner); !ok {
-				r.runtimeErr = HookFailurePolicyInvalid
-			}
 			return
 		}
 		if r.policy.Enforcement != sandbox.EnforcementRequired &&
@@ -318,7 +384,10 @@ func (r *Registry) policyForWorkspace(workDir string) (sandbox.Policy, HookFailu
 		}
 		policy.Workspace = ""
 		policy.Network = sandbox.NetworkAccessUnspecified
-		policy.Required.ProcessTreeKill = true
+		// Explicit full mode runs through UnconfinedRunner. Keep the process
+		// supervision requirement aligned with that runner's truthful platform
+		// capability instead of claiming a process-tree guarantee it cannot make.
+		policy.Required.ProcessTreeKill = r.runner.Capabilities().ProcessTreeKill
 		policy.Required.EnvironmentFiltering = true
 		policy.Required.Timeouts = true
 		return policy, HookFailureNone
@@ -368,6 +437,7 @@ func (r *Registry) runHook(
 	workDir string,
 	environment sandbox.EnvironmentSpec,
 	policy sandbox.Policy,
+	executionPolicy executionpolicy.Snapshot,
 ) HookResult {
 	timeout := time.Duration(hook.Timeout) * time.Second
 	if hook.Timeout == 0 {
@@ -400,7 +470,41 @@ func (r *Registry) runHook(
 	if failure != HookFailureNone {
 		hookResult.Error = safeHookFailureMessage(failure)
 	}
-	return hookResult
+	return withExecutionPolicy(hookResult, executionPolicy)
+}
+
+func withExecutionPolicy(result HookResult, policy executionpolicy.Snapshot) HookResult {
+	result.ExecutionPolicyMode = policy.Mode
+	result.ExecutionPolicyRevision = policy.Revision
+	return result
+}
+
+func normalizeExecutionPolicy(policy executionpolicy.Snapshot) (executionpolicy.Snapshot, HookFailureCode) {
+	// Capabilities are runtime evidence, never inherited authority. Populate
+	// them only after this registry resolves its own concrete runner.
+	policy.RuntimeCapabilities = sandbox.Capabilities{}
+	if policy.Mode == "" {
+		resolved, err := executionpolicy.Resolve(executionpolicy.Request{}, "", sandbox.Capabilities{})
+		if err != nil {
+			return executionpolicy.Snapshot{}, HookFailureExecutionPolicyInvalid
+		}
+		return resolved, HookFailureNone
+	}
+	switch policy.Mode {
+	case executionpolicy.ModeReadOnly, executionpolicy.ModeWorkspace, executionpolicy.ModeFull:
+	default:
+		return policy, HookFailureExecutionPolicyInvalid
+	}
+	if policy.Revision == 0 {
+		policy.Revision = 1
+	}
+	if policy.Source == "" {
+		policy.Source = executionpolicy.SourceUserSelected
+	}
+	if err := executionpolicy.ValidateSnapshot(policy); err != nil {
+		return policy, HookFailureExecutionPolicyInvalid
+	}
+	return policy, HookFailureNone
 }
 
 func syntheticHookResult(hookType HookType, failure HookFailureCode) HookResult {
@@ -493,7 +597,8 @@ func hookFailureFromPolicyValidation(err error) HookFailureCode {
 
 func sandboxFailureForHookFailure(failure HookFailureCode) sandbox.FailureCode {
 	switch failure {
-	case HookFailurePolicyInvalid, HookFailureConfigInvalid, HookFailureEnvironmentInvalid:
+	case HookFailurePolicyInvalid, HookFailureConfigInvalid, HookFailureEnvironmentInvalid,
+		HookFailureReadOnlyPolicy, HookFailureExecutionPolicyInvalid:
 		return sandbox.FailurePolicyInvalid
 	case HookFailureCapabilityUnavailable:
 		return sandbox.FailureCapabilityUnavailable
@@ -524,6 +629,10 @@ func safeHookFailureMessage(failure HookFailureCode) string {
 		return "hook environment rejected"
 	case HookFailurePolicyInvalid:
 		return "hook sandbox policy rejected"
+	case HookFailureReadOnlyPolicy:
+		return "project hooks are disabled by the read-only execution policy"
+	case HookFailureExecutionPolicyInvalid:
+		return "hook execution policy rejected"
 	case HookFailureCapabilityUnavailable:
 		return "required hook sandbox capability unavailable"
 	case HookFailureRunnerUnavailable:

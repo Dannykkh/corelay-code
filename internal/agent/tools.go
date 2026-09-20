@@ -186,6 +186,8 @@ var FileOwnershipChecker func(workerID, filePath string) (bool, string)
 var activeWorkerID string
 
 type ToolExecutionOptions struct {
+	ExecutionPolicy   *ExecutionPolicySnapshot
+	ToolCallID        string
 	WorkerID          string
 	OwnershipChecker  func(workerID, filePath string) (bool, string)
 	Context           context.Context
@@ -199,11 +201,13 @@ type ToolExecutionOptions struct {
 	ExpectedRunID     string
 	ObserveHost       func(HostInteractionReport)
 	ToolResultReader  ToolResultReader
+	SkillBodyReader   SkillBodyReader
 	// CompletionContract and CompletionEvidenceResolver are run-owned strict
 	// completion state. ReportCompletion additionally requires the private
 	// catalog proof minted from the dispatcher's identity-bound envelope.
 	CompletionContract         *CompletionContract
 	CompletionEvidenceResolver CompletionEvidenceResolver
+	imageReadSink              *imageReadPayloadSink
 	hostApproval               hostInteractionApprovalProof
 	pluginApproval             pluginApprovalProof
 	fileMutation               *fileMutationPrecondition
@@ -264,6 +268,10 @@ func ExecuteToolWithOptions(name string, input json.RawMessage, workDir string, 
 			), true
 		}
 		input = boundInput
+		if opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeReadOnly &&
+			expectedIdentity.Kind != toolExecutorBuiltIn {
+			return "[POLICY BLOCKED] read-only execution mode blocks external executors", true
+		}
 		if name == reportCompletionToolName {
 			proof, valid := newCompletionReportCatalogProof(expectedIdentity, opts.ExpectedRunID)
 			if !valid {
@@ -271,6 +279,13 @@ func ExecuteToolWithOptions(name string, input json.RawMessage, workDir string, 
 			}
 			opts.completionReportProof = &proof
 		}
+	}
+	if hostBound && (!identityBound || expectedIdentity.Kind != toolExecutorBuiltIn) {
+		return "[HOST INTERACTION BLOCKED] approval proof was attached to an unbound host executor", true
+	}
+	if opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeReadOnly &&
+		!readOnlyPolicyAllowsBuiltIn(name, input) {
+		return "[POLICY BLOCKED] read-only execution mode blocks this tool effect", true
 	}
 	if pluginApprovalBound && (!identityBound || expectedIdentity.Kind != toolExecutorPlugin) {
 		return "[PLUGIN BLOCKED] plugin approval proof was attached to a non-plugin executor", true
@@ -362,13 +377,16 @@ func executeBuiltInTool(name string, input json.RawMessage, workDir string, opts
 		return result, isErr
 	}
 	if result, isErr, handled := ExecuteComputerUseToolWithOptions(name, input, workDir, HostInteractionExecutionOptions{
-		Context:           opts.Context,
-		Driver:            opts.HostDriver,
-		Policy:            opts.HostPolicy,
-		ExpectedSessionID: opts.ExpectedSessionID,
-		ExpectedRunID:     opts.ExpectedRunID,
-		ObserveReport:     opts.ObserveHost,
-		approval:          opts.hostApproval,
+		Context:            opts.Context,
+		Driver:             opts.HostDriver,
+		Policy:             opts.HostPolicy,
+		ExpectedSessionID:  opts.ExpectedSessionID,
+		ExpectedRunID:      opts.ExpectedRunID,
+		ExpectedToolCallID: opts.ToolCallID,
+		ExpectedExecutorID: "builtin:" + name,
+		ExecutionPolicy:    opts.ExecutionPolicy,
+		ObserveReport:      opts.ObserveHost,
+		approval:           opts.hostApproval,
 	}); handled {
 		return result, isErr
 	}
@@ -387,21 +405,23 @@ func executeBaseTool(name string, input json.RawMessage, workDir string, opts To
 			opts.ObserveSandbox,
 		)
 	case "Read":
-		return executeReadV2(input, workDir)
+		return executeReadV2WithOptions(input, workDir, opts)
 	case "Write":
 		return executeWriteV2WithOptions(input, workDir, opts)
 	case "Edit":
 		return executeEditV2WithOptions(input, workDir, opts)
 	case "Glob":
-		return executeGlobV2(input, workDir)
+		return executeGlobV2WithOptions(input, workDir, opts)
 	case "Grep":
 		return executeGrepV2WithOptions(input, workDir, opts)
 	case loadToolResultToolName:
 		return executeLoadToolResult(input, opts.ToolResultReader)
+	case loadSkillToolName:
+		return executeLoadSkill(input, opts.SkillBodyReader)
 	case reportCompletionToolName:
 		return executeReportCompletion(input, opts)
 	case "WebFetch":
-		return executeWebFetch(input, workDir)
+		return executeWebFetchWithContext(opts.Context, input)
 	case "WebSearch":
 		return executeWebSearch(input, workDir)
 	case "WebResearch":

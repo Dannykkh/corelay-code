@@ -26,6 +26,7 @@ func runWorker(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: saved config or ollama)")
 	model := fs.String("model", "", "Model ID (default: saved config or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
+	modeFlag := fs.String("mode", "", "Per-run execution mode: read-only, workspace, or full (default: workspace)")
 	baseDir := fs.String("base-dir", "", "State directory (default: ~/.corelay)")
 	verifyCommand := fs.String("verify", "", "Optional verification command to run after the worker")
 	responseLang := fs.String("lang", "auto", "Response language hint")
@@ -34,8 +35,17 @@ func runWorker(args []string) {
 		fmt.Fprintf(os.Stderr, "worker: %v\n", err)
 		os.Exit(2)
 	}
+	mode, err := parseExecutionModeFlag(*modeFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "worker: %v\n", err)
+		os.Exit(2)
+	}
 
-	cfg := config.Load()
+	cfg, _, err := config.LoadChecked()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "worker: invalid configuration: %v\n", err)
+		os.Exit(2)
+	}
 	registerWorkerCustomProviders(cfg)
 
 	if *providerName == "" {
@@ -91,7 +101,11 @@ func runWorker(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(*workDir)
+	sandboxRunner, sandboxPolicy, executionPolicy, err := resolveCLIExecutionPolicy(*workDir, mode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "worker: invalid execution mode: %v\n", err)
+		os.Exit(2)
+	}
 	team := agent.NewTeam(provider, *model, *workDir, *baseDir, agent.TeamConfig{
 		Name:            "cli-worker",
 		MaxWaveSize:     1,
@@ -100,6 +114,7 @@ func runWorker(args []string) {
 		ProviderFactory: createProviderByName,
 		SandboxRunner:   sandboxRunner,
 		SandboxPolicy:   sandboxPolicy,
+		ExecutionPolicy: &executionPolicy,
 	})
 	team.AddTask(task.ToTeamTask())
 
@@ -107,6 +122,7 @@ func runWorker(args []string) {
 	go func() {
 		defer close(eventCh)
 		verification := agent.ReceiptVerification{Status: "not-run", Source: "none"}
+		eventCh <- agent.Event{Type: "status", Data: fmt.Sprintf("Execution mode: %s (revision %d)", executionPolicy.Mode, executionPolicy.Revision)}
 		if err := team.ExecuteWaves(ctx, eventCh); err != nil {
 			eventCh <- agent.Event{Type: "error", Data: err.Error()}
 			emitTeamReceipt(eventCh, team, workerPlan, *baseDir, *workDir, "failed", verification)

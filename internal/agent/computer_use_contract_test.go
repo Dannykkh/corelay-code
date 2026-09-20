@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/approval"
 )
 
 type fakeHostInteractionDriver struct {
@@ -65,22 +67,33 @@ func approvedHostOptions(
 	driver HostInteractionDriver,
 ) HostInteractionExecutionOptions {
 	t.Helper()
-	proof, err := mintHostInteractionApproval(
-		fmt.Sprintf("approval-test-%s-%d", t.Name(), testHostApprovalSequence.Add(1)),
-		"session-test",
-		"run-test",
-		name,
-		input,
-		time.Now().Add(time.Minute),
-	)
+	policy := hostTestExecutionPolicy()
+	callID := hostApprovalTestCallID(name)
+	pending := approval.Pending{
+		ID:                      fmt.Sprintf("approval-test-%s-%d", t.Name(), testHostApprovalSequence.Add(1)),
+		SessionID:               "session-test",
+		RunID:                   "run-test",
+		ToolCallID:              callID,
+		ToolName:                name,
+		ExecutorID:              "builtin:" + name,
+		InputDigest:             approvalToolInputDigest(name, input),
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		ExpiresAt:               time.Now().Add(time.Minute),
+	}
+	proof, err := mintHostInteractionApproval(pending, callID, input, policy)
 	if err != nil {
 		t.Fatalf("mint host approval: %v", err)
 	}
 	return HostInteractionExecutionOptions{
-		Context:           context.Background(),
-		Driver:            driver,
-		ExpectedSessionID: "session-test",
-		ExpectedRunID:     "run-test",
+		Context:            context.Background(),
+		Driver:             driver,
+		ExpectedSessionID:  "session-test",
+		ExpectedRunID:      "run-test",
+		ExpectedToolCallID: callID,
+		ExpectedExecutorID: "builtin:" + name,
+		ExecutionPolicy:    &policy,
 		Policy: HostInteractionPolicy{
 			Enabled:     true,
 			Allowed:     allHostCapabilities(),
@@ -88,6 +101,18 @@ func approvedHostOptions(
 		},
 		approval: proof,
 	}
+}
+
+func hostTestExecutionPolicy() ExecutionPolicySnapshot {
+	return ExecutionPolicySnapshot{
+		Mode:     ExecutionModeWorkspace,
+		Revision: 29,
+		Source:   "user-selected",
+	}
+}
+
+func hostApprovalTestCallID(name string) string {
+	return "host-call:" + name
 }
 
 func TestComputerUseZeroAndMissingApprovalFailClosedWithoutDriverStart(t *testing.T) {
@@ -290,6 +315,22 @@ func TestComputerUseApprovalProofCannotReplayAcrossRunOrCall(t *testing.T) {
 	}
 
 	opts.ExpectedRunID = "run-test"
+	opts.ExpectedToolCallID = "different-host-call"
+	result, isError, _ = ExecuteComputerUseToolWithOptions("TypeText", input, t.TempDir(), opts)
+	if !isError || !strings.Contains(result, string(HostFailureApprovalInvalid)) || driver.callCount() != 0 {
+		t.Fatalf("cross-call result=%q isError=%v calls=%d", result, isError, driver.callCount())
+	}
+	opts.ExpectedToolCallID = hostApprovalTestCallID("TypeText")
+	changedPolicy := *opts.ExecutionPolicy
+	changedPolicy.Revision++
+	opts.ExecutionPolicy = &changedPolicy
+	result, isError, _ = ExecuteComputerUseToolWithOptions("TypeText", input, t.TempDir(), opts)
+	if !isError || !strings.Contains(result, string(HostFailureApprovalInvalid)) || driver.callCount() != 0 {
+		t.Fatalf("changed-policy result=%q isError=%v calls=%d", result, isError, driver.callCount())
+	}
+	opts.ExecutionPolicy = &changedPolicy
+	changedPolicy.Revision--
+	opts.ExecutionPolicy = &changedPolicy
 	result, isError, _ = ExecuteComputerUseToolWithOptions("TypeText", input, t.TempDir(), opts)
 	if isError || driver.callCount() != 1 {
 		t.Fatalf("first execution result=%q isError=%v calls=%d", result, isError, driver.callCount())
@@ -326,8 +367,10 @@ func TestDispatchComputerUseRequiresBrokerAndCarriesApprovalProof(t *testing.T) 
 		InputRaw: string(input),
 	}
 	driver := &fakeHostInteractionDriver{name: "fake-host", caps: allHostCapabilities()}
+	executionPolicy := hostTestExecutionPolicy()
 	base := toolDispatchOptions{
 		Context:          context.Background(),
+		ExecutionPolicy:  &executionPolicy,
 		WorkDir:          workDir,
 		AllowedTools:     toolCatalogNames(ComputerUseToolDefs()),
 		PermissionConfig: PermissionConfig{AutoApprove: "all"},
@@ -336,6 +379,8 @@ func TestDispatchComputerUseRequiresBrokerAndCarriesApprovalProof(t *testing.T) 
 		Execute: func(call toolUseBlock) (string, bool) {
 			return ExecuteToolWithOptions(call.Name, call.Input, workDir, ToolExecutionOptions{
 				Context:           context.Background(),
+				ExecutionPolicy:   &executionPolicy,
+				ToolCallID:        call.ID,
 				HostDriver:        driver,
 				ExpectedSessionID: "host-session",
 				ExpectedRunID:     "host-run",

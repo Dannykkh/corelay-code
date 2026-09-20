@@ -4,31 +4,95 @@
 
 <h1 align="center">Corelay Code</h1>
 
-<p align="center"><strong>Relay model intent into verified code.</strong></p>
+<p align="center"><strong>Turn development failures into tested improvements.</strong></p>
 
 <p align="center">
-  One agent kernel for Web, TUI, HTTP, ACP, teams, and background runs.<br />
-  One compatibility gateway for the CLIs you already use.
+  Execute development tasks, preserve evidence, and evaluate improvements.<br />
+  A shared agent harness for local and hosted models, with a gateway for existing CLIs.
 </p>
 
-## What it is
+## Purpose
 
-Corelay Code is an execution control plane for coding agents. It sits between a
-model and a real workspace and owns the mechanics that models should not have to
-get right by accident: tool contracts, permissions, context, durable sessions,
-verification, recovery, and completion.
+Corelay Code aims to reduce repeated failures and the human intervention needed
+when AI agents work on real software projects. Its intended use is development
+work itself: run a task, preserve what happened, reproduce failures, and test
+whether a change makes the next run more reliable.
 
-The name describes the boundary:
+A **harness** supplies the execution environment around the model: tools,
+permissions, project context, verification, and recovery. Corelay provides that
+foundation and is building a bounded self-improvement loop on top of it.
+The model supplies reasoning; the harness makes its actions and results
+observable and checkable.
 
-| Layer | Meaning |
-|---|---|
-| **Core** | One agent kernel gives every native ingress the same tool, safety, evidence, and terminal semantics. |
-| **Relay** | Models, accounts, and compatible CLIs can change without changing the execution contract. |
-| **Code** | A run is not finished because it produced prose; workspace changes must be executed, checked, and recorded. |
+The success criterion is fewer repeated mistakes and less user intervention on
+real tasks, with acceptable time and cost. Tool count, generated code volume,
+and a model saying “done” are not sufficient evidence of progress.
 
-The model still supplies judgement. Corelay Code supplies the conditions under
-which that judgement can survive stale edits, malformed calls, context pressure,
-process death, and ambiguous side effects.
+## Problems it addresses
+
+An agent can invoke tools and still fail to finish useful work. It may send
+invalid arguments repeatedly, edit stale content, lose requirements in a long
+conversation, or report completion without successful verification. A canceled
+or crashed run can also leave changes whose status is unclear.
+
+Corelay makes these conditions explicit so a failed run can become something
+that can be investigated, reproduced, and eventually improved. That goal is
+broader than the current implementation: production failure collection,
+reproducible tasks, candidate generation, and independent evaluation are not yet
+one fully automatic pipeline.
+
+## What exists to address them
+
+| Need | Current mechanism | Boundary |
+|---|---|---|
+| Execute work consistently | Shared agent kernel for Web, TUI, HTTP, ACP, team workers, and background work | Model quality still affects task success; not every ingress supports every workflow |
+| Keep projects and actions under control | Workspace/session binding, permissions, approvals, sandbox adapters, tool validation | Isolation depends on the configured platform/backend; this is not a complete security certification |
+| Detect incomplete work | Verification commands, completion evidence, typed terminal states, execution receipts | Passing a fixture does not prove an arbitrary user task is complete |
+| Recover from interruption | Durable sessions, revision checks, write-ahead markers, checkpoints and reconciliation | Ambiguous side effects require reconciliation rather than automatic replay |
+| Turn failures into test material | Failed Chronos/Team traces can be promoted to regression cases | Production traces are not yet automatically converted into safe, isolated acceptance tasks |
+| Evaluate behavior before adoption | Profiler with isolated calibration, holdout and safety probes; immutable profiles | Fixed-suite measurements do not establish general or statistically reliable improvement |
+| Learn bounded workflow reminders | `improve --learn` proposes reminders from repeated calibration failures, runs control/candidate evaluations, and publishes only accepted candidates | Four code-owned reminder types; no arbitrary skill generation, source-code rewriting, or model training |
+| Use accepted lessons in later work | Exact-target automatic profile selection injects evaluated reminders into subsequent matching native runs | Requires compatible, current evidence and the configured runtime profile store |
+| Work with existing tools and models | Local/hosted providers, MCP, native tools, and a compatibility gateway for external coding CLIs | The gateway does not own or evaluate an external CLI's complete agent loop |
+
+The native tools include file reading/search/editing, shell and test execution,
+repository navigation, and web-page reading. `WebFetch` can render JavaScript
+pages through local headless Chromium; this does not by itself provide general
+click/type/login browser automation. See [web reading](docs/web-fetch.md) and
+the [agent operating model](docs/agent-operating-model.md).
+
+## Current self-improvement scope
+
+The implemented lesson cycle is:
+
+```text
+Profiler calibration failures
+  → propose a bounded set of workflow reminders
+  → freeze the candidate instructions
+  → run incumbent and candidate in separate fixture workspaces
+  → compare verification, safety and per-attempt regressions
+  → publish an accepted profile, or retain the incumbent
+  → apply accepted reminders to subsequent matching native runs
+```
+
+Use `corelaycode-profile improve --baseline <profile-id> --learn --confirm`
+with the same provider/model/store options as the baseline. This is an explicit,
+bounded evaluation, not an always-running learning service. See the
+[RSI contract, commands and limitations](docs/rsi.md).
+
+**Current evidence:** local deterministic tests exercise failure handling,
+control/candidate execution, persistence, rejection, and next-run injection.
+A real agent loop dispatches tools in these tests, but the model is a fixture.
+We have not demonstrated that this learning mechanism improves a live model's
+performance, reduces user intervention, or beats other coding agents.
+
+**Next milestone:** collect ten failures from actual development work, turn them
+into reproducible acceptance tasks, and evaluate fixes against both those tasks
+and separate tasks the candidate did not use for learning. Track task completion,
+user interventions, elapsed time, cost, and false completion. Production trace
+conversion, richer candidate generation, automatic rollback and scheduling
+remain follow-up work. Existing coding agents may help author improvements;
+Corelay must still evaluate whether those improvements are worth adopting.
 
 ## Two paths, one runtime plane
 
@@ -173,11 +237,20 @@ verification evidence, teams, memory, activity, and KAIROS background work.
   kernel and terminal finalizer rather than maintaining alternate loops.
 - KAIROS schedules background tasks, watches Git state, and emits notifications.
 
+### Web page reading
+
+`WebFetch` reads URLs through the existing agent tool dispatcher and returns
+structured Markdown with optional query-relevant excerpts selected before
+output truncation. It tries HTTP first and falls back to local headless Chromium
+for JavaScript shells or HTTP failures. Rod manages the browser; no Python or
+external browser server is required. Use `provider=browser` to force rendering.
+See [web fetch configuration and limits](docs/web-fetch.md).
+
 ## Quick start
 
 ### Build from source
 
-Requirements: Go, Node.js, and npm.
+Requirements: Go 1.26.8 or later, Node.js, and npm.
 
 ```bash
 git clone https://github.com/Dannykkh/corelay-code.git
@@ -190,7 +263,14 @@ make all
 
 The browser opens at `http://localhost:4000/app`.
 
-In a second terminal, from the project the agent should edit:
+From the project the agent should edit, `corelaycode chat` connects to the
+configured local server or starts a loopback-only managed server when that
+endpoint is free. The managed server closes after its last CLI client exits.
+An explicit `-url` is connection-only: a failed remote URL never starts a local
+server, and an occupied local port is reused only when Corelay identity and
+credentials are confirmed. Ctrl-C quits its CLI client without interrupting
+other clients attached to the same managed server. To keep the server and
+dashboard open independently, start the server command above as usual.
 
 ```bash
 corelaycode chat
@@ -200,7 +280,43 @@ corelaycode tui
 
 # Non-interactive use
 corelaycode chat -p "Find the failing test and fix it"
+
+# Machine-readable one-shot output
+corelaycode chat -p "Summarize the changes" -format json
+corelaycode chat -p "Summarize the changes" -format jsonl
+
+# Resume or fork the same durable session in TUI, plain, or one-shot mode
+corelaycode chat -session <id>
+corelaycode chat -session <id> -fork -p "Try a different approach"
+
+# CLI build metadata and read-only diagnostics
+corelaycode version
+corelaycode doctor
+corelaycode doctor -url http://127.0.0.1:4000 -workdir .
 ```
+
+`-format` defaults to `human`. The `json` format writes one versioned result
+object to stdout. `jsonl` writes versioned event rows followed by exactly one
+`result` row; rows include `schemaVersion`, `runId`, and increasing `seq`
+values. Machine formats require `-p`, keep human progress and approval prompts
+on stderr, and omit raw tool inputs. Exit codes are `0` for completion, `1` for
+a failed or blocked run, `2` for invalid usage, and `130` when interrupted with
+Ctrl-C.
+
+`version` reports the CLI version, build commit, and Go runtime without reading
+configuration or contacting a server. `doctor` checks installed browser, Git,
+Bash, sandbox capability, MCP configuration counts, and server health. MCP
+runtime state is reported as unknown because the CLI cannot observe the server
+process's in-memory state. It does not download or launch a browser, start MCP
+processes, or start/stop a server; server checks are limited to `GET /health`
+and authenticated `GET /`, which provide the server version/build commit. It
+omits credentials, provider/model values, command lines, environment values,
+paths, and endpoint details from its output.
+Doctor also reports whether the configured Go `gopls` executable is available;
+semantic LSP calls fall back to a clearly labeled structural `RepoMap` result
+when it is absent. Full execution mode uses the current OS account's privileges with sandbox isolation disabled; it does not elevate
+privileges. For an explicit remote URL, pass its credential with `-token`;
+ambient environment credentials are only used for loopback endpoints.
 
 Windows uses the same commands with the `.exe` suffix.
 
@@ -269,6 +385,11 @@ Minimal `~/.corelay/config.json`:
 }
 ```
 
+For semantic Go navigation, add `"lspExecutable": "gopls"` (or an absolute
+configured executable path), or set `CORELAY_LSP_EXECUTABLE`. Corelay Code does
+not install language servers; unavailable `gopls` calls use a labeled
+structural `RepoMap` fallback.
+
 When server authentication is enabled, prefer an environment variable so the
 token does not enter shell history:
 
@@ -286,14 +407,32 @@ CORELAY_ACCESS_TOKEN=... corelaycode chat
 | `POST /v1/messages` | Anthropic-compatible provider gateway |
 | `GET /api/runtime` | Providers, accounts, routes, quota windows, and telemetry |
 | `GET/POST /api/sessions` | Durable session lifecycle |
+| `/api/workstreams/{id}/plans/...` | Revisioned Workstream Plans, approval, stage evidence, and explicit interrupted-stage recovery ([guide](docs/workstreams.md)) |
 | `GET /api/evidence/recent` | Verification policy and recent receipts |
 | `GET /api/run-traces` | Agentic run traces and regression promotion |
-| `corelaycode-acp` | Stable ACP adapter with the same durable execution rules |
+| `corelaycode-acp` | Durable ACP sessions; workflow-bound sessions require the native Web/API path |
 | `corelaycode-profile` | Repeatable model and capability profiling |
+| `corelaycode-profile version` | Offline profiler build metadata |
+| `corelaycode update` | Explicit local artifact verification and install |
 
 The server has narrower endpoints for projects, files, permissions, MCP,
 plugins, memory, workstreams, hooks, commands, skills, usage, feedback, KAIROS,
 and worktrees. The Web UI is the easiest way to explore them.
+
+Native API requests carry the selected project/workspace and execution policy
+into the same run-owned kernel as Web and TUI. Session and Workstream mutations
+use expected revisions; SSE terminal results are not treated as successful
+completion without the corresponding durable evidence. The compatibility
+gateway under `/v1/*` translates requests but does not claim ownership of the
+external CLI's private loop.
+
+The local Web UI authenticates by exchanging a single-use, 60-second challenge
+for its HttpOnly cookie. Challenges are bound to the requesting Host and Origin;
+service credentials are never placed in the URL.
+
+ACP currently rejects sessions carrying Workstream/Plan/Stage bindings before
+loading or running them. Those workflows require the native Web/API path until
+ACP supports their approval, revision, and stage-evidence lifecycle.
 
 ### Compare the harness against its minimal ablation
 
@@ -305,6 +444,7 @@ approval, target binding, sandboxing, and safety probes.
 # Inspect the bounded plans before spending model time
 corelaycode-profile dry-run --variant minimal
 corelaycode-profile dry-run --variant corelay
+corelaycode-profile version
 
 # Publish immutable profiles for the exact same provider/model target
 corelaycode-profile run --variant minimal --confirm --measurement-only
@@ -315,10 +455,42 @@ corelaycode-profile compare --baseline <minimal-profile-id> --candidate <corelay
 ```
 
 The comparison is content-free and fails closed unless target, plan version,
-case shape, and safety evidence are compatible. A safety regression overrides
-all apparent performance gains. `--measurement-only` changes only the process
-exit code after immutable publication; quarantined profiles remain ineligible
-for automatic harness selection.
+case shape, and safety evidence are compatible. The default plan also includes
+six bounded real-task fixtures: multi-file bug repair, new feature plus test,
+failing-test repair, decision retention, project switching, and interrupted
+checkpoint recovery. Coding tasks require both matching file snapshots and
+executed Go test assertions in a separate sandbox with filesystem, network, and
+process isolation. Missing isolation or an unavailable Go toolchain cannot
+produce a passing result. The v4 plan separates this acceptance from older
+snapshot-only profiles. A safety regression overrides all apparent performance
+gains.
+Lifecycle tasks run the production compactor, reopen durable sessions across
+project A/B/A selections, and cancel a completed fixture write before reconciling
+its checkpoint and resuming without replay. Deterministic provider tests verify
+these paths; they do not establish live-model quality or an OS crash benchmark.
+`--measurement-only` changes only the process exit code after immutable
+publication; quarantined profiles remain ineligible for automatic harness
+selection.
+
+For a same-harness profile refresh with a comparison gate, use
+`corelaycode-profile improve --baseline <profile-id> --confirm` with the same
+target options. Rejected candidates remain outside automatic selection; accepted
+candidates publish through the existing profile store. See the
+[RSI adoption contract](docs/rsi.md) for criteria, exit codes, and remaining
+work toward a full improvement loop.
+Add `--learn` to derive bounded workflow reminders from repeated calibration
+failures and execute a fresh control/candidate comparison before adoption.
+
+`corelaycode update` is an explicit local artifact operation. Supply an artifact
+and the SHA-256 from the release channel, for example
+`corelaycode update -artifact ./corelaycode-vX.Y.Z-windows-amd64.exe -sha256 <digest>`.
+It verifies the digest, keeps the previous executable beside the target, and
+does not discover or download releases in the background. On Windows, when the
+target is the running executable, it starts a one-shot helper that waits for the
+explicit update command to exit before replacing the file and verifying the
+result. A different in-use target is rejected without removing the current file.
+Restore the retained copy explicitly with
+`corelaycode update -rollback -target <path> -backup <path>.previous`.
 
 ## Design boundaries
 

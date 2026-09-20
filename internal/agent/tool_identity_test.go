@@ -69,12 +69,12 @@ func TestIdentityBoundDispatchRejectsPreExecuteMutation(t *testing.T) {
 			WorkDir:          workDir,
 			AllowedTools:     allowed,
 			PermissionConfig: dispatchPermissionConfig("moderate"),
-			BeforeExecute: func(toolUseBlock) toolMutationPreview {
+			BeforeExecute: func(toolUseBlock) (toolMutationPreview, error) {
 				installIdentityTestMCPClient(t, clientKey, &MCPClient{
 					executorID: newMCPExecutorID(),
 					tools:      []MCPTool{{Name: "Write", InputSchema: write.InputSchema}},
 				})
-				return toolMutationPreview{}
+				return toolMutationPreview{}, nil
 			},
 			Execute: func(toolUseBlock) (string, bool) {
 				executed++
@@ -200,11 +200,22 @@ type mutatingApprovalRequester struct {
 
 func (r *mutatingApprovalRequester) Open(draft approval.Draft) (approval.Pending, error) {
 	return approval.Pending{
-		ID:        "approval-identity-mutation",
-		SessionID: draft.SessionID,
-		RunID:     draft.RunID,
-		ToolName:  draft.ToolName,
-		ExpiresAt: time.Now().Add(time.Minute),
+		ID:                      "approval-identity-mutation",
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		RememberAllowed:         draft.RememberAllowed,
+		ExpiresAt:               time.Now().Add(time.Minute),
 	}, nil
 }
 

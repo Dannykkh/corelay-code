@@ -51,7 +51,13 @@ func (r *WindowsJobRunner) Capabilities() sandbox.Capabilities {
 }
 
 func (r *WindowsJobRunner) Start(ctx context.Context, policy sandbox.Policy, input Spec) (*Process, Report) {
-	report := Report{Runner: r.Name(), Policy: policy, Capabilities: r.Capabilities()}
+	capabilities := r.Capabilities()
+	report := Report{
+		Runner:          r.Name(),
+		Policy:          policy,
+		Capabilities:    capabilities,
+		ExecutionPolicy: executionPolicyForReport(input.ExecutionPolicy, capabilities),
+	}
 	fail := func(code sandbox.FailureCode, detail string) (*Process, Report) {
 		report.Failure = code
 		report.Detail = detail
@@ -60,7 +66,7 @@ func (r *WindowsJobRunner) Start(ctx context.Context, policy sandbox.Policy, inp
 	if policy.Enforcement == sandbox.EnforcementDisabled {
 		return fail(sandbox.FailurePolicyInvalid, "Windows Job Object adapter does not accept disabled enforcement")
 	}
-	if err := sandbox.ValidatePolicy(policy, r.Capabilities()); err != nil {
+	if err := sandbox.ValidatePolicy(policy, capabilities); err != nil {
 		return fail(sandboxFailure(err), err.Error())
 	}
 	spec := cloneSpec(input)

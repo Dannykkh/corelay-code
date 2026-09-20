@@ -39,6 +39,8 @@ type SubAgentTask struct {
 type SubAgentManagerOptions struct {
 	Context           context.Context
 	SessionID         string
+	SessionRevision   uint64
+	CheckpointScope   *CheckpointScope
 	ApprovalRequester approval.Requester
 	SandboxRunner     sandbox.Runner
 	SandboxPolicy     sandbox.Policy
@@ -48,6 +50,10 @@ type SubAgentManagerOptions struct {
 	Recorder          RunRecorder
 	HarnessProfile    *harness.HarnessProfile
 	CapabilityProfile *capabilityprofile.AutomaticSelection
+	ExecutionPolicy   *ExecutionPolicySnapshot
+	SkillSource       string
+	SkillDirs         []string
+	ProjectSkillDirs  []string
 }
 
 // SubAgentManager manages parallel sub-agents.
@@ -60,6 +66,7 @@ type SubAgentManager struct {
 	counter           int
 	context           context.Context
 	sessionID         string
+	sessionRevision   uint64
 	approvalRequester approval.Requester
 	sandboxRunner     sandbox.Runner
 	sandboxPolicy     sandbox.Policy
@@ -69,6 +76,11 @@ type SubAgentManager struct {
 	recorder          RunRecorder
 	harnessProfile    *harness.HarnessProfile
 	capabilityProfile *capabilityprofile.AutomaticSelection
+	executionPolicy   *ExecutionPolicySnapshot
+	checkpointScope   *CheckpointScope
+	skillSource       string
+	skillDirs         []string
+	projectSkillDirs  []string
 }
 
 func NewSubAgentManager(provider types.Provider, model, workDir string) *SubAgentManager {
@@ -85,6 +97,7 @@ func NewSubAgentManagerWithOptions(
 		opts.SandboxRunner,
 		opts.SandboxPolicy,
 		"sub-agent",
+		opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeFull,
 	)
 	var pluginDirs []string
 	if opts.PluginDirs != nil {
@@ -96,6 +109,17 @@ func NewSubAgentManagerWithOptions(
 		copy := *opts.PluginExecution
 		pluginExecution = &copy
 	}
+	var executionPolicy *ExecutionPolicySnapshot
+	if opts.ExecutionPolicy != nil {
+		copy := *opts.ExecutionPolicy
+		executionPolicy = &copy
+	}
+	skillDirs := cloneStringsPreserveNil(opts.SkillDirs)
+	projectSkillDirs := cloneStringsPreserveNil(opts.ProjectSkillDirs)
+	checkpointScope := opts.CheckpointScope
+	if checkpointScope == nil {
+		checkpointScope = NewCheckpointScope(opts.SessionID, opts.SessionRevision)
+	}
 	return &SubAgentManager{
 		tasks:             make(map[string]*SubAgentTask),
 		provider:          provider,
@@ -103,6 +127,7 @@ func NewSubAgentManagerWithOptions(
 		workDir:           workDir,
 		context:           opts.Context,
 		sessionID:         opts.SessionID,
+		sessionRevision:   opts.SessionRevision,
 		approvalRequester: opts.ApprovalRequester,
 		sandboxRunner:     sandboxRunner,
 		sandboxPolicy:     sandboxPolicy,
@@ -112,6 +137,11 @@ func NewSubAgentManagerWithOptions(
 		recorder:          opts.Recorder,
 		harnessProfile:    opts.HarnessProfile,
 		capabilityProfile: opts.CapabilityProfile,
+		executionPolicy:   executionPolicy,
+		checkpointScope:   checkpointScope,
+		skillSource:       opts.SkillSource,
+		skillDirs:         skillDirs,
+		projectSkillDirs:  projectSkillDirs,
 	}
 }
 
@@ -123,6 +153,16 @@ func (m *SubAgentManager) SessionID() string {
 		return ""
 	}
 	return m.sessionID
+}
+
+// ExecutionPolicySnapshot returns a detached copy of the policy inherited by
+// this manager. A snapshot can be inspected by API layers without exposing the
+// manager's mutable internal state.
+func (m *SubAgentManager) ExecutionPolicySnapshot() (ExecutionPolicySnapshot, bool) {
+	if m == nil || m.executionPolicy == nil {
+		return ExecutionPolicySnapshot{}, false
+	}
+	return *m.executionPolicy, true
 }
 
 // Spawn creates and starts a sub-agent in a separate goroutine, then returns a
@@ -244,6 +284,7 @@ func (m *SubAgentManager) run(task *SubAgentTask) {
 	defer cancel()
 
 	mode := newSubAgentRunMode(task)
+	executionPolicy := deriveChildExecutionPolicy(m.executionPolicy, "", m.sandboxRunner)
 	anchor := defaultSubAgentPlanAnchor(task)
 	reducer := newSubAgentEventReducer(task.ID, mode)
 	events := make(chan Event, 64)
@@ -254,7 +295,11 @@ func (m *SubAgentManager) run(task *SubAgentTask) {
 		[]types.Message{{Role: "user", Content: mustJSON(task.Instruction)}},
 		m.workDir,
 		RunOptions{
+			ExecutionPolicy:   executionPolicy,
 			SessionID:         m.sessionID,
+			DurableSessionID:  m.checkpointScope.ownerSnapshot().SessionID,
+			CheckpointScope:   m.checkpointScope,
+			SessionRevision:   m.sessionRevision,
 			ApprovalRequester: m.approvalRequester,
 			Recorder:          m.recorder,
 			WorkerID:          task.ID,
@@ -269,6 +314,9 @@ func (m *SubAgentManager) run(task *SubAgentTask) {
 			PluginDirs:        cloneStringsPreserveNil(m.pluginDirs),
 			PluginExecution:   clonePluginExecutionOptions(m.pluginExecution),
 			DisablePlugins:    m.disablePlugins,
+			SkillSource:       m.skillSource,
+			SkillDirs:         cloneStringsPreserveNil(m.skillDirs),
+			ProjectSkillDirs:  cloneStringsPreserveNil(m.projectSkillDirs),
 		},
 		events,
 	)

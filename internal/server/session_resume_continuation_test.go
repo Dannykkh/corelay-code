@@ -215,7 +215,7 @@ func TestDurableSessionInterruptedRunReconcilesThenContinuesWithoutReplay(t *tes
 		t.Fatalf("pre-reconcile continuation = %v, want reconcile required", err)
 	}
 
-	reconciled, err := store.MarkReconciled(session.ID, resume.Revision)
+	reconciled, err := reconcileSessionWithReceiptForTest(t, store, session.ID, resume.Revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,6 +439,7 @@ func isolateResumeContinuationEnvironment(t *testing.T) {
 func resumeSandboxCapabilities() sandbox.Capabilities {
 	return sandbox.Capabilities{
 		ProcessIsolation:     true,
+		FilesystemIsolation:  true,
 		ProcessTreeKill:      true,
 		EnvironmentFiltering: true,
 		Timeouts:             true,

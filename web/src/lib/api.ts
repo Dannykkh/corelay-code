@@ -1,4 +1,25 @@
+import { streamSSE } from './sse';
+
 const BASE = '';
+
+let bootstrapInFlight: Promise<boolean> | undefined;
+
+function bootstrapBrowser(): Promise<boolean> {
+  if (!bootstrapInFlight) {
+    bootstrapInFlight = (async () => {
+      const issued = await fetch(BASE + '/api/bootstrap/challenge', { method: 'POST', cache: 'no-store' });
+      if (!issued.ok) return false;
+      const body: unknown = await issued.json();
+      if (!body || typeof body !== 'object' || !('challenge' in body) || typeof body.challenge !== 'string') return false;
+      const exchanged = await fetch(BASE + '/api/bootstrap', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challenge: body.challenge }), cache: 'no-store',
+      });
+      return exchanged.ok;
+    })().finally(() => { bootstrapInFlight = undefined; });
+  }
+  return bootstrapInFlight;
+}
 
 type ErrorBody = {
   error?: { message?: unknown };
@@ -24,7 +45,10 @@ export class HTTPError extends Error {
 }
 
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + url, init);
+  let res = await fetch(BASE + url, init);
+  if (res.status === 401 && !url.startsWith('/api/bootstrap') && url.startsWith('/api/')) {
+    if (await bootstrapBrowser()) res = await fetch(BASE + url, init);
+  }
   if (!res.ok) {
     // Surface server errors as exceptions so callers can show a toast instead
     // of silently treating the error body as a successful result. The server's
@@ -100,31 +124,14 @@ export async function* streamChat(messages: unknown[], model?: string): AsyncGen
     }),
   });
 
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('event:')) continue;
-      if (trimmed.startsWith('data: ')) {
-        try {
-          const event = JSON.parse(trimmed.slice(6));
-          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-            yield event.delta.text;
-          }
-          if (event.type === 'message_stop') return;
-        } catch { /* skip */ }
+  for await (const frame of streamSSE(res)) {
+    try {
+      const event = JSON.parse(frame.data);
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        yield event.delta.text;
       }
-    }
+      if (event.type === 'message_stop') return;
+    } catch { /* skip */ }
   }
 }
 

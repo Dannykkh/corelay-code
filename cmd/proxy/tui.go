@@ -30,16 +30,19 @@ const (
 )
 
 type tuiOptions struct {
-	BaseURL      string
-	WorkDir      string
-	Lang         string
-	Provider     string
-	Model        string
-	AccessToken  string
-	SessionID    string
-	NoColor      bool
-	ShowThinking bool
-	Quiet        bool
+	BaseURL         string
+	WorkDir         string
+	Mode            agent.ExecutionMode
+	Lang            string
+	Provider        string
+	Model           string
+	AccessToken     string
+	SessionID       string
+	ForkSession     bool
+	WorkDirExplicit bool
+	NoColor         bool
+	ShowThinking    bool
+	Quiet           bool
 }
 
 type tuiBackend interface {
@@ -53,7 +56,8 @@ type tuiBackend interface {
 	GetSession(context.Context, string) (*agent.Session, error)
 	SaveSession(context.Context, *agent.Session, *uint64) (sessionSaveResult, error)
 	ForkSession(context.Context, string, uint64) (*agent.Session, error)
-	ReconcileSession(context.Context, string, uint64) (*agent.Session, error)
+	ReconciliationPreview(context.Context, string, uint64) (agent.SessionReconciliationAssessment, error)
+	ReconcileSession(context.Context, string, uint64, string, bool) (*agent.Session, error)
 	CloseSession(context.Context, string, uint64) (*agent.Session, error)
 	DeleteSession(context.Context, string, uint64) error
 	StartTurn(context.Context, agentTurnRequest) <-chan agentStreamItem
@@ -104,6 +108,11 @@ type tuiTranscriptEntry struct {
 	At   time.Time
 }
 
+type tuiDiffRecord struct {
+	File string
+	Diff string
+}
+
 type tuiApproval struct {
 	ID            string
 	RuntimeID     string
@@ -117,15 +126,35 @@ type tuiApproval struct {
 }
 
 type tuiConfirmation struct {
-	Action      string
-	Title       string
-	Description string
+	Action                         string
+	Title                          string
+	Description                    string
+	ExpectedRevision               uint64
+	EvidenceDigest                 string
+	ManualConfirmationAcknowledged bool
 }
 
 type tuiContextMeter struct {
 	Estimated int
 	Window    int
 	Remaining int
+}
+
+type tuiSessionPermission struct {
+	mode     agent.ExecutionMode
+	revision uint64
+	known    bool
+}
+
+func permissionFromSession(session *agent.Session) tuiSessionPermission {
+	if session == nil || session.ExecutionPolicy == nil {
+		return tuiSessionPermission{}
+	}
+	policy := session.ExecutionPolicy
+	if !validEffectiveExecutionPolicy(policy.Mode, policy.Revision) {
+		return tuiSessionPermission{}
+	}
+	return tuiSessionPermission{mode: policy.Mode, revision: policy.Revision, known: true}
 }
 
 type tuiModel struct {
@@ -142,6 +171,7 @@ type tuiModel struct {
 	assistantEntry     int
 	assistantText      string
 	lastDiff           string
+	diffs              []tuiDiffRecord
 	pendingToolInput   string
 	newOutputWhileAway int
 
@@ -173,6 +203,7 @@ type tuiModel struct {
 
 	sessions       []agent.SessionSummary
 	current        *agent.Session
+	permission     tuiSessionPermission
 	loadedMessages []chatMsg
 
 	approval *tuiApproval
@@ -192,6 +223,7 @@ type tuiBootstrapMsg struct {
 	health   serverHealth
 	config   serverConfig
 	root     serverRoot
+	workDir  string
 	commands []agent.SlashCommand
 	sessions []agent.SessionSummary
 	loops    []activeLoopInfo
@@ -235,6 +267,13 @@ type tuiSessionOperationMsg struct {
 	err     error
 }
 
+type tuiReconciliationPreviewMsg struct {
+	sessionID  string
+	revision   uint64
+	assessment agent.SessionReconciliationAssessment
+	err        error
+}
+
 type tuiConfigMsg struct {
 	config serverConfig
 	err    error
@@ -263,7 +302,7 @@ func runTUI(opts tuiOptions) error {
 	if (opts.Provider == "") != (opts.Model == "") {
 		return errors.New("provider and model must be supplied together")
 	}
-	client := &http.Client{Timeout: 0}
+	client := newChatHTTPClient(0)
 	backend := newAgentStreamTransport(opts.BaseURL, opts.AccessToken, client)
 	model := newTUIModel(backend, opts)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -381,6 +420,7 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.current = cloneTUISession(msg.session)
+		m.permission = permissionFromSession(msg.session)
 		m.loadedMessages = wireMessagesFromSession(msg.session.Messages)
 		m.stream = msg.stream
 		m.turnCancel = msg.cancel
@@ -444,6 +484,27 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.operationBusy = true
 		m.lastStatus = "Refreshing durable sessions"
 		return m, m.listSessionsCmd()
+
+	case tuiReconciliationPreviewMsg:
+		m.operationBusy = false
+		if msg.err != nil {
+			m.appendEntry(tuiEntryError, "Reconciliation preview failed: "+safeTUIText(msg.err.Error(), 2048))
+			return m, nil
+		}
+		if m.current == nil || m.current.ID != msg.sessionID || m.current.Revision != msg.revision ||
+			msg.assessment.SessionID != msg.sessionID || msg.assessment.Revision != msg.revision {
+			m.appendEntry(tuiEntryError, "The session changed before the reconciliation preview completed; review it again.")
+			return m, nil
+		}
+		m.confirm = &tuiConfirmation{
+			Action:                         "reconcile",
+			Title:                          "Acknowledge this reconciliation evidence?",
+			Description:                    reconciliationAssessmentDescription(msg.assessment),
+			ExpectedRevision:               msg.revision,
+			EvidenceDigest:                 msg.assessment.EvidenceDigest,
+			ManualConfirmationAcknowledged: msg.assessment.ManualConfirmationRequired,
+		}
+		return m, nil
 
 	case tuiConfigMsg:
 		m.operationBusy = false
@@ -713,9 +774,14 @@ func (m *tuiModel) applyBootstrap(msg tuiBootstrapMsg) {
 	m.dynamicCommands = skillTUICommands(msg.commands)
 	if msg.session != nil {
 		m.loadSession(msg.session)
+		m.opts.SessionID = msg.session.ID
+		m.opts.ForkSession = false
 	} else {
 		m.entries = nil
 		m.appendEntry(tuiEntrySystem, fmt.Sprintf("Connected to %s · target %s/%s", m.opts.BaseURL, m.config.Provider, m.config.Model))
+	}
+	if strings.TrimSpace(msg.workDir) != "" {
+		m.opts.WorkDir = msg.workDir
 	}
 	for _, warning := range msg.warnings {
 		m.appendEntry(tuiEntryError, safeTUIText(warning, 2048))
@@ -826,8 +892,11 @@ func (m *tuiModel) applyWireEvent(event agentWireEvent) []tea.Cmd {
 			Diff string `json:"diff"`
 		}
 		if json.Unmarshal(event.Data, &payload) == nil {
-			m.lastDiff = safeTUIText(payload.Diff, 64<<10)
-			m.appendEntry(tuiEntryDiff, safeTUIText(payload.File, 512)+"\n"+m.lastDiff)
+			file := safeTUIText(payload.File, 512)
+			diff := safeTUIText(payload.Diff, 64<<10)
+			m.lastDiff = diff
+			m.diffs = append(m.diffs, tuiDiffRecord{File: file, Diff: diff})
+			m.appendEntry(tuiEntryDiff, file+"\n"+diff)
 		}
 	case "error":
 		m.pendingToolInput = ""
@@ -841,10 +910,23 @@ func (m *tuiModel) applyWireEvent(event agentWireEvent) []tea.Cmd {
 		m.appendEntry(tuiEntryError, "Context planning blocked this run")
 	case "session":
 		var payload struct {
-			SessionID string `json:"sessionId"`
+			SessionID       string `json:"sessionId"`
+			ExecutionPolicy struct {
+				Mode     agent.ExecutionMode `json:"mode"`
+				Revision uint64              `json:"revision"`
+			} `json:"executionPolicy"`
 		}
 		if json.Unmarshal(event.Data, &payload) == nil {
 			m.runtimeID = strings.TrimSpace(payload.SessionID)
+			m.permission = tuiSessionPermission{}
+			if validEffectiveExecutionPolicy(payload.ExecutionPolicy.Mode, payload.ExecutionPolicy.Revision) {
+				m.permission = tuiSessionPermission{
+					mode: payload.ExecutionPolicy.Mode, revision: payload.ExecutionPolicy.Revision, known: true,
+				}
+				status := fmt.Sprintf("Execution mode: %s (revision %d)", payload.ExecutionPolicy.Mode, payload.ExecutionPolicy.Revision)
+				m.lastStatus = status
+				m.appendEntry(tuiEntryStatus, status)
+			}
 		}
 	case "approval_required":
 		m.pendingToolInput = ""
@@ -1092,6 +1174,12 @@ func (m *tuiModel) loadSession(session *agent.Session) {
 		return
 	}
 	m.current = cloneTUISession(session)
+	m.permission = permissionFromSession(session)
+	m.opts.SessionID = session.ID
+	m.opts.ForkSession = false
+	if !m.opts.WorkDirExplicit && strings.TrimSpace(session.Workspace) != "" {
+		m.opts.WorkDir = session.Workspace
+	}
 	m.awaitingReload = false
 	m.reloadFailed = false
 	m.loadedMessages = wireMessagesFromSession(session.Messages)
@@ -1124,6 +1212,10 @@ func (m *tuiModel) syncSessionAfterRun(session *agent.Session) {
 		return
 	}
 	m.current = cloneTUISession(session)
+	m.permission = permissionFromSession(session)
+	if !m.opts.WorkDirExplicit && strings.TrimSpace(session.Workspace) != "" {
+		m.opts.WorkDir = session.Workspace
+	}
 	m.loadedMessages = wireMessagesFromSession(session.Messages)
 	m.awaitingReload = false
 	m.reloadFailed = false
@@ -1135,11 +1227,15 @@ func (m *tuiModel) syncSessionAfterRun(session *agent.Session) {
 
 func (m *tuiModel) newSession() {
 	m.current = nil
+	m.permission = tuiSessionPermission{}
+	m.opts.SessionID = ""
+	m.opts.ForkSession = false
 	m.loadedMessages = nil
 	m.entries = nil
 	m.assistantEntry = -1
 	m.assistantText = ""
 	m.lastDiff = ""
+	m.diffs = nil
 	m.runState = tuiRunIdle
 	m.awaitingReload = false
 	m.reloadFailed = false
@@ -1226,11 +1322,31 @@ func (m tuiModel) bootstrapCmd() tea.Cmd {
 			root = serverRoot{Name: "corelaycode", Version: "unknown", Provider: config.Provider, Model: config.Model}
 			warnings = append(warnings, "Server version discovery failed: "+rootErr.Error())
 		}
-		commands, commandsErr := m.backend.Commands(ctx, m.opts.WorkDir)
+		workDir := m.opts.WorkDir
+		var loaded *agent.Session
+		if m.opts.SessionID != "" {
+			loaded, err = m.backend.GetSession(ctx, m.opts.SessionID)
+			if err != nil {
+				return tuiBootstrapMsg{health: health, config: config, root: root, err: err}
+			}
+			if err := validateDurableChatWorkspace(loaded, m.opts.WorkDir, m.opts.WorkDirExplicit); err != nil {
+				return tuiBootstrapMsg{health: health, config: config, root: root, err: err}
+			}
+			if !m.opts.WorkDirExplicit && strings.TrimSpace(loaded.Workspace) != "" {
+				workDir = loaded.Workspace
+			}
+			if m.opts.ForkSession {
+				loaded, err = m.backend.ForkSession(ctx, loaded.ID, loaded.Revision)
+				if err != nil {
+					return tuiBootstrapMsg{health: health, config: config, root: root, err: err}
+				}
+			}
+		}
+		commands, commandsErr := m.backend.Commands(ctx, workDir)
 		if commandsErr != nil {
 			warnings = append(warnings, "Workspace command discovery failed: "+commandsErr.Error())
 		}
-		sessions, sessionsErr := m.backend.ListSessions(ctx, m.opts.WorkDir)
+		sessions, sessionsErr := m.backend.ListSessions(ctx, workDir)
 		if sessionsErr != nil {
 			warnings = append(warnings, "Durable session discovery failed: "+sessionsErr.Error())
 		}
@@ -1241,16 +1357,9 @@ func (m tuiModel) bootstrapCmd() tea.Cmd {
 				warnings = append(warnings, "Active run discovery failed: "+loopsErr.Error())
 			}
 		}
-		var loaded *agent.Session
-		if m.opts.SessionID != "" {
-			loaded, err = m.backend.GetSession(ctx, m.opts.SessionID)
-			if err != nil {
-				return tuiBootstrapMsg{health: health, config: config, root: root, commands: commands, sessions: sessions, loops: loops, err: err}
-			}
-		}
 		return tuiBootstrapMsg{
 			health: health, config: config, root: root, commands: commands,
-			sessions: sessions, loops: loops, session: loaded, warnings: warnings,
+			workDir: workDir, sessions: sessions, loops: loops, session: loaded, warnings: warnings,
 		}
 	}
 }
@@ -1294,6 +1403,9 @@ func (m tuiModel) loadSessionCmdWithRequirement(id string, required bool) tea.Cm
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		session, err := m.backend.GetSession(ctx, id)
+		if err == nil {
+			err = validateDurableChatWorkspace(session, m.opts.WorkDir, m.opts.WorkDirExplicit)
+		}
 		return tuiSessionLoadedMsg{session: session, required: required, err: err}
 	}
 }

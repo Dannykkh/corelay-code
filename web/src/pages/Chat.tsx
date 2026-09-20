@@ -3,19 +3,35 @@ import { t } from '../lib/i18n';
 import { CircleCheck, CircleX, LoaderCircle, ShieldAlert } from 'lucide-react';
 import { Markdown } from '../components/Markdown';
 import { HTTPError, resolveApproval, type ApprovalDecision } from '../lib/api';
+import { streamSSE } from '../lib/sse';
 import {
   getSession,
   listSessions,
   saveSession,
   SessionConflictError,
+  type SessionExecutionMode,
+  type SessionExecutionPolicy,
+  type SessionLifecycleStatus,
+  type SessionImageReference,
   type SessionMessage,
   type SessionSummary,
 } from '../lib/sessions';
-import { createWorkstream, generateHandoff, listWorkstreams, type Workstream } from '../lib/workstreams';
+import {
+  approveWorkstreamPlan,
+  createWorkstream,
+  generateHandoff,
+  getWorkstreamPlan,
+  listWorkstreamPlans,
+  listWorkstreams,
+  reconcileWorkstreamPlanStage,
+  type Workstream,
+  type WorkstreamPlan,
+} from '../lib/workstreams';
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'tool';
   content: string;
+  attachments?: SessionImageReference[];
   toolName?: string;
   toolInput?: Record<string, unknown> | string;
   toolResult?: string;
@@ -24,7 +40,65 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+interface DiffRecord {
+  turn: number;
+  file: string;
+  diff: string;
+}
+
+interface UndoEntry {
+  id: string;
+  path: string;
+  status: string;
+}
+
+interface AttachedImage {
+  mediaType: string;
+  data: string;
+}
+
+type AgentContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+type AgentMessage = {
+  role: 'user' | 'assistant';
+  content: string | AgentContentBlock[];
+};
+
+const maxAttachedImageBytes = 4 * 1024 * 1024;
+const supportedImageTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function readImageAttachment(file: File): Promise<AttachedImage> {
+  const mediaType = file.type.toLowerCase();
+  if (!supportedImageTypes.has(mediaType)) {
+    return Promise.reject(new Error('PNG, JPEG, GIF, and WebP images are supported.'));
+  }
+  if (file.size === 0 || file.size > maxAttachedImageBytes) {
+    return Promise.reject(new Error('Image must be between 1 byte and 4 MiB.'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Image could not be read.'));
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('Image could not be read.'));
+        return;
+      }
+      const separator = reader.result.indexOf(',');
+      if (separator < 0) {
+        reject(new Error('Image data URL is invalid.'));
+        return;
+      }
+      resolve({ mediaType, data: reader.result.slice(separator + 1) });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 interface ChatPageProps {
+  selectedWorkspace: string;
   loadSessionId?: string | null;
   onSessionLoaded?: () => void;
 }
@@ -39,7 +113,10 @@ type AgentEventObject = {
   input?: Record<string, unknown> | string;
   result?: string;
   isError?: boolean;
+  file?: string;
   diff?: string;
+  entries?: unknown;
+  error?: string;
   chars?: number;
   elapsedMs?: number;
   id?: string;
@@ -61,6 +138,7 @@ type AgentEventObject = {
   completionStatus?: string;
   completionRevision?: number;
   completionBlocked?: number;
+  executionPolicy?: unknown;
 };
 
 type ApprovalState = 'pending' | 'submitting' | 'resolved' | 'expired' | 'error';
@@ -77,6 +155,56 @@ type ActiveApproval = {
   decision?: ApprovalDecision;
   error?: string;
 };
+
+type WorkflowBinding = {
+  workstreamId: string;
+  planId: string;
+  planRevision?: number;
+  stageId: string;
+};
+
+type CurrentSessionIndicator = {
+  id: string;
+  title: string;
+  revision: number;
+  lifecycleStatus: SessionLifecycleStatus;
+};
+
+function readExecutionPolicy(value: unknown): SessionExecutionPolicy | null {
+  if (!value || typeof value !== 'object') return null;
+  const policy = value as Partial<SessionExecutionPolicy>;
+  if (policy.mode !== 'read-only' && policy.mode !== 'workspace' && policy.mode !== 'full') {
+    return null;
+  }
+  if (typeof policy.revision !== 'number' || !Number.isSafeInteger(policy.revision) || policy.revision < 1) {
+    return null;
+  }
+  return { mode: policy.mode, revision: policy.revision };
+}
+
+function readUndoEntries(value: unknown): UndoEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): UndoEntry[] => {
+    if (!item || typeof item !== 'object') return [];
+    const entry = item as Record<string, unknown>;
+    return typeof entry.id === 'string' && typeof entry.path === 'string' && typeof entry.status === 'string'
+      ? [{ id: entry.id, path: entry.path, status: entry.status }]
+      : [];
+  });
+}
+
+function executionModeLabel(mode: SessionExecutionMode): string {
+  switch (mode) {
+    case 'read-only': return 'read-only';
+    case 'workspace': return 'workspace';
+    case 'full': return 'full';
+  }
+}
+
+function workspaceLabel(workspace: string): string {
+  const segments = workspace.replace(/\\/g, '/').split('/').filter(Boolean);
+  return segments[segments.length - 1] || workspace || 'none';
+}
 
 type SpeechRecognitionLike = {
   continuous: boolean;
@@ -112,58 +240,224 @@ function eventText(data: unknown): string {
   return JSON.stringify(data);
 }
 
-export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
+function planStageEligible(plan: WorkstreamPlan, stageId: string): boolean {
+  const stageIndex = plan.stages.findIndex((stage) => stage.id === stageId);
+  if (stageIndex < 0 || plan.stages.some((stage) => stage.status === 'running')) return false;
+  const stage = plan.stages[stageIndex];
+  if (stage.status !== 'pending' && stage.status !== 'failed') return false;
+  return plan.stages.slice(0, stageIndex).every((previous) => previous.status === 'completed');
+}
+
+function planIsApprovedCurrentRevision(plan: WorkstreamPlan, revision: number | undefined): boolean {
+  return revision != null && plan.revision === revision && plan.approvedRevision === plan.revision &&
+    (plan.status === 'approved' || plan.status === 'executing' || plan.status === 'failed');
+}
+
+export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: ChatPageProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [status, setStatus] = useState('');
-  const [planReady, setPlanReady] = useState(false); // a /plan run finished; offer Approve & Run
-  const [attachedImage, setAttachedImage] = useState<string | null>(null); // base64
+  const [planReady, setPlanReady] = useState(false); // a /plan run finished; offer an ordinary follow-up prompt
+  const [attachedImage, setAttachedImage] = useState<AttachedImage | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [, setSessions] = useState<SessionSummary[]>([]);
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
+  const [plans, setPlans] = useState<WorkstreamPlan[]>([]);
+  const [plansLoading, setPlansLoading] = useState(false);
+  const [planActionBusy, setPlanActionBusy] = useState(false);
+  const [activeWorkspace, setActiveWorkspace] = useState(selectedWorkspace);
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState('');
+  const [selectedPlanId, setSelectedPlanId] = useState('');
+  const [selectedPlanRevision, setSelectedPlanRevision] = useState<number | undefined>();
+  const [selectedStageId, setSelectedStageId] = useState('');
   const [workstreamNotice, setWorkstreamNotice] = useState('');
   const [sessionNotice, setSessionNotice] = useState('');
   const [activeApproval, setActiveApproval] = useState<ActiveApproval | null>(null);
+  const [currentSession, setCurrentSession] = useState<CurrentSessionIndicator | null>(null);
+  const [effectiveExecutionPolicy, setEffectiveExecutionPolicy] = useState<SessionExecutionPolicy | null>(null);
+  const [executionPolicyPending, setExecutionPolicyPending] = useState(false);
   // Liveness indicators for slow local models: elapsed seconds tick client-side
   // from the moment we send; genChars is the authoritative output size from the
   // backend heartbeat. Together they prove the model is alive, not hung —
   // modeled on Claude Code's "Thinking… (Ns · ↑N)" status line.
   const [elapsed, setElapsed] = useState(0);
   const [genChars, setGenChars] = useState(0);
+  const [diffRecords, setDiffRecords] = useState<DiffRecord[]>([]);
+  const [undoEntries, setUndoEntries] = useState<UndoEntry[]>([]);
+  const [undoActionBusy, setUndoActionBusy] = useState(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const durableSessionIDRef = useRef<string | null>(null);
   const durableSessionRevisionRef = useRef<number | null>(null);
   const durableSessionEpochRef = useRef(0);
   const durableSessionSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const persistedWorkflowBindingRef = useRef<WorkflowBinding>({ workstreamId: '', planId: '', stageId: '' });
+  const plansRequestRef = useRef(0);
+  const workstreamsRequestRef = useRef(0);
+  const workspaceEpochRef = useRef(0);
+  const sendInProgressRef = useRef(false);
+  const turnNumberRef = useRef(0);
+  const activeWorkspaceRef = useRef(selectedWorkspace);
   const runtimeSessionIdRef = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const denyApprovalRef = useRef<HTMLButtonElement>(null);
 
-  // Load session list
-  useEffect(() => {
-    listSessions().then((s) => setSessions(s || [])).catch(() => setSessions([]));
+  const updateActiveWorkspace = useCallback((workspace: string) => {
+    if (activeWorkspaceRef.current !== workspace) {
+      workspaceEpochRef.current += 1;
+      abortRef.current?.abort();
+      runtimeSessionIdRef.current = null;
+    }
+    activeWorkspaceRef.current = workspace;
+    setActiveWorkspace(workspace);
   }, []);
 
-  const refreshWorkstreams = useCallback(async () => {
+  // A selected project is the default for a new chat. Once a durable session
+  // is loaded, its stored workspace remains authoritative across project
+  // selection changes in another part of the UI.
+  useEffect(() => {
+    if (!durableSessionIDRef.current) {
+      updateActiveWorkspace(selectedWorkspace);
+    } else if (selectedWorkspace !== activeWorkspaceRef.current) {
+      workspaceEpochRef.current += 1;
+      abortRef.current?.abort();
+      runtimeSessionIdRef.current = null;
+    }
+  }, [selectedWorkspace, updateActiveWorkspace]);
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      if (!activeWorkspace) {
+        setSessions([]);
+        return;
+      }
+      listSessions(activeWorkspace).then((sessions) => {
+        if (active) setSessions(sessions || []);
+      }).catch(() => {
+        if (active) setSessions([]);
+      });
+    });
+    return () => { active = false; };
+  }, [activeWorkspace]);
+
+  const refreshWorkstreams = useCallback(async (workspace = activeWorkspaceRef.current) => {
+    const requestID = ++workstreamsRequestRef.current;
     try {
-      const next = await listWorkstreams();
+      const next = await listWorkstreams(workspace);
+      if (workstreamsRequestRef.current !== requestID || activeWorkspaceRef.current !== workspace) return;
       setWorkstreams(next);
       setSelectedWorkstreamId((current) => {
         if (!current) return current;
         return next.some((w) => w.id === current) ? current : '';
       });
     } catch (err) {
-      setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+      if (workstreamsRequestRef.current === requestID && activeWorkspaceRef.current === workspace) {
+        setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+      }
     }
   }, []);
 
   useEffect(() => {
-    refreshWorkstreams();
-  }, [refreshWorkstreams]);
+    refreshWorkstreams(activeWorkspace);
+  }, [activeWorkspace, refreshWorkstreams]);
+
+  const refreshPlans = useCallback(async (workstreamId = selectedWorkstreamId, workspace = activeWorkspaceRef.current) => {
+    const requestID = ++plansRequestRef.current;
+    if (!workstreamId) {
+      setPlans([]);
+      setPlansLoading(false);
+      return [];
+    }
+    setPlansLoading(true);
+    try {
+      const next = await listWorkstreamPlans(workstreamId, workspace);
+      if (plansRequestRef.current === requestID) setPlans(next);
+      return next;
+    } catch (err) {
+      if (plansRequestRef.current === requestID) {
+        setPlans([]);
+        setWorkstreamNotice(err instanceof Error ? err.message : String(err));
+      }
+      return [];
+    } finally {
+      if (plansRequestRef.current === requestID) setPlansLoading(false);
+    }
+  }, [selectedWorkstreamId]);
+
+  useEffect(() => {
+    void refreshPlans(selectedWorkstreamId, activeWorkspace);
+  }, [activeWorkspace, selectedWorkstreamId, refreshPlans]);
+
+  const loadSession = useCallback(async (id: string) => {
+    abortRef.current?.abort();
+    runtimeSessionIdRef.current = null;
+    setActiveApproval(null);
+    const epoch = durableSessionEpochRef.current + 1;
+    durableSessionEpochRef.current = epoch;
+    durableSessionSaveChainRef.current = Promise.resolve();
+    const sess = await getSession(id);
+    if (durableSessionEpochRef.current !== epoch) return;
+    const msgs: ChatMessage[] = (sess.messages || []).map((m) => ({
+      ...m,
+      timestamp: new Date(m.timestamp),
+    }));
+    setMessages(msgs);
+    durableSessionIDRef.current = sess.id;
+    durableSessionRevisionRef.current = sess.revision ?? 0;
+    setCurrentSession({
+      id: sess.id,
+      title: sess.title,
+      revision: sess.revision ?? 0,
+      lifecycleStatus: sess.lifecycleStatus ?? (sess.reconcileRequired ? 'recovery-needed' : 'active'),
+    });
+    setEffectiveExecutionPolicy(readExecutionPolicy(sess.executionPolicy));
+    setExecutionPolicyPending(false);
+    updateActiveWorkspace(sess.workspace || selectedWorkspace);
+    setSelectedWorkstreamId(sess.workstreamId || '');
+    const binding: WorkflowBinding = {
+      workstreamId: sess.workstreamId || '',
+      planId: sess.planId || '',
+      planRevision: sess.planRevision,
+      stageId: sess.stageId || '',
+    };
+    persistedWorkflowBindingRef.current = binding;
+    setSelectedPlanId(binding.planId);
+    setSelectedPlanRevision(binding.planRevision);
+    setSelectedStageId(binding.stageId);
+    setSessionNotice('');
+    setDiffRecords([]);
+    setUndoEntries([]);
+    turnNumberRef.current = 0;
+  }, [selectedWorkspace, updateActiveWorkspace]);
+
+  const newChat = useCallback(() => {
+    abortRef.current?.abort();
+    runtimeSessionIdRef.current = null;
+    setActiveApproval(null);
+    durableSessionEpochRef.current += 1;
+    durableSessionSaveChainRef.current = Promise.resolve();
+    setMessages([]);
+    durableSessionIDRef.current = null;
+    durableSessionRevisionRef.current = null;
+    setCurrentSession(null);
+    setEffectiveExecutionPolicy(null);
+    setExecutionPolicyPending(false);
+    persistedWorkflowBindingRef.current = { workstreamId: '', planId: '', stageId: '' };
+    updateActiveWorkspace(selectedWorkspace);
+    setSelectedWorkstreamId('');
+    setSelectedPlanId('');
+    setSelectedPlanRevision(undefined);
+    setSelectedStageId('');
+    setPlans([]);
+    setSessionNotice('');
+    setDiffRecords([]);
+    setUndoEntries([]);
+    turnNumberRef.current = 0;
+  }, [selectedWorkspace, updateActiveWorkspace]);
 
   // Handle session load/new from SidePanel
   useEffect(() => {
@@ -174,7 +468,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       loadSession(loadSessionId);
     }
     onSessionLoaded?.();
-  }, [loadSessionId, onSessionLoaded]);
+  }, [loadSessionId, onSessionLoaded, loadSession, newChat]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -217,11 +511,18 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   // The returned promise belongs to this save; the internal tail swallows the
   // rejection only so a later save can still proceed after the caller handles
   // the conflict.
-  const persistSession = useCallback((msgs: ChatMessage[]): Promise<void> => {
+  const persistSession = useCallback((msgs: ChatMessage[], bindingOverride?: WorkflowBinding): Promise<void> => {
     if (msgs.length === 0) return Promise.resolve();
+    const binding = bindingOverride || {
+      workstreamId: selectedWorkstreamId,
+      planId: selectedPlanId,
+      planRevision: selectedPlanRevision,
+      stageId: selectedStageId,
+    };
     const sessionMsgs: SessionMessage[] = msgs.map((m) => ({
       role: m.role,
       content: m.content,
+      attachments: m.attachments,
       toolName: m.toolName,
       toolInput: m.toolInput,
       toolResult: m.toolResult,
@@ -229,6 +530,8 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
       timestamp: m.timestamp.toISOString(),
     }));
     const epoch = durableSessionEpochRef.current;
+    const workspace = activeWorkspaceRef.current;
+    const workspaceEpoch = workspaceEpochRef.current;
 
     // Serialize saves for one durable chat so each request observes the
     // revision returned by the previous request. A load/new-chat transition
@@ -237,19 +540,38 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     const operation = durableSessionSaveChainRef.current
       .catch(() => undefined)
       .then(async () => {
-        if (durableSessionEpochRef.current !== epoch) return;
+        if (durableSessionEpochRef.current !== epoch
+          || workspaceEpochRef.current !== workspaceEpoch
+          || activeWorkspaceRef.current !== workspace) return;
         const sid = durableSessionIDRef.current;
         const revision = durableSessionRevisionRef.current;
         try {
           const result = await saveSession(
-            { id: sid || undefined, messages: sessionMsgs },
+            {
+              id: sid || undefined,
+              messages: sessionMsgs,
+              workspace: sid ? undefined : workspace || selectedWorkspace,
+              workstreamId: binding.workstreamId || undefined,
+              planId: binding.planId || undefined,
+              planRevision: binding.planId ? binding.planRevision : undefined,
+              stageId: binding.planId ? binding.stageId || undefined : undefined,
+            },
             sid ? revision ?? undefined : undefined,
           );
-          if (durableSessionEpochRef.current !== epoch) return;
+          if (durableSessionEpochRef.current !== epoch
+            || workspaceEpochRef.current !== workspaceEpoch
+            || activeWorkspaceRef.current !== workspace) return;
           durableSessionIDRef.current = result.id;
           durableSessionRevisionRef.current = result.revision;
+          setCurrentSession((current) => ({
+            id: result.id,
+            title: current?.id === result.id ? current.title : (msgs.find((message) => message.role === 'user')?.content || 'New session'),
+            revision: result.revision,
+            lifecycleStatus: current?.id === result.id ? current.lifecycleStatus : 'active',
+          }));
+          persistedWorkflowBindingRef.current = binding;
           setSessionNotice('');
-          listSessions().then((sessions) => {
+          listSessions(activeWorkspaceRef.current).then((sessions) => {
             if (durableSessionEpochRef.current === epoch) setSessions(sessions || []);
           }).catch(() => {
             if (durableSessionEpochRef.current === epoch) setSessions([]);
@@ -267,43 +589,70 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     );
     durableSessionSaveChainRef.current = operation.catch(() => undefined);
     return operation;
-  }, []);
-
-  const loadSession = async (id: string) => {
-    abortRef.current?.abort();
-    runtimeSessionIdRef.current = null;
-    setActiveApproval(null);
-    const epoch = durableSessionEpochRef.current + 1;
-    durableSessionEpochRef.current = epoch;
-    durableSessionSaveChainRef.current = Promise.resolve();
-    const sess = await getSession(id);
-    if (durableSessionEpochRef.current !== epoch) return;
-    const msgs: ChatMessage[] = (sess.messages || []).map((m) => ({
-      ...m,
-      timestamp: new Date(m.timestamp),
-    }));
-    setMessages(msgs);
-    durableSessionIDRef.current = sess.id;
-    durableSessionRevisionRef.current = sess.revision ?? 0;
-    setSessionNotice('');
-  };
-
-  function newChat() {
-    abortRef.current?.abort();
-    runtimeSessionIdRef.current = null;
-    setActiveApproval(null);
-    durableSessionEpochRef.current += 1;
-    durableSessionSaveChainRef.current = Promise.resolve();
-    setMessages([]);
-    durableSessionIDRef.current = null;
-    durableSessionRevisionRef.current = null;
-    setSessionNotice('');
-  }
+  }, [selectedWorkspace, selectedWorkstreamId, selectedPlanId, selectedPlanRevision, selectedStageId]);
 
   async function send(overrideText?: string) {
     const text = (overrideText ?? input).trim();
     if (!text && !attachedImage) return;
-    if (streaming) return;
+    if (streaming || sendInProgressRef.current) return;
+    sendInProgressRef.current = true;
+    turnNumberRef.current += 1;
+    const sendWorkspace = activeWorkspaceRef.current;
+    const sendWorkspaceEpoch = workspaceEpochRef.current;
+    const sendIsCurrent = () => (
+      activeWorkspaceRef.current === sendWorkspace
+      && workspaceEpochRef.current === sendWorkspaceEpoch
+    );
+
+    const stopBeforeRun = (notice: string) => {
+      setSessionNotice(notice);
+      setStatus('');
+      setStreaming(false);
+      sendInProgressRef.current = false;
+    };
+
+    const runBinding: WorkflowBinding = {
+      workstreamId: selectedWorkstreamId,
+      planId: selectedPlanId,
+      planRevision: selectedPlanRevision,
+      stageId: selectedStageId,
+    };
+    if (runBinding.planId) {
+      if (!runBinding.workstreamId || runBinding.planRevision == null || !runBinding.stageId) {
+        stopBeforeRun('Plan 실행에는 Workstream, 정확한 Plan revision, 단계가 모두 필요합니다.');
+        return;
+      }
+      setStreaming(true);
+      setStatus('Plan 상태 확인 중…');
+      try {
+        const currentPlan = await getWorkstreamPlan(
+          runBinding.workstreamId,
+          runBinding.planId,
+          activeWorkspaceRef.current,
+        );
+        setPlans((current) => current.map((plan) => plan.id === currentPlan.id ? currentPlan : plan));
+        if (currentPlan.revision !== runBinding.planRevision) {
+          stopBeforeRun(`Plan이 revision ${currentPlan.revision}으로 변경됐습니다. 현재 revision을 다시 선택한 뒤 진행하세요.`);
+          return;
+        }
+        if (!planIsApprovedCurrentRevision(currentPlan, runBinding.planRevision)) {
+          stopBeforeRun('현재 Plan revision의 승인이 필요합니다. draft Plan을 승인한 뒤 다시 진행하세요.');
+          return;
+        }
+        if (!planStageEligible(currentPlan, runBinding.stageId)) {
+          stopBeforeRun('선택한 단계가 실행 가능한 상태가 아닙니다. 완료된 선행 단계와 현재 진행 상태를 확인하세요.');
+          return;
+        }
+      } catch (err) {
+        stopBeforeRun(`Plan 상태를 확인하지 못해 실행을 시작하지 않았습니다: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+
+    if (!sendIsCurrent()) {
+      sendInProgressRef.current = false;
+      return;
+    }
 
     runtimeSessionIdRef.current = null;
     setActiveApproval(null);
@@ -314,6 +663,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     const newMsgs = [...messages, userMsg];
     setMessages([...newMsgs, { role: 'assistant', content: '', timestamp: new Date() }]);
     setStreaming(true);
+    setExecutionPolicyPending(true);
     setStatus(t('chat.thinking'));
     // Start the liveness clock immediately (don't wait for the first backend
     // heartbeat at t=1s, and cover the connecting phase before any token).
@@ -322,18 +672,26 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     if (tickRef.current) clearInterval(tickRef.current);
     tickRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
 
-    // Build message content — include image if attached
-    let msgContent: string = text || 'Analyze this image.';
-    if (attachedImage) {
-      msgContent = `[Image attached (base64, ${Math.round(attachedImage.length / 1024)}KB)]\n\n${msgContent}`;
-    }
+    const msgContent = text || 'Analyze this image.';
 
-    const apiMessages = newMsgs
+    const apiMessages: AgentMessage[] = newMsgs
       .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({ role: m.role, content: m.content }));
-    // Replace last with the actual content including image reference
+      .map((m) => ({ role: m.role, content: m.content } as AgentMessage));
+    // Durable history stores only the display-safe label. The current request
+    // carries image bytes in a canonical block alongside the user's text.
     if (apiMessages.length > 0) {
-      apiMessages[apiMessages.length - 1] = { role: 'user', content: msgContent };
+      apiMessages[apiMessages.length - 1] = {
+        role: 'user',
+        content: attachedImage
+          ? [
+              { type: 'text', text: msgContent },
+              {
+                type: 'image',
+                source: { type: 'base64', media_type: attachedImage.mediaType, data: attachedImage.data },
+              },
+            ]
+          : msgContent,
+      };
     }
 
     setAttachedImage(null); // clear after sending
@@ -343,12 +701,20 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     // stops the provider stream server-side.
     const controller = new AbortController();
     abortRef.current = controller;
+    const streamIsCurrent = () => (
+      activeWorkspaceRef.current === sendWorkspace
+      && workspaceEpochRef.current === sendWorkspaceEpoch
+    );
     let streamEnded = false;
     let streamFailed = false;
     let durableHandled = false;
 
     try {
-      await persistSession(newMsgs);
+      await persistSession(newMsgs, runBinding);
+      if (!streamIsCurrent()) {
+        controller.abort();
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
       const durableSessionId = durableSessionIDRef.current;
       const expectedRevision = durableSessionRevisionRef.current;
       if (!durableSessionId || expectedRevision == null) {
@@ -359,47 +725,55 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: apiMessages,
-          workstreamId: selectedWorkstreamId || undefined,
+          workstreamId: runBinding.workstreamId || undefined,
           durableSessionId,
           expectedRevision,
         }),
         signal: controller.signal,
       });
 
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data: ')) continue;
-          try {
-            const event = JSON.parse(trimmed.slice(6)) as AgentEvent;
-            if (event.type === 'done' || event.type === 'stream_end') streamEnded = true;
-            if (event.type === 'done' && completionBlocksSuccess(eventObject(event.data))) streamFailed = true;
-            if (event.type === 'error') streamFailed = true;
-            if (event.type === 'durable_session' || event.type === 'durable_session_error') durableHandled = true;
-            handleAgentEvent(event);
-          } catch { /* skip */ }
+      if (!res.ok) {
+        let message = `Agent request failed (${res.status}).`;
+        try {
+          const payload = await res.json() as { error?: { message?: string } };
+          if (payload.error?.message) message = payload.error.message;
+        } catch { /* retain the status fallback */ }
+        throw new Error(message);
+      }
+      if (!res.body) throw new Error('Agent response stream is unavailable.');
+      for await (const frame of streamSSE(res, controller.signal)) {
+        if (!streamIsCurrent()) {
+          controller.abort();
+          break;
         }
+        try {
+          const event = JSON.parse(frame.data) as AgentEvent;
+          if (event.type === 'done' || event.type === 'stream_end') streamEnded = true;
+          if (event.type === 'done' && completionBlocksSuccess(eventObject(event.data))) streamFailed = true;
+          if (event.type === 'error') streamFailed = true;
+          if (event.type === 'durable_session' || event.type === 'durable_session_error') durableHandled = true;
+          handleAgentEvent(event);
+        } catch { /* skip */ }
+      }
+      if (streamIsCurrent() && !controller.signal.aborted && !streamEnded && !streamFailed) {
+        streamFailed = true;
+        setSessionNotice('The connection ended before completion was confirmed. Reload this session to check its saved state before retrying.');
+        throw new Error('Connection interrupted before the run completed. The partial response is preserved.');
       }
     } catch (err) {
       const aborted = err instanceof DOMException && err.name === 'AbortError';
-      setMessages((prev) => {
-        const updated = [...prev];
-        const last = updated[updated.length - 1];
-        if (last?.role === 'assistant') {
-          const note = aborted ? '\n\n_(stopped)_' : `\n\n[Error: ${err}]`;
-          updated[updated.length - 1] = { ...last, content: last.content + note };
-        }
-        return updated;
-      });
+      streamFailed = true;
+      if (streamIsCurrent()) {
+        setMessages((prev) => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant') {
+            const note = aborted ? '\n\n_(stopped)_' : `\n\n[Error: ${err}]`;
+            updated[updated.length - 1] = { ...last, content: last.content + note };
+          }
+          return updated;
+        });
+      }
     } finally {
       runtimeSessionIdRef.current = null;
       if (controller.signal.aborted || streamFailed || !streamEnded) {
@@ -412,13 +786,15 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         ));
       }
       setStreaming(false);
+      setExecutionPolicyPending(false);
+      sendInProgressRef.current = false;
       setStatus('');
       abortRef.current = null;
       if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
       inputRef.current?.focus();
       // Compatibility fallback for an older backend that does not own the
       // durable run checkpoint. Never overwrite an interrupted/conflicted run.
-      if (!controller.signal.aborted && !streamFailed && streamEnded && !durableHandled) {
+      if (streamIsCurrent() && !controller.signal.aborted && !streamFailed && streamEnded && !durableHandled) {
         setMessages((prev) => {
           void persistSession(prev).catch(() => undefined);
           return prev;
@@ -473,20 +849,44 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         if (typeof data.durableSessionId === 'string' && typeof data.durableRevision === 'number') {
           durableSessionIDRef.current = data.durableSessionId;
           durableSessionRevisionRef.current = data.durableRevision;
+          setCurrentSession((current) => ({
+            id: data.durableSessionId as string,
+            title: current && current.id === data.durableSessionId ? current.title : 'Current session',
+            revision: data.durableRevision as number,
+            lifecycleStatus: current && current.id === data.durableSessionId ? current.lifecycleStatus : 'active',
+          }));
         }
+        setEffectiveExecutionPolicy(readExecutionPolicy(data.executionPolicy));
+        setExecutionPolicyPending(false);
         break;
       case 'durable_session':
         if (typeof data.sessionId === 'string' && typeof data.revision === 'number') {
           durableSessionIDRef.current = data.sessionId;
           durableSessionRevisionRef.current = data.revision;
+          setCurrentSession((current) => ({
+            id: data.sessionId as string,
+            title: current && current.id === data.sessionId ? current.title : 'Current session',
+            revision: data.revision as number,
+            lifecycleStatus: data.reconcileRequired ? 'recovery-needed' : 'active',
+          }));
           setSessionNotice(data.reconcileRequired
             ? 'This session was interrupted after a tool started. Reconcile it before resuming.'
             : '');
-          listSessions().then((sessions) => setSessions(sessions || [])).catch(() => setSessions([]));
+          listSessions(activeWorkspaceRef.current).then((sessions) => setSessions(sessions || [])).catch(() => setSessions([]));
         }
         break;
       case 'durable_session_error':
         setSessionNotice(`Durable session checkpoint failed${data.code ? ` (${data.code})` : ''}: ${data.message || 'reload before continuing'}`);
+        break;
+      case 'undo_preview':
+        setUndoEntries(readUndoEntries(data.entries));
+        setUndoActionBusy(false);
+        if (typeof data.error === 'string' && data.error) setSessionNotice(data.error);
+        break;
+      case 'undo_result':
+        setUndoEntries(readUndoEntries(data.entries));
+        setUndoActionBusy(false);
+        if (typeof data.error === 'string' && data.error) setSessionNotice(data.error);
         break;
       case 'approval_required': {
         const runtimeSessionId = runtimeSessionIdRef.current;
@@ -573,8 +973,17 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         setStatus('');
         setMessages((prev) => [...prev, { role: 'assistant', content: '', timestamp: new Date() }]);
         break;
-      case 'diff':
+      case 'diff': {
         // Attach the before/after diff to the most recent Edit/Write tool card.
+        const diffFile = data.file;
+        const diffText = data.diff;
+        if (typeof diffFile === 'string' && typeof diffText === 'string') {
+          setDiffRecords((current) => [...current, {
+            turn: turnNumberRef.current,
+            file: diffFile,
+            diff: diffText,
+          }].slice(-200));
+        }
         setMessages((prev) => {
           const updated = [...prev];
           for (let i = updated.length - 1; i >= 0; i--) {
@@ -587,6 +996,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           return updated;
         });
         break;
+      }
       case 'heartbeat':
         // Authoritative output size + elapsed from the backend liveness ticker.
         if (typeof data.chars === 'number') setGenChars(data.chars);
@@ -617,6 +1027,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           return prev;
         });
         refreshWorkstreams();
+        void refreshPlans();
         break;
       case 'error':
         setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${eventText(event.data)}`, timestamp: new Date() }]);
@@ -632,12 +1043,140 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
     ? `${status || 'Thinking…'} · ${elapsed}s${genChars > 0 ? ` · ${genChars.toLocaleString()} chars` : ''}`
     : '';
   const selectedWorkstream = workstreams.find((w) => w.id === selectedWorkstreamId);
+  const selectedPlan = plans.find((plan) => plan.id === selectedPlanId);
+  const selectedStage = selectedPlan?.stages.find((stage) => stage.id === selectedStageId);
+  const selectedStageName = selectedPlan?.definition.stages?.find((stage) => stage.id === selectedStageId)?.name || selectedStage?.id;
+  const changedFiles = Array.from(new Set(diffRecords.map((record) => record.file).filter(Boolean)));
+  const currentTurnDiffs = diffRecords.filter((record) => record.turn === turnNumberRef.current);
+  const currentSessionLabel = currentSession
+    ? `${currentSession.id.slice(0, 8)} · r${currentSession.revision} · ${currentSession.lifecycleStatus}`
+    : 'new';
+  const permissionLabel = executionPolicyPending
+    ? 'checking…'
+    : effectiveExecutionPolicy
+      ? `${executionModeLabel(effectiveExecutionPolicy.mode)} · r${effectiveExecutionPolicy.revision}`
+      : 'unknown';
+  const persistedBinding = persistedWorkflowBindingRef.current;
+  const cannotClearWorkstream = Boolean(durableSessionIDRef.current && persistedBinding.workstreamId);
+  const cannotClearPlan = Boolean(
+    durableSessionIDRef.current && selectedWorkstreamId &&
+    persistedBinding.workstreamId === selectedWorkstreamId && persistedBinding.planId,
+  );
+
+  function changeWorkstream(workstreamId: string) {
+    const persisted = persistedWorkflowBindingRef.current;
+    const binding = workstreamId && workstreamId === persisted.workstreamId
+      ? { ...persisted }
+      : { workstreamId, planId: '', planRevision: undefined, stageId: '' };
+    setSelectedWorkstreamId(workstreamId);
+    setSelectedPlanId(binding.planId);
+    setSelectedPlanRevision(binding.planRevision);
+    setSelectedStageId(binding.stageId);
+    void persistSession(messages, binding).catch(() => undefined);
+  }
+
+  function changePlan(planId: string) {
+    if (!planId && cannotClearPlan) return;
+    const plan = plans.find((item) => item.id === planId);
+    const stage = plan?.stages.find((item) => planStageEligible(plan, item.id)) || plan?.stages[0];
+    const binding: WorkflowBinding = {
+      workstreamId: selectedWorkstreamId,
+      planId,
+      planRevision: plan?.revision,
+      stageId: stage?.id || '',
+    };
+    setSelectedPlanId(planId);
+    setSelectedPlanRevision(binding.planRevision);
+    setSelectedStageId(binding.stageId);
+    void persistSession(messages, binding).catch(() => undefined);
+  }
+
+  function changeStage(stageId: string) {
+    const binding: WorkflowBinding = {
+      workstreamId: selectedWorkstreamId,
+      planId: selectedPlanId,
+      planRevision: selectedPlanRevision,
+      stageId,
+    };
+    setSelectedStageId(stageId);
+    void persistSession(messages, binding).catch(() => undefined);
+  }
+
+  function bindCurrentPlanRevision() {
+    if (!selectedWorkstreamId || !selectedPlan) return;
+    const stage = selectedPlan.stages.find((item) => planStageEligible(selectedPlan, item.id)) || selectedPlan.stages[0];
+    const binding: WorkflowBinding = {
+      workstreamId: selectedWorkstreamId,
+      planId: selectedPlan.id,
+      planRevision: selectedPlan.revision,
+      stageId: stage?.id || '',
+    };
+    setSelectedPlanRevision(binding.planRevision);
+    setSelectedStageId(binding.stageId);
+    void persistSession(messages, binding).catch(() => undefined);
+    setSessionNotice(`Plan revision ${selectedPlan.revision}을 이 대화에 연결했습니다.`);
+  }
+
+  async function approveSelectedPlan() {
+    const plan = selectedPlan;
+    if (!selectedWorkstreamId || !plan || plan.status !== 'draft' || !plan.revision || !plan.stateRevision || streaming) return;
+    setPlanActionBusy(true);
+    try {
+      const approved = await approveWorkstreamPlan(
+        selectedWorkstreamId,
+        plan.id,
+        activeWorkspaceRef.current,
+        plan.revision,
+        plan.stateRevision,
+      );
+      setPlans((current) => current.map((item) => item.id === approved.id ? approved : item));
+      setSelectedPlanRevision(approved.revision);
+      setSessionNotice(`Plan revision ${approved.revision} 승인 완료`);
+    } catch (err) {
+      setSessionNotice(`Plan 승인에 실패했습니다: ${err instanceof Error ? err.message : String(err)}. 최신 상태를 다시 불러옵니다.`);
+      await refreshPlans(selectedWorkstreamId, activeWorkspaceRef.current);
+    } finally {
+      setPlanActionBusy(false);
+    }
+  }
+
+  async function reconcileSelectedPlanStage() {
+    const plan = selectedPlan;
+    const stage = plan?.stages.find((item) => item.id === selectedStageId);
+    const attempts = stage?.attempts ?? [];
+    const attempt = attempts[attempts.length - 1];
+    if (!selectedWorkstreamId || !plan || !stage || stage.status !== 'running' || !attempt || streaming || planActionBusy) return;
+    const confirmed = window.confirm(
+      `Plan stage ${stage.id} is still recorded as running (${attempt.runId}). Confirm the old process is stopped and inspect its file changes before marking this attempt incomplete?`,
+    );
+    if (!confirmed) return;
+    setPlanActionBusy(true);
+    try {
+      const reconciled = await reconcileWorkstreamPlanStage(
+        selectedWorkstreamId,
+        plan.id,
+        stage.id,
+        activeWorkspaceRef.current,
+        plan.revision,
+        plan.stateRevision,
+        attempt.runId,
+      );
+      setPlans((current) => current.map((item) => item.id === reconciled.id ? reconciled : item));
+      setSessionNotice(`Stage ${stage.id} was reconciled as incomplete. It can be retried after reviewing its changes.`);
+    } catch (err) {
+      setSessionNotice(`Stage recovery failed: ${err instanceof Error ? err.message : String(err)}. Latest Plan state is being reloaded.`);
+      await refreshPlans(selectedWorkstreamId, activeWorkspaceRef.current);
+    } finally {
+      setPlanActionBusy(false);
+    }
+  }
 
   async function createCurrentWorkstream() {
     const seed = input.trim() || messages.find((m) => m.role === 'user')?.content || 'Local agent workstream';
     const title = seed.split('\n')[0].slice(0, 80) || 'Local agent workstream';
     try {
       const created = await createWorkstream({
+        workDir: activeWorkspaceRef.current,
         title,
         summary: seed,
         nextAction: seed,
@@ -648,7 +1187,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           verificationPolicy: { requiredSignals: ['test'], maxRepairAttempts: 2 },
         },
       });
-      setSelectedWorkstreamId(created.id);
+      changeWorkstream(created.id);
       setWorkstreamNotice(`Created ${created.title}`);
       await refreshWorkstreams();
     } catch (err) {
@@ -659,7 +1198,7 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
   async function exportHandoff() {
     if (!selectedWorkstreamId) return;
     try {
-      const result = await generateHandoff(selectedWorkstreamId);
+      const result = await generateHandoff(selectedWorkstreamId, activeWorkspaceRef.current, selectedPlanId || undefined);
       setWorkstreamNotice(`Handoff saved: ${result.path}`);
     } catch (err) {
       setWorkstreamNotice(err instanceof Error ? err.message : String(err));
@@ -695,17 +1234,19 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
         <div className="flex items-center gap-2 min-w-0">
           <select
             value={selectedWorkstreamId}
-            onChange={(e) => setSelectedWorkstreamId(e.target.value)}
+            onChange={(e) => changeWorkstream(e.target.value)}
+            disabled={streaming || planActionBusy}
             className="max-w-72 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)]"
             title="Workstream"
           >
-            <option value="">No workstream</option>
+            <option value="" disabled={cannotClearWorkstream}>No workstream</option>
             {workstreams.map((ws) => (
               <option key={ws.id} value={ws.id}>{ws.title}</option>
             ))}
           </select>
           <button
             onClick={createCurrentWorkstream}
+            disabled={streaming || planActionBusy}
             className="px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)]"
           >
             New
@@ -719,6 +1260,104 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
           </button>
         </div>
       </div>
+
+      <nav
+        aria-label="Current project, workstream, session, stage, and permission"
+        className="px-4 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[var(--color-text2)]"
+      >
+        <span title={activeWorkspace || 'No project'}><span className="text-[var(--color-text)]">Project</span> {workspaceLabel(activeWorkspace)}</span>
+        <span aria-hidden="true">›</span>
+        <span title={selectedWorkstream?.id || selectedWorkstreamId || 'No workstream'}><span className="text-[var(--color-text)]">Work</span> {selectedWorkstream?.title || (selectedWorkstreamId ? 'unavailable' : 'none')}</span>
+        <span aria-hidden="true">›</span>
+        <span title={currentSession?.id || 'No durable session'}><span className="text-[var(--color-text)]">Session</span> {currentSessionLabel}</span>
+        <span aria-hidden="true">›</span>
+        <span title={selectedPlan?.id || selectedPlanId || 'No plan'}><span className="text-[var(--color-text)]">Stage</span> {selectedStageName ? `${selectedStageName} · ${selectedStage?.status || 'unknown'}` : 'none'}</span>
+        <span aria-hidden="true">›</span>
+        <span title={effectiveExecutionPolicy ? `Effective execution mode, revision ${effectiveExecutionPolicy.revision}` : 'Effective execution mode has not been confirmed'}><span className="text-[var(--color-text)]">Permission</span> {permissionLabel}</span>
+      </nav>
+
+      {selectedWorkstreamId && (
+        <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex flex-wrap items-center gap-2 text-xs">
+          <label className="flex items-center gap-1.5 text-[var(--color-text2)]">
+            Plan
+            <select
+              value={selectedPlanId}
+              onChange={(e) => changePlan(e.target.value)}
+              disabled={streaming || planActionBusy || plansLoading}
+              className="max-w-64 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)] disabled:opacity-50"
+              aria-label="Workstream plan"
+            >
+              <option value="" disabled={cannotClearPlan}>Chat only</option>
+              {plans.map((plan) => (
+                <option key={plan.id} value={plan.id}>
+                  {plan.definition.name || plan.definition.objective || plan.id} · {plan.status} · r{plan.revision}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5 text-[var(--color-text2)]">
+            Stage
+            <select
+              value={selectedStageId}
+              onChange={(e) => changeStage(e.target.value)}
+              disabled={streaming || planActionBusy || !selectedPlan || selectedPlan.stages.length === 0}
+              className="max-w-56 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)] disabled:opacity-50"
+              aria-label="Plan stage"
+            >
+              {!selectedStageId && <option value="">Select stage</option>}
+              {selectedPlan && selectedPlan.stages.map((stage) => (
+                <option key={stage.id} value={stage.id} disabled={!planStageEligible(selectedPlan, stage.id)}>
+                  {selectedPlan.definition.stages?.find((item) => item.id === stage.id)?.name || stage.id} · {stage.status}
+                </option>
+              ))}
+            </select>
+          </label>
+          {plansLoading && <span className="text-[var(--color-text2)]">Plans loading…</span>}
+          {!plansLoading && selectedPlanId && !selectedPlan && (
+            <span className="text-[var(--color-red)]">선택한 Plan을 불러올 수 없습니다.</span>
+          )}
+          {selectedPlan && (
+            <>
+              <span className={selectedPlan.approvedRevision === selectedPlan.revision ? 'text-[var(--color-green)]' : 'text-[var(--color-yellow)]'}>
+                {selectedPlan.approvedRevision === selectedPlan.revision
+                  ? `승인됨 · r${selectedPlan.revision}`
+                  : `승인 필요 · ${selectedPlan.status} · r${selectedPlan.revision}`}
+              </span>
+              <span className="text-[var(--color-text2)]">
+                {selectedPlan.stages.filter((stage) => stage.status === 'completed').length}/{selectedPlan.stages.length} stages complete
+              </span>
+              {selectedPlanRevision !== selectedPlan.revision && (
+                <button
+                  onClick={bindCurrentPlanRevision}
+                  disabled={streaming || planActionBusy}
+                  className="px-2.5 py-1.5 rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
+                >
+                  현재 revision 연결
+                </button>
+              )}
+              <button
+                onClick={approveSelectedPlan}
+                disabled={streaming || planActionBusy || selectedPlan.status !== 'draft' ||
+                  selectedPlanRevision !== selectedPlan.revision || !selectedPlan.revision || !selectedPlan.stateRevision}
+                className="px-2.5 py-1.5 rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-40"
+                title={selectedPlan.status !== 'draft' ? 'Draft Plan만 승인할 수 있습니다.' : '현재 definition/state revision을 CAS로 승인합니다.'}
+              >
+                {planActionBusy ? '승인 중…' : 'Plan 승인'}
+              </button>
+              {selectedPlan.stages.find((stage) => stage.id === selectedStageId)?.status === 'running' && (
+                <button
+                  onClick={reconcileSelectedPlanStage}
+                  disabled={streaming || planActionBusy}
+                  className="px-2.5 py-1.5 rounded-lg border border-[var(--color-yellow)] text-[var(--color-yellow)] hover:border-[var(--color-accent)] disabled:opacity-40"
+                  title="실행 프로세스가 끝났음을 확인한 뒤 미완료 상태로 수동 복구합니다."
+                >
+                  {planActionBusy ? '상태 처리 중…' : '중단 단계 복구'}
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {(selectedWorkstream || workstreamNotice || sessionNotice) && (
         <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex items-center gap-3 text-xs min-h-10">
@@ -741,6 +1380,65 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
             <span className="ml-auto text-[var(--color-text2)] truncate">{sessionNotice}</span>
           )}
         </div>
+      )}
+
+      {(diffRecords.length > 0 || undoEntries.length > 0) && (
+        <section className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] text-xs" aria-label="Run changes and restore">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium text-[var(--color-text)]">Changes</span>
+            <span className="text-[var(--color-text2)]">{changedFiles.length} file{changedFiles.length === 1 ? '' : 's'} · {diffRecords.length} diff{diffRecords.length === 1 ? '' : 's'}</span>
+            {currentTurnDiffs.length > 0 && <span className="text-[var(--color-accent)]">current turn {currentTurnDiffs.length}</span>}
+            <button
+              onClick={() => { setUndoActionBusy(true); void send('/undo --list'); }}
+              disabled={streaming || undoActionBusy}
+              className="ml-auto px-2 py-1 rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
+            >
+              {undoActionBusy ? 'Checking restore…' : 'Check restore'}
+            </button>
+          </div>
+          {changedFiles.length > 0 && (
+            <div className="mt-1 text-[var(--color-text2)] truncate" title={changedFiles.join(', ')}>
+              {changedFiles.join(' · ')}
+            </div>
+          )}
+          {undoEntries.length > 0 && (
+            <div className="mt-2 flex flex-col gap-1.5">
+              <span className="text-[var(--color-text2)]">Checkpoint restore candidates</span>
+              {undoEntries.map((entry) => {
+                const restorable = entry.status === 'restorable';
+                return (
+                  <div key={entry.id} className="flex items-center gap-2">
+                    <span className={`truncate flex-1 ${restorable ? 'text-[var(--color-text)]' : 'text-[var(--color-yellow)]'}`} title={entry.path}>
+                      {entry.path} · {entry.status}
+                    </span>
+                    {restorable && (
+                      <button
+                        onClick={() => { setUndoActionBusy(true); void send(`/undo --select ${entry.id}`); }}
+                        disabled={streaming || undoActionBusy}
+                        className="px-2 py-0.5 rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
+                      >
+                        Restore
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {diffRecords.length > 0 && (
+            <details className="mt-2">
+              <summary className="cursor-pointer text-[var(--color-text2)]">Show accumulated turn diffs</summary>
+              <div className="mt-1 max-h-56 overflow-auto space-y-2">
+                {diffRecords.map((record, index) => (
+                  <div key={`${record.turn}-${record.file}-${index}`} className="border-l-2 border-[var(--color-border)] pl-2">
+                    <div className="text-[var(--color-text)]">turn {record.turn} · {record.file}</div>
+                    <pre className="mt-0.5 whitespace-pre-wrap text-[10px] font-mono text-[var(--color-text2)]">{record.diff}</pre>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </section>
       )}
 
       {/* Messages Area — full width */}
@@ -952,20 +1650,20 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
             {attachedImage && (
               <div className="w-full mb-2 flex items-center gap-2">
                 <div className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg p-1 flex items-center gap-2">
-                  <img src={`data:image/png;base64,${attachedImage}`} className="h-12 rounded" alt="attached" />
+                  <img src={`data:${attachedImage.mediaType};base64,${attachedImage.data}`} className="h-12 rounded" alt="attached" />
                   <button onClick={() => setAttachedImage(null)} className="text-xs text-[var(--color-red)] px-1">✕</button>
                 </div>
                 <span className="text-xs text-[var(--color-text2)]">Image attached</span>
               </div>
             )}
             {planReady && !streaming && (
-              <div className="w-full mb-2 flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[var(--color-surface2)] border border-[var(--color-accent)]">
-                <span className="text-xs text-[var(--color-text)]">계획이 준비됐어요. 검토 후 진행하세요.</span>
+              <div className="w-full mb-2 flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[var(--color-surface2)] border border-[var(--color-accent)]">
+                <span className="text-xs text-[var(--color-text)]">이 제안은 대화에만 있습니다. 버튼은 일반 요청을 보내며 저장된 Workstream Plan 승인을 기록하지 않습니다.</span>
                 <button
                   onClick={() => send('위 계획대로 구현을 진행해줘.')}
                   className="text-xs font-semibold px-3 py-1.5 rounded-md bg-[var(--color-accent)] text-white hover:opacity-90 whitespace-nowrap"
                 >
-                  승인 &amp; 실행
+                  이 계획으로 계속 요청
                 </button>
               </div>
             )}
@@ -975,19 +1673,18 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
                 <span>📎</span>
                 <input
                   type="file"
-                  accept="image/*"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
                   className="hidden"
                   onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                      const result = reader.result as string;
-                      const b64 = result.split(',')[1];
-                      setAttachedImage(b64);
-                    };
-                    reader.readAsDataURL(file);
                     e.target.value = '';
+                    try {
+                      setAttachedImage(await readImageAttachment(file));
+                      setSessionNotice('');
+                    } catch (error) {
+                      setSessionNotice(error instanceof Error ? error.message : 'Image could not be read.');
+                    }
                   }}
                 />
               </label>
@@ -1047,12 +1744,12 @@ export function ChatPage({ loadSessionId, onSessionLoaded }: ChatPageProps) {
                       e.preventDefault();
                       const file = item.getAsFile();
                       if (!file) return;
-                      const reader = new FileReader();
-                      reader.onload = () => {
-                        const result = reader.result as string;
-                        setAttachedImage(result.split(',')[1]);
-                      };
-                      reader.readAsDataURL(file);
+                      void readImageAttachment(file).then((attached) => {
+                        setAttachedImage(attached);
+                        setSessionNotice('');
+                      }).catch((error: unknown) => {
+                        setSessionNotice(error instanceof Error ? error.message : 'Image could not be read.');
+                      });
                     }
                   }
                 }}

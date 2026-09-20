@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 const (
@@ -100,11 +101,51 @@ type agentStreamItem struct {
 }
 
 type agentTurnRequest struct {
-	Messages         []chatMsg `json:"messages"`
-	WorkDir          string    `json:"workDir"`
-	ResponseLang     string    `json:"responseLang"`
-	DurableSessionID string    `json:"durableSessionId,omitempty"`
-	ExpectedRevision *uint64   `json:"expectedRevision,omitempty"`
+	Messages         []chatMsg                     `json:"messages"`
+	WorkDir          string                        `json:"workDir"`
+	ResponseLang     string                        `json:"responseLang"`
+	ExecutionPolicy  *agent.ExecutionPolicyRequest `json:"executionPolicy,omitempty"`
+	DurableSessionID string                        `json:"durableSessionId,omitempty"`
+	ExpectedRevision *uint64                       `json:"expectedRevision,omitempty"`
+}
+
+func parseExecutionModeFlag(value string) (agent.ExecutionMode, error) {
+	mode := agent.ExecutionMode(strings.TrimSpace(value))
+	if mode == "" || mode == agent.ExecutionModeReadOnly || mode == agent.ExecutionModeWorkspace || mode == agent.ExecutionModeFull {
+		return mode, nil
+	}
+	return "", fmt.Errorf("invalid execution mode %q; expected read-only, workspace, or full", value)
+}
+
+func requestedExecutionPolicy(mode agent.ExecutionMode) *agent.ExecutionPolicyRequest {
+	if mode == "" {
+		return nil
+	}
+	return &agent.ExecutionPolicyRequest{Mode: mode}
+}
+
+func validEffectiveExecutionPolicy(mode agent.ExecutionMode, revision uint64) bool {
+	return revision > 0 && (mode == agent.ExecutionModeReadOnly || mode == agent.ExecutionModeWorkspace || mode == agent.ExecutionModeFull)
+}
+
+func resolveCLIExecutionPolicy(
+	workDir string,
+	requestedMode agent.ExecutionMode,
+) (sandbox.Runner, sandbox.Policy, agent.ExecutionPolicySnapshot, error) {
+	effectiveMode := requestedMode
+	if effectiveMode == "" {
+		effectiveMode = agent.ExecutionModeWorkspace
+	}
+	runner, policy := agent.SandboxExecutionForMode(workDir, effectiveMode)
+	snapshot, err := agent.ResolveExecutionPolicy(
+		agent.ExecutionPolicyRequest{Mode: requestedMode},
+		"",
+		runner.Capabilities(),
+	)
+	if err != nil {
+		return nil, sandbox.Policy{}, agent.ExecutionPolicySnapshot{}, err
+	}
+	return runner, policy, snapshot, nil
 }
 
 // agentHTTPError is safe to render in a terminal. Body is capped at 4 KiB,
@@ -252,8 +293,56 @@ func (t *agentStreamTransport) ForkSession(ctx context.Context, id string, revis
 	return response.Session, nil
 }
 
-func (t *agentStreamTransport) ReconcileSession(ctx context.Context, id string, revision uint64) (*agent.Session, error) {
-	return t.mutateSessionLifecycle(ctx, id, "reconcile", revision)
+func (t *agentStreamTransport) ReconciliationPreview(
+	ctx context.Context,
+	id string,
+	revision uint64,
+) (agent.SessionReconciliationAssessment, error) {
+	var assessment agent.SessionReconciliationAssessment
+	err := t.doJSON(
+		ctx,
+		http.MethodGet,
+		sessionPath(id)+"/reconcile-preview",
+		url.Values{"expectedRevision": []string{fmt.Sprintf("%d", revision)}},
+		nil,
+		&assessment,
+	)
+	return assessment, err
+}
+
+func (t *agentStreamTransport) ReconcileSession(
+	ctx context.Context,
+	id string,
+	revision uint64,
+	evidenceDigest string,
+	manualConfirmationAcknowledged bool,
+) (*agent.Session, error) {
+	var response struct {
+		Session *agent.Session `json:"session"`
+	}
+	err := t.doJSON(
+		ctx,
+		http.MethodPost,
+		sessionPath(id)+"/reconcile",
+		nil,
+		struct {
+			ExpectedRevision               uint64 `json:"expectedRevision"`
+			EvidenceDigest                 string `json:"evidenceDigest"`
+			ManualConfirmationAcknowledged bool   `json:"manualConfirmationAcknowledged"`
+		}{
+			ExpectedRevision:               revision,
+			EvidenceDigest:                 evidenceDigest,
+			ManualConfirmationAcknowledged: manualConfirmationAcknowledged,
+		},
+		&response,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if response.Session == nil {
+		return nil, errors.New("reconcile response did not include a session")
+	}
+	return response.Session, nil
 }
 
 func (t *agentStreamTransport) CloseSession(ctx context.Context, id string, revision uint64) (*agent.Session, error) {
@@ -420,8 +509,11 @@ func truncateUTF8Bytes(value string, limit int) string {
 	return value
 }
 
-// StartTurn starts a single ordered SSE stream. On a clean HTTP EOF it emits
-// one EOF item; protocol, transport, and context failures emit one Err item.
+// StartTurn starts a single ordered SSE stream. It deliberately never retries
+// or re-POSTs an agent turn: the POST can mutate files, so a dropped response
+// fails closed until a future protocol can resume by an explicit idempotency key.
+// On a clean HTTP EOF it emits one EOF item; protocol, transport, and context
+// failures emit one Err item.
 func (t *agentStreamTransport) StartTurn(ctx context.Context, turn agentTurnRequest) <-chan agentStreamItem {
 	items := make(chan agentStreamItem, 16)
 	go func() {

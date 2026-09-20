@@ -21,7 +21,9 @@ type ChronosConfig struct {
 	CompletionCheck   string                                // how to determine completion
 	AutoFix           bool                                  // automatically attempt fixes on verify failure
 	WorkstreamContext string                                // durable workstream context rendered by the server
+	CompactionContext CompactionContext                     `json:"-"`
 	SessionID         string                                `json:"-"`
+	ExecutionPolicy   *ExecutionPolicySnapshot              `json:"-"`
 	ApprovalRequester approval.Requester                    `json:"-"`
 	SandboxRunner     sandbox.Runner                        `json:"-"`
 	SandboxPolicy     sandbox.Policy                        `json:"-"`
@@ -32,6 +34,10 @@ type ChronosConfig struct {
 	HarnessProfile    *harness.HarnessProfile               `json:"-"`
 	CapabilityProfile *capabilityprofile.AutomaticSelection `json:"-"`
 	PlanAnchor        *PlanAnchor                           `json:"-"`
+	PlanBinding       *PlanExecutionBinding                 `json:"-"`
+	SkillSource       string                                `json:"-"`
+	SkillDirs         []string                              `json:"-"`
+	ProjectSkillDirs  []string                              `json:"-"`
 }
 
 // DefaultChronosConfig returns standard settings.

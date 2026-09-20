@@ -28,7 +28,13 @@ func (r *wrappedRunner) Name() string { return r.name }
 func (r *wrappedRunner) Capabilities() sandbox.Capabilities { return r.capabilities }
 
 func (r *wrappedRunner) Start(ctx context.Context, policy sandbox.Policy, input Spec) (*Process, Report) {
-	report := Report{Runner: r.name, Policy: policy, Capabilities: r.capabilities}
+	capabilities := r.Capabilities()
+	report := Report{
+		Runner:          r.name,
+		Policy:          policy,
+		Capabilities:    capabilities,
+		ExecutionPolicy: executionPolicyForReport(input.ExecutionPolicy, capabilities),
+	}
 	fail := func(code sandbox.FailureCode, detail string) (*Process, Report) {
 		report.Failure = code
 		report.Detail = detail
@@ -37,7 +43,7 @@ func (r *wrappedRunner) Start(ctx context.Context, policy sandbox.Policy, input 
 	if policy.Enforcement == sandbox.EnforcementDisabled {
 		return fail(sandbox.FailurePolicyInvalid, "secure streaming adapter does not accept disabled enforcement")
 	}
-	if err := sandbox.ValidatePolicy(policy, r.capabilities); err != nil {
+	if err := sandbox.ValidatePolicy(policy, capabilities); err != nil {
 		return fail(sandboxFailure(err), err.Error())
 	}
 	spec := cloneSpec(input)

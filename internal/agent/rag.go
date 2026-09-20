@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -19,7 +20,7 @@ type RAGResult struct {
 
 // RAGSearch searches the project for relevant context based on a query.
 // Uses keyword extraction + file search + content grep.
-func RAGSearch(workDir string, query string, maxResults int) []RAGResult {
+func RAGSearch(workDir string, query string, maxResults int, excludedPaths ...string) []RAGResult {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
@@ -31,11 +32,12 @@ func RAGSearch(workDir string, query string, maxResults int) []RAGResult {
 
 	log.Printf("[RAG] Query: %q → keywords: %v", truncateStr(query, 50), keywords)
 
+	excluded := ragExcludedPathSet(excludedPaths)
 	// Phase 1: Find relevant files by name
-	fileMatches := searchFileNames(workDir, keywords)
+	fileMatches := searchFileNames(workDir, keywords, excluded)
 
 	// Phase 2: Search file contents
-	contentMatches := searchFileContents(workDir, keywords)
+	contentMatches := searchFileContents(workDir, keywords, excluded)
 
 	// Phase 3: Merge and rank
 	all := mergeAndRank(fileMatches, contentMatches)
@@ -49,6 +51,9 @@ func RAGSearch(workDir string, query string, maxResults int) []RAGResult {
 			continue
 		}
 		seen[match.File] = true
+		if ragPathExcluded(workDir, match.File, excluded) {
+			continue
+		}
 
 		content := readFileSnippet(filepath.Join(workDir, match.File), match.Line, 30)
 		if content == "" {
@@ -156,7 +161,7 @@ type fileMatch struct {
 	Score float64
 }
 
-func searchFileNames(workDir string, keywords []string) []fileMatch {
+func searchFileNames(workDir string, keywords []string, excluded map[string]struct{}) []fileMatch {
 	var matches []fileMatch
 
 	skipDirs := map[string]bool{
@@ -166,7 +171,15 @@ func searchFileNames(workDir string, keywords []string) []fileMatch {
 	}
 
 	filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		if err != nil || info == nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(workDir, path)
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		if ragPathExcluded(workDir, rel, excluded) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if info.IsDir() {
@@ -176,8 +189,6 @@ func searchFileNames(workDir string, keywords []string) []fileMatch {
 			return nil
 		}
 
-		rel, _ := filepath.Rel(workDir, path)
-		rel = strings.ReplaceAll(rel, "\\", "/")
 		lower := strings.ToLower(rel)
 
 		score := 0.0
@@ -206,7 +217,7 @@ func searchFileNames(workDir string, keywords []string) []fileMatch {
 
 // ── Content search (grep-like) ──
 
-func searchFileContents(workDir string, keywords []string) []fileMatch {
+func searchFileContents(workDir string, keywords []string, excluded map[string]struct{}) []fileMatch {
 	var matches []fileMatch
 
 	codeExts := map[string]bool{
@@ -222,8 +233,19 @@ func searchFileContents(workDir string, keywords []string) []fileMatch {
 	}
 
 	filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			if info != nil && info.IsDir() && skipDirs[info.Name()] {
+		if err != nil || info == nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(workDir, path)
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		if ragPathExcluded(workDir, rel, excluded) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.IsDir() {
+			if skipDirs[info.Name()] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -244,8 +266,6 @@ func searchFileContents(workDir string, keywords []string) []fileMatch {
 
 		content := strings.ToLower(string(data))
 		lines := strings.Split(string(data), "\n")
-		rel, _ := filepath.Rel(workDir, path)
-		rel = strings.ReplaceAll(rel, "\\", "/")
 
 		for _, kw := range keywords {
 			for lineNum, line := range lines {
@@ -268,6 +288,53 @@ func searchFileContents(workDir string, keywords []string) []fileMatch {
 		matches = matches[:30]
 	}
 	return matches
+}
+
+func ragExcludedPathSet(paths []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(paths)*2)
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		result[ragPathKey(absolute)] = struct{}{}
+		if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+			result[ragPathKey(resolved)] = struct{}{}
+		}
+	}
+	return result
+}
+
+func ragPathExcluded(workDir, relativePath string, excluded map[string]struct{}) bool {
+	if len(excluded) == 0 {
+		return false
+	}
+	absolute, err := filepath.Abs(filepath.Join(workDir, filepath.FromSlash(relativePath)))
+	if err != nil {
+		return false
+	}
+	pathKey := ragPathKey(absolute)
+	for current := pathKey; ; current = filepath.Dir(current) {
+		if _, ok := excluded[current]; ok {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return false
+}
+
+func ragPathKey(path string) string {
+	key := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
 }
 
 // ── Merge and rank ──

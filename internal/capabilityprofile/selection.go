@@ -15,6 +15,13 @@ type AutomaticSelection struct {
 	profile CapabilityProfile
 }
 
+func (s AutomaticSelection) LessonsFor(provider, model string, now time.Time) LessonPolicy {
+	if _, _, ok := s.RecommendationsFor(provider, model, now); !ok {
+		return 0
+	}
+	return s.profile.snapshot.Provenance.Lessons
+}
+
 // NewAutomaticSelection validates all automatic-use gates and binds profile to
 // target. Manual selections deliberately cannot be converted into this type.
 func NewAutomaticSelection(target TargetIdentity, profile CapabilityProfile, now time.Time) (AutomaticSelection, error) {

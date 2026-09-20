@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/capabilityprofile"
 	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/harness"
@@ -238,10 +239,20 @@ func TestChronosAndSubAgentCompositionInjectSelectedCapabilityProfile(t *testing
 		}
 		server := New(provider, model, 0)
 		server.SetWorkDir(t.TempDir())
+		invalidRequest := httptest.NewRequest(
+			http.MethodPost,
+			"/api/chronos",
+			bytes.NewReader([]byte(`{"task":"reject unknown mode","executionPolicy":{"mode":"unrestricted"}}`)),
+		)
+		invalidRecorder := httptest.NewRecorder()
+		server.handleChronos(invalidRecorder, invalidRequest)
+		if invalidRecorder.Code != http.StatusBadRequest || provider.calls != 0 {
+			t.Fatalf("invalid chronos mode status/calls = %d/%d, want 400/0", invalidRecorder.Code, provider.calls)
+		}
 		req := httptest.NewRequest(
 			http.MethodPost,
 			"/api/chronos",
-			bytes.NewReader([]byte(`{"task":"verify chronos composition","maxCycles":1}`)),
+			bytes.NewReader([]byte(`{"task":"verify chronos composition","maxCycles":1,"executionPolicy":{"mode":"full","revision":999,"runtimeCapabilities":{"filesystemIsolation":true}}}`)),
 		)
 		recorder := httptest.NewRecorder()
 
@@ -252,13 +263,13 @@ func TestChronosAndSubAgentCompositionInjectSelectedCapabilityProfile(t *testing
 		if provider.calls != 1 || provider.toolCount != 1 {
 			t.Fatalf("chronos provider calls/tools = %d/%d, want 1/1", provider.calls, provider.toolCount)
 		}
+		if !strings.Contains(recorder.Body.String(), `"type":"execution_policy","data":{"mode":"full","revision":`) ||
+			strings.Contains(recorder.Body.String(), `"revision":999`) {
+			t.Fatalf("chronos SSE omitted server-selected execution policy: %s", recorder.Body.String())
+		}
 	})
 
 	t.Run("sub-agent", func(t *testing.T) {
-		previousManager := subAgentMgr
-		subAgentMgr = nil
-		t.Cleanup(func() { subAgentMgr = previousManager })
-
 		provider := &serverCapabilityRunProvider{name: providerName, endpoint: endpoint}
 		server := New(provider, model, 0)
 		workDir := t.TempDir()
@@ -279,16 +290,30 @@ func TestChronosAndSubAgentCompositionInjectSelectedCapabilityProfile(t *testing
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
 		}
-		if subAgentMgr == nil {
+		var response struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		manager := server.subAgentManager(response.SessionID)
+		if manager == nil {
 			t.Fatal("sub-agent manager was not created")
 		}
-		subAgentMgr.Wait(2 * time.Second)
+		manager.Wait(2 * time.Second)
 		if provider.calls != 1 || provider.toolCount != 1 {
 			t.Fatalf("sub-agent provider calls/tools = %d/%d, want 1/1", provider.calls, provider.toolCount)
 		}
-		tasks := subAgentMgr.GetTasks()
+		tasks := manager.GetTasks()
 		if len(tasks) != 1 || tasks[0].Status != "completed" {
 			t.Fatalf("sub-agent tasks = %#v", tasks)
+		}
+		policy, ok := manager.ExecutionPolicySnapshot()
+		if !ok || policy.Mode != agent.ExecutionModeWorkspace {
+			t.Fatalf("standalone sub-agent policy = %#v (present=%t), want workspace", policy, ok)
+		}
+		if response.SessionID == "" {
+			t.Fatal("spawn response omitted its isolated session id")
 		}
 	})
 }

@@ -16,7 +16,11 @@ services:
 
   # ── Corelay Code: LLM Harness ──
   corelaycode:
-    build: .
+    build:
+      context: .
+      args:
+        CORELAY_VERSION: ${CORELAY_VERSION:-dev}
+        CORELAY_BUILD_COMMIT: ${CORELAY_BUILD_COMMIT:-unknown}
     container_name: corelaycode
     ports:
       - "4000:4000"

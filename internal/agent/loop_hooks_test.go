@@ -129,7 +129,9 @@ func TestRunLoopPreHookFailureBlocksToolAndUsesRunContext(t *testing.T) {
 	})
 	hookRunner := &loopHookRunner{}
 	hookRegistry := hooks.NewRegistryWithOptions(hooks.RegistryOptions{Runner: hookRunner, ShellPath: "hook-shell"})
-	toolRunner := &fakeBashRunner{name: "tool-must-not-run", capabilities: fakeBashCapabilities()}
+	toolCapabilities := fakeBashCapabilities()
+	toolCapabilities.FilesystemIsolation = true
+	toolRunner := &fakeBashRunner{name: "tool-must-not-run", capabilities: toolCapabilities}
 	provider := &scriptedLoopProvider{steps: []scriptedLoopStep{
 		toolUseStep("toolu_hook_block", "Bash", map[string]string{"command": "echo should-not-run"}),
 		textStep("blocked safely"),
@@ -182,7 +184,9 @@ func TestRunLoopPostHookFailureIsRecordedAndRawToolResultIsDigested(t *testing.T
 	})
 	hookRunner := &loopHookRunner{}
 	hookRegistry := hooks.NewRegistryWithOptions(hooks.RegistryOptions{Runner: hookRunner, ShellPath: "hook-shell"})
-	toolRunner := &fakeBashRunner{name: "tool-success", capabilities: fakeBashCapabilities()}
+	toolCapabilities := fakeBashCapabilities()
+	toolCapabilities.FilesystemIsolation = true
+	toolRunner := &fakeBashRunner{name: "tool-success", capabilities: toolCapabilities}
 	toolRunner.run = func(_ context.Context, policy sandbox.Policy, _ sandbox.CommandSpec) (sandbox.Result, sandbox.Report) {
 		report := fakeBashReport(toolRunner, policy)
 		report.Started = true

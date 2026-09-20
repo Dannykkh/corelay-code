@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,68 @@ import (
 	"github.com/Dannykkh/corelay-code/internal/approval"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
+
+func TestDispatchCheckpointFailureMarksUnrevertedMutationAsError(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("CORELAY_CONFIG_DIR", stateDir)
+	t.Setenv("ANICLEW_CONFIG_DIR", "")
+	workDir := t.TempDir()
+	target := filepath.Join(workDir, "checkpoint-conflict.txt")
+	writeDispatchFixture(t, target, "before")
+	owner := newCheckpointOwner("checkpoint-conflict-session", 1, "run_checkpoint_conflict")
+	scope := newCheckpointScope(owner)
+	ledger := NewReadLedger(workDir)
+	if err := ledger.RecordRead(target); err != nil {
+		t.Fatalf("record preimage read: %v", err)
+	}
+	call := dispatchTestCall("checkpoint-conflict-write", "Write", map[string]any{
+		"file_path": "checkpoint-conflict.txt",
+		"content":   "tool-write",
+	})
+	results := dispatchToolCalls([]toolUseBlock{call}, toolDispatchOptions{
+		Context:          context.Background(),
+		WorkDir:          workDir,
+		AllowedTools:     dispatchAllowedTools("Write"),
+		PermissionConfig: dispatchPermissionConfig("moderate"),
+		ReadBeforeWrite:  true,
+		ReadLedger:       ledger,
+		SnapshotDecision: func(toolUseBlock) string { return "allow" },
+		BeforeExecute: func(call toolUseBlock) (toolMutationPreview, error) {
+			path := dispatchFilePath(call.Input)
+			err := scope.captureBeforeMutation(workDir, path, resolvePath(path, workDir))
+			return toolMutationPreview{File: path, CheckpointCaptured: err == nil}, err
+		},
+		MutationBatchCommitted: func([]committedFileMutation) error {
+			if err := os.WriteFile(target, []byte("concurrent-change"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("checkpoint store unavailable")
+		},
+		MutationBatchSettled: func(paths []string) error {
+			return scope.settleFailedBatch(workDir, paths)
+		},
+		Execute: func(call toolUseBlock) (string, bool) {
+			content, isError := ExecuteTool(call.Name, call.Input, workDir)
+			return content, isError
+		},
+	})
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "[TRANSACTION INCOMPLETE]") {
+		t.Fatalf("checkpoint failure result = %#v", results)
+	}
+	manifest, _, found, err := readManifestStrict(workDir, owner.SessionID)
+	if err != nil || !found {
+		t.Fatalf("failed checkpoint manifest unavailable: found=%v err=%v", found, err)
+	}
+	if entry := manifest.Files["checkpoint-conflict.txt"]; entry.PostimageCaptured {
+		t.Fatalf("concurrent edit was incorrectly settled as safe postimage: %+v", entry)
+	}
+	if _, ok, err := undoCheckpointSecure(workDir, owner.SessionID); err == nil || ok {
+		t.Fatalf("undo did not refuse conflicting checkpoint: ok=%v err=%v", ok, err)
+	}
+	if content, err := os.ReadFile(target); err != nil || string(content) != "concurrent-change" {
+		t.Fatalf("unsafe rollback changed concurrent file: %q, err=%v", content, err)
+	}
+}
 
 func TestDispatchToolCallsDeniesBeforeParallelAndPreservesSlots(t *testing.T) {
 	workDir := t.TempDir()
@@ -170,9 +233,9 @@ func TestDispatchToolCallsBlocksEditWithoutReadEvidence(t *testing.T) {
 		ReadLedger:       NewReadLedger(workDir),
 		RunGuard:         NewRunGuard(10),
 		SnapshotDecision: func(toolUseBlock) string { return "allow" },
-		BeforeExecute: func(toolUseBlock) toolMutationPreview {
+		BeforeExecute: func(toolUseBlock) (toolMutationPreview, error) {
 			beforeExecute++
-			return toolMutationPreview{}
+			return toolMutationPreview{}, nil
 		},
 		PostHook: func(toolUseBlock, string, bool) {
 			postHooks++
@@ -528,9 +591,9 @@ func TestDispatchToolCallsRechecksCancellationAfterApproval(t *testing.T) {
 		ApprovalRequester: requester,
 		SessionID:         "session-cancel",
 		RunID:             "run-cancel",
-		BeforeExecute: func(toolUseBlock) toolMutationPreview {
+		BeforeExecute: func(toolUseBlock) (toolMutationPreview, error) {
 			beforeExecute++
-			return toolMutationPreview{}
+			return toolMutationPreview{}, nil
 		},
 		PostHook: func(toolUseBlock, string, bool) {
 			postHooks++
@@ -615,17 +678,21 @@ type cancelOnApprovalRequester struct {
 
 func (r *cancelOnApprovalRequester) Open(draft approval.Draft) (approval.Pending, error) {
 	return approval.Pending{
-		ID:              "approval-cancel",
-		SessionID:       draft.SessionID,
-		SessionRevision: draft.SessionRevision,
-		RunID:           draft.RunID,
-		ToolCallID:      draft.ToolCallID,
-		ToolName:        draft.ToolName,
-		RedactedInput:   draft.RedactedInput,
-		InputDigest:     draft.InputDigest,
-		DangerLevel:     draft.DangerLevel,
-		Scope:           draft.Scope,
-		ExpiresAt:       time.Now().Add(time.Minute),
+		ID:                      "approval-cancel",
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		ExpiresAt:               time.Now().Add(time.Minute),
 	}, nil
 }
 
@@ -646,17 +713,21 @@ func (r *cancelOnApprovalRequester) Await(
 func (r *allowingApprovalRequester) Open(draft approval.Draft) (approval.Pending, error) {
 	r.opened = draft
 	return approval.Pending{
-		ID:              "approval-test",
-		SessionID:       draft.SessionID,
-		SessionRevision: draft.SessionRevision,
-		RunID:           draft.RunID,
-		ToolCallID:      draft.ToolCallID,
-		ToolName:        draft.ToolName,
-		RedactedInput:   draft.RedactedInput,
-		InputDigest:     draft.InputDigest,
-		DangerLevel:     draft.DangerLevel,
-		Scope:           draft.Scope,
-		ExpiresAt:       time.Now().Add(time.Minute),
+		ID:                      "approval-test",
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		ExpiresAt:               time.Now().Add(time.Minute),
 	}, nil
 }
 

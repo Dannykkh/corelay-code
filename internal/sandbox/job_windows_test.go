@@ -50,7 +50,12 @@ func TestWindowsJobRunnerKillsDescendantTreeOnTimeout(t *testing.T) {
 	command := windowsJobHelperCommand("parent")
 	readyPath := filepath.Join(t.TempDir(), "descendant-ready")
 	command.Environment.Set[windowsJobHelperReady] = readyPath
-	command.Timeout = 1500 * time.Millisecond
+	// Job Object setup creates a suspended process, assigns it to the job, and
+	// then waits for the descendant readiness barrier. A short deadline makes a
+	// loaded Windows runner fail before the process tree exists, which tests the
+	// setup timeout rather than descendant termination. Keep enough budget for
+	// setup while the helper's 30-second sleep still guarantees a real timeout.
+	command.Timeout = 10 * time.Second
 	result, report := runner.Run(context.Background(), Policy{
 		Enforcement:      EnforcementRequired,
 		Required:         Capabilities{ProcessIsolation: true, ProcessTreeKill: true},

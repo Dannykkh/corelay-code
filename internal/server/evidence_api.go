@@ -83,10 +83,11 @@ func (s *Server) handleEvidencePolicyUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	cfg := agent.NormalizeEvidencePolicyConfig(body)
-	saved := config.Load()
-	saved.EvidencePolicy = cfg.Policy
-	saved.EvidenceMaxStopBlocks = cfg.MaxStopBlocks
-	if err := config.Save(saved); err != nil {
+	if _, err := config.Update(func(saved *config.Config) error {
+		saved.EvidencePolicy = cfg.Policy
+		saved.EvidenceMaxStopBlocks = cfg.MaxStopBlocks
+		return nil
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save evidence policy: "+err.Error())
 		return
 	}

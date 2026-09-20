@@ -3,6 +3,26 @@ import { fetchJSON, HTTPError, postJSON } from './api';
 export type SessionLifecycleStatus = 'active' | 'interrupted' | 'closed' | 'recovery-needed';
 export type SessionSideEffectState = 'unknown' | 'started' | 'may_have_applied' | 'applied';
 export type CompletionContractStatus = 'incomplete' | 'complete' | 'blocked';
+export type SessionExecutionMode = 'read-only' | 'workspace' | 'full';
+
+export interface SessionExecutionPolicy {
+  mode: SessionExecutionMode;
+  revision: number;
+  runtimeCapabilities?: {
+    filesystemIsolation?: boolean;
+    networkIsolation?: boolean;
+    processIsolation?: boolean;
+    environmentIsolation?: boolean;
+    processLimits?: boolean;
+    memoryLimits?: boolean;
+    processTreeKill?: boolean;
+    environmentFiltering?: boolean;
+    timeouts?: boolean;
+  };
+  parentRevision?: number;
+  fullSelectionRevision?: number;
+  source?: string;
+}
 
 export interface DurableRunTerminalMetadata {
   terminalState?: string;
@@ -45,6 +65,10 @@ export interface SessionSummary {
   model: string;
   updatedAt: string;
   workspace?: string;
+  workstreamId?: string;
+  planId?: string;
+  planRevision?: number;
+  stageId?: string;
   version?: number;
   revision?: number;
   parentSessionId?: string;
@@ -58,11 +82,18 @@ export interface SessionSummary {
 export interface SessionMessage {
   role: 'user' | 'assistant' | 'tool';
   content: string;
+  attachments?: SessionImageReference[];
   toolName?: string;
   toolInput?: Record<string, unknown> | string;
   toolResult?: string;
   isError?: boolean;
   timestamp: string;
+}
+
+export interface SessionImageReference {
+  digest: string;
+  mediaType: string;
+  size: number;
 }
 
 export interface Session extends SessionLifecycleFields {
@@ -75,6 +106,11 @@ export interface Session extends SessionLifecycleFields {
   updatedAt: string;
   turns: number;
   workspace?: string;
+  workstreamId?: string;
+  planId?: string;
+  planRevision?: number;
+  stageId?: string;
+  executionPolicy?: SessionExecutionPolicy;
 }
 
 export interface NormalizedSessionLifecycle {

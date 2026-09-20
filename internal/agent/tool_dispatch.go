@@ -17,8 +17,9 @@ import (
 )
 
 type toolMutationPreview struct {
-	File   string
-	Before string
+	File               string
+	Before             string
+	CheckpointCaptured bool
 }
 
 type toolDispatchResult struct {
@@ -33,34 +34,43 @@ type toolDispatchResult struct {
 }
 
 type toolDispatchOptions struct {
-	Context             context.Context
-	WorkDir             string
-	AllowedTools        map[string]struct{}
-	PlanMode            bool
-	PermissionConfig    PermissionConfig
-	SnapshotDecision    func(toolUseBlock) string
-	ApprovalRequester   approval.Requester
-	SessionID           string
-	RunID               string
-	ReadBeforeWrite     bool
-	ReadLedger          *ReadLedger
-	RunGuard            *RunGuard
-	PlanStep            string
-	ScopeCheck          func(toolUseBlock) (bool, string)
-	PreHook             func(toolUseBlock) (bool, string)
-	PostHook            func(toolUseBlock, string, bool)
-	BeforeExecute       func(toolUseBlock) toolMutationPreview
-	PreExecutionJournal ToolExecutionJournal
-	Execute             func(toolUseBlock) (string, bool)
-	Emit                func(Event)
+	Context                context.Context
+	ExecutionPolicy        *ExecutionPolicySnapshot
+	WorkDir                string
+	AllowedTools           map[string]struct{}
+	PlanMode               bool
+	PermissionConfig       PermissionConfig
+	SnapshotDecision       func(toolUseBlock) string
+	ApprovalRequester      approval.Requester
+	SessionID              string
+	SessionRevision        uint64
+	RunID                  string
+	ReadBeforeWrite        bool
+	ReadLedger             *ReadLedger
+	RunGuard               *RunGuard
+	PlanStep               string
+	ScopeCheck             func(toolUseBlock) (bool, string)
+	InstructionCheck       func(toolUseBlock) (bool, string)
+	InstructionBegin       func()
+	InstructionFinish      func()
+	PreHook                func(toolUseBlock) (bool, string)
+	PostHook               func(toolUseBlock, string, bool)
+	BeforeExecute          func(toolUseBlock) (toolMutationPreview, error)
+	MutationBatchCommitted func([]committedFileMutation) error
+	MutationBatchSettled   func([]string) error
+	PreExecutionJournal    ToolExecutionJournal
+	Execute                func(toolUseBlock) (string, bool)
+	Emit                   func(Event)
 }
 
 type preparedToolCall struct {
 	index          int
 	tool           toolUseBlock
 	concurrent     bool
+	danger         DangerLevel
 	hostApproval   *hostInteractionApprovalProof
 	pluginApproval *pluginApprovalProof
+	fullModeGrant  *approval.Pending
 }
 
 var fallbackRunIDCounter atomic.Uint64
@@ -82,6 +92,12 @@ func newActiveRunID() string {
 // concurrent or serial queue, and every returned slot matches the model's
 // original call order.
 func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDispatchResult {
+	if opts.InstructionBegin != nil {
+		opts.InstructionBegin()
+	}
+	if opts.InstructionFinish != nil {
+		defer opts.InstructionFinish()
+	}
 	results := make([]toolDispatchResult, len(calls))
 	concurrent := make([]preparedToolCall, 0, len(calls))
 	serial := make([]preparedToolCall, 0, len(calls))
@@ -130,6 +146,17 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 			)
 			continue
 		}
+		if opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeReadOnly {
+			if (canonicalPermissionToolName(call.Name) == "Bash" || canonicalPermissionToolName(call.Name) == "Git") &&
+				!opts.ExecutionPolicy.RuntimeCapabilities.FilesystemIsolation {
+				results[index] = deniedToolResult(call, "Read-only shell execution requires filesystem isolation")
+				continue
+			}
+			if identity.Kind != toolExecutorBuiltIn || !readOnlyPolicyAllowsBuiltIn(call.Name, call.Input) {
+				results[index] = deniedToolResult(call, "Read-only execution mode blocks this tool effect")
+				continue
+			}
+		}
 		if opts.ScopeCheck != nil {
 			if allowed, reason := opts.ScopeCheck(call); !allowed {
 				if strings.TrimSpace(reason) == "" {
@@ -144,14 +171,24 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 		if opts.SnapshotDecision != nil {
 			snapshotDecision = opts.SnapshotDecision(call)
 		}
-		permission := ResolvePermission(
+		permission := ResolvePermissionWithPolicy(
 			call.Name,
 			call.Input,
 			opts.WorkDir,
 			opts.PermissionConfig,
 			snapshotDecision,
+			opts.ExecutionPolicy,
 		)
 		emitToolInput(opts.Emit, call, permission.Danger)
+		if permission.Decision != PermissionDeny && opts.InstructionCheck != nil {
+			if allowed, reason := opts.InstructionCheck(call); !allowed {
+				if strings.TrimSpace(reason) == "" {
+					reason = "Applicable project instructions must be reviewed before this tool call"
+				}
+				results[index] = deniedToolResult(call, reason)
+				continue
+			}
+		}
 		var completedApproval approval.Pending
 		switch permission.Decision {
 		case PermissionDeny:
@@ -159,46 +196,44 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 			continue
 		case PermissionApproval:
 			var reason string
-			completedApproval, reason = requestToolApproval(call, permission, opts)
+			completedApproval, reason = requestToolApproval(call, permission, identity, opts)
 			if reason != "" {
 				results[index] = deniedToolResult(call, reason)
 				continue
 			}
 		}
-		// Desktop control always requires an explicit, per-call operator
-		// approval even when a broad automatic permission rule would otherwise
-		// classify the call as allowed.
-		if isHostInteractionTool(call.Name) && completedApproval.ID == "" {
-			var reason string
+		fullMode := opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeFull
+		if fullMode && identity.Kind != toolExecutorBuiltIn &&
+			identity.Kind != toolExecutorMCP && identity.Kind != toolExecutorPlugin {
+			results[index] = deniedToolResult(call, "Full-mode executor identity is unsupported")
+			continue
+		}
+		var fullModeGrant *approval.Pending
+		needsBoundAuthorization := isHostInteractionTool(call.Name) || identity.Kind == toolExecutorPlugin ||
+			(fullMode && identity.Kind != toolExecutorBuiltIn)
+		if needsBoundAuthorization && completedApproval.ID == "" {
+			reason := "Explicit per-call approval required"
+			if fullMode {
+				reason = "Full-mode one-call grant required"
+			}
 			completedApproval, reason = requestToolApproval(call, PermissionResult{
 				Decision: PermissionApproval,
-				Reason:   "Explicit host interaction approval required",
+				Reason:   reason,
 				Danger:   permission.Danger,
-			}, opts)
+			}, identity, opts)
 			if reason != "" {
 				results[index] = deniedToolResult(call, reason)
 				continue
 			}
 		}
-		// Executable plugins are third-party process code. Every individual call
-		// requires an operator round-trip even when permission snapshots or
-		// AutoApprove would otherwise allow it.
-		if identity.Kind == toolExecutorPlugin && completedApproval.ID == "" {
-			var reason string
-			completedApproval, reason = requestToolApproval(call, PermissionResult{
-				Decision: PermissionApproval,
-				Reason:   "Explicit executable plugin approval required",
-				Danger:   permission.Danger,
-			}, opts)
-			if reason != "" {
-				results[index] = deniedToolResult(call, reason)
-				continue
-			}
+		if completedApproval.ApprovalSource == approval.ApprovalSourceUserSelectedFull {
+			grant := completedApproval
+			fullModeGrant = &grant
 		}
 		// An explicit allow-once is a real user decision and therefore starts a
 		// fresh repetition budget. Automatic permission rules never reach this
 		// branch and cannot be used by the model to reset the guard.
-		if completedApproval.ID != "" && opts.RunGuard != nil {
+		if completedApproval.ApprovalSource == approval.ApprovalSourceUser && opts.RunGuard != nil {
 			opts.RunGuard.Reset()
 		}
 		// Project hooks are executable code, not part of authorization. Run
@@ -220,19 +255,18 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 		inputMap := make(map[string]interface{})
 		_ = json.Unmarshal(call.Input, &inputMap)
 		prepared := preparedToolCall{
-			index:      index,
-			tool:       call,
-			concurrent: IsConcurrencySafe(call.Name, inputMap),
+			index:         index,
+			tool:          call,
+			concurrent:    IsConcurrencySafe(call.Name, inputMap),
+			danger:        permission.Danger,
+			fullModeGrant: fullModeGrant,
 		}
 		if isHostInteractionTool(call.Name) {
-			proof, err := mintHostInteractionApproval(
-				completedApproval.ID,
-				opts.SessionID,
-				opts.RunID,
-				call.Name,
-				call.Input,
-				completedApproval.ExpiresAt,
-			)
+			policy := ExecutionPolicySnapshot{}
+			if opts.ExecutionPolicy != nil {
+				policy = *opts.ExecutionPolicy
+			}
+			proof, err := mintHostInteractionApproval(completedApproval, call.ID, call.Input, policy)
 			if err != nil {
 				results[index] = deniedToolResult(call, "Host interaction approval proof could not be created")
 				continue
@@ -240,15 +274,11 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 			prepared.hostApproval = &proof
 		}
 		if identity.Kind == toolExecutorPlugin {
-			proof, err := mintPluginApproval(
-				completedApproval.ID,
-				opts.SessionID,
-				opts.RunID,
-				call.Name,
-				identity.ExecutorID,
-				call.Input,
-				completedApproval.ExpiresAt,
-			)
+			policy := ExecutionPolicySnapshot{}
+			if opts.ExecutionPolicy != nil {
+				policy = *opts.ExecutionPolicy
+			}
+			proof, err := mintPluginApproval(completedApproval, call.ID, call.Input, policy)
 			if err != nil {
 				results[index] = deniedToolResult(call, "Plugin approval proof could not be created")
 				continue
@@ -273,7 +303,7 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 		resultCh := make(chan indexedResult, len(concurrent))
 		for _, prepared := range concurrent {
 			go func(call preparedToolCall) {
-				result := executePreparedToolCall(call.tool, call.hostApproval, call.pluginApproval, opts)
+				result := executePreparedToolCall(call.tool, call.hostApproval, call.pluginApproval, call.fullModeGrant, call.danger, opts)
 				result.Concurrent = true
 				resultCh <- indexedResult{index: call.index, result: result}
 			}(prepared)
@@ -287,6 +317,21 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 	if hasPreparedFileMutations(serial) {
 		fileMutationBatchMu.Lock()
 		defer fileMutationBatchMu.Unlock()
+	}
+	dispatchOptions := opts
+	capturedCheckpointPaths := make([]string, 0, len(serial))
+	capturedCheckpointPathSet := make(map[string]struct{}, len(serial))
+	if opts.BeforeExecute != nil {
+		dispatchOptions.BeforeExecute = func(call toolUseBlock) (toolMutationPreview, error) {
+			preview, err := opts.BeforeExecute(call)
+			if preview.CheckpointCaptured && strings.TrimSpace(preview.File) != "" {
+				if _, seen := capturedCheckpointPathSet[preview.File]; !seen {
+					capturedCheckpointPathSet[preview.File] = struct{}{}
+					capturedCheckpointPaths = append(capturedCheckpointPaths, preview.File)
+				}
+			}
+			return preview, err
+		}
 	}
 	preflightBlocked := preflightFileMutationBatch(serial, opts)
 	journal := make([]committedFileMutation, 0, len(serial))
@@ -328,7 +373,7 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 			}
 		}
 
-		result := executePreparedToolCall(prepared.tool, prepared.hostApproval, prepared.pluginApproval, opts)
+		result := executePreparedToolCall(prepared.tool, prepared.hostApproval, prepared.pluginApproval, prepared.fullModeGrant, prepared.danger, dispatchOptions)
 		results[prepared.index] = result
 		if !isMutation {
 			continue
@@ -367,6 +412,44 @@ func dispatchToolCalls(calls []toolUseBlock, opts toolDispatchOptions) []toolDis
 			PostRevision: postRevision,
 		})
 	}
+	if !mutationBatchFailed && len(journal) > 0 && opts.MutationBatchCommitted != nil {
+		if err := opts.MutationBatchCommitted(append([]committedFileMutation(nil), journal...)); err != nil {
+			mutationBatchFailed = true
+			rollbackErrors := rollbackFileMutationBatch(journal, results, opts.ReadLedger)
+			for _, mutation := range journal {
+				result := &results[mutation.ResultIndex]
+				result.IsError = true
+				if len(rollbackErrors) == 0 {
+					result.Content = "[TRANSACTION ROLLED BACK] The mutation succeeded, but its recovery checkpoint could not be saved; the file was restored."
+					result.Display = result.Content
+				} else {
+					result.Content = "[TRANSACTION INCOMPLETE] The mutation succeeded, its recovery checkpoint could not be saved, and rollback could not safely restore every change"
+					if len(rollbackErrors) > 1 {
+						result.Content += fmt.Sprintf(" (%d rollback conflicts)", len(rollbackErrors))
+					}
+					result.Display = result.Content
+				}
+			}
+		}
+	}
+	if mutationBatchFailed && opts.MutationBatchSettled != nil {
+		if len(capturedCheckpointPaths) > 0 {
+			if err := opts.MutationBatchSettled(capturedCheckpointPaths); err != nil {
+				for _, prepared := range serial {
+					if !isFileMutationTool(prepared.tool.Name) {
+						continue
+					}
+					result := &results[prepared.index]
+					result.IsError = true
+					result.Content = "[TRANSACTION INCOMPLETE] The mutation batch failed and its recovery checkpoint could not be settled safely"
+					if result.Executed && result.Display != "" {
+						result.Content += "; executor result: " + result.Display
+					}
+					result.Display = result.Content
+				}
+			}
+		}
+	}
 	return results
 }
 
@@ -394,6 +477,8 @@ func executePreparedToolCall(
 	call toolUseBlock,
 	hostApproval *hostInteractionApprovalProof,
 	pluginApproval *pluginApprovalProof,
+	fullModeGrant *approval.Pending,
+	danger DangerLevel,
 	opts toolDispatchOptions,
 ) toolDispatchResult {
 	if reason := dispatchContextDenial(opts.Context); reason != "" {
@@ -416,7 +501,11 @@ func executePreparedToolCall(
 
 	var mutation toolMutationPreview
 	if opts.BeforeExecute != nil {
-		mutation = opts.BeforeExecute(call)
+		var err error
+		mutation, err = opts.BeforeExecute(call)
+		if err != nil {
+			return deniedToolResult(call, "File recovery checkpoint could not be prepared")
+		}
 	}
 	// Approval may have completed well before a serial call reaches this point.
 	// Re-check cancellation immediately before invoking the executor so an
@@ -474,6 +563,25 @@ func executePreparedToolCall(
 			// The journal owns its diagnostic details. Never surface an error
 			// that may contain storage paths or other persistence internals.
 			return deniedToolResult(call, "Tool execution journal failed")
+		}
+	}
+	if fullModeGrant != nil {
+		if opts.ExecutionPolicy == nil || opts.ExecutionPolicy.Mode != ExecutionModeFull {
+			return deniedToolResult(call, "Full-mode grant is not valid for this execution policy")
+		}
+		consumer, ok := opts.ApprovalRequester.(approval.FullModeGrantConsumer)
+		if !ok {
+			return deniedToolResult(call, "Full-mode grant consumer is unavailable")
+		}
+		if reason := dispatchContextDenial(opts.Context); reason != "" {
+			return deniedToolResult(call, reason)
+		}
+		if err := validateToolExecutorIdentity(opts.AllowedTools, call.Name); err != nil {
+			return deniedToolResult(call, "Tool executor identity check failed: "+err.Error())
+		}
+		expected := fullModeApprovalDraft(call, identity, danger, opts)
+		if err := consumer.ConsumeFullModeGrant(*fullModeGrant, expected, *opts.ExecutionPolicy); err != nil {
+			return deniedToolResult(call, "Full-mode grant expired or no longer matches this execution")
 		}
 	}
 	if opts.Emit != nil {
@@ -655,6 +763,7 @@ func emitToolInput(emit func(Event), call toolUseBlock, danger DangerLevel) {
 func requestToolApproval(
 	call toolUseBlock,
 	permission PermissionResult,
+	identity toolExecutorIdentity,
 	opts toolDispatchOptions,
 ) (approval.Pending, string) {
 	if opts.ApprovalRequester == nil {
@@ -667,24 +776,24 @@ func requestToolApproval(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	pending, err := opts.ApprovalRequester.Open(approval.Draft{
-		SessionID:       opts.SessionID,
-		RunID:           opts.RunID,
-		ToolCallID:      call.ID,
-		ToolName:        call.Name,
-		RedactedInput:   redactedApprovalInput(call),
-		InputDigest:     toolInputDigest(call),
-		DangerLevel:     string(permission.Danger),
-		Scope:           approvalScope(call),
-		RememberAllowed: false,
-	})
+	draft := fullModeApprovalDraft(call, identity, permission.Danger, opts)
+	fullMode := opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeFull
+	if fullMode && (identity.Kind != toolExecutorBuiltIn || isHostInteractionTool(call.Name)) {
+		issuer, ok := opts.ApprovalRequester.(approval.FullModeIssuer)
+		if !ok {
+			return approval.Pending{}, "Full-mode grant issuer is unavailable"
+		}
+		pending, err := issuer.IssueFullModeGrant(draft, *opts.ExecutionPolicy)
+		if err != nil || !pendingMatchesApprovalDraft(pending, draft, approval.ApprovalSourceUserSelectedFull) {
+			return approval.Pending{}, "Full-mode grant could not be issued for this exact tool call"
+		}
+		return pending, ""
+	}
+	pending, err := opts.ApprovalRequester.Open(draft)
 	if err != nil {
 		return approval.Pending{}, "Approval request could not be opened"
 	}
-	if strings.TrimSpace(pending.ID) == "" || pending.SessionID != opts.SessionID ||
-		pending.RunID != opts.RunID || pending.ToolName != call.Name ||
-		(pending.ToolCallID != "" && pending.ToolCallID != call.ID) ||
-		(pending.InputDigest != "" && pending.InputDigest != toolInputDigest(call)) ||
+	if !pendingMatchesApprovalDraft(pending, draft, approval.ApprovalSourceUser) ||
 		(!pending.ExpiresAt.IsZero() && !pending.ExpiresAt.After(time.Now())) {
 		return approval.Pending{}, "Approval request metadata is invalid"
 	}
@@ -708,6 +817,55 @@ func requestToolApproval(
 		return approval.Pending{}, "Explicit approval was denied or became unavailable"
 	}
 	return pending, ""
+}
+
+func fullModeApprovalDraft(
+	call toolUseBlock,
+	identity toolExecutorIdentity,
+	danger DangerLevel,
+	opts toolDispatchOptions,
+) approval.Draft {
+	draft := approval.Draft{
+		SessionID:       opts.SessionID,
+		SessionRevision: opts.SessionRevision,
+		RunID:           opts.RunID,
+		ToolCallID:      call.ID,
+		ToolName:        call.Name,
+		ExecutorID:      identity.ExecutorID,
+		RedactedInput:   redactedApprovalInput(call),
+		InputDigest:     toolInputDigest(call),
+		DangerLevel:     string(danger),
+		Scope:           approvalScope(call),
+		RememberAllowed: false,
+	}
+	if opts.ExecutionPolicy != nil {
+		draft.ExecutionPolicyRevision = opts.ExecutionPolicy.Revision
+		draft.FullSelectionRevision = opts.ExecutionPolicy.FullSelectionRevision
+	}
+	return draft
+}
+
+func pendingMatchesApprovalDraft(
+	pending approval.Pending,
+	draft approval.Draft,
+	source approval.ApprovalSource,
+) bool {
+	return strings.TrimSpace(pending.ID) != "" &&
+		pending.SessionID == draft.SessionID &&
+		pending.SessionRevision == draft.SessionRevision &&
+		pending.RunID == draft.RunID &&
+		pending.ToolCallID == draft.ToolCallID &&
+		pending.ToolName == draft.ToolName &&
+		pending.ExecutorID == draft.ExecutorID &&
+		pending.RedactedInput == draft.RedactedInput &&
+		pending.InputDigest == draft.InputDigest &&
+		pending.ExecutionPolicyRevision == draft.ExecutionPolicyRevision &&
+		pending.FullSelectionRevision == draft.FullSelectionRevision &&
+		pending.ApprovalSource == source &&
+		pending.DangerLevel == draft.DangerLevel &&
+		pending.Scope == draft.Scope &&
+		pending.RememberAllowed == draft.RememberAllowed &&
+		pending.ExpiresAt.After(time.Now())
 }
 
 func toolInputDigest(call toolUseBlock) string {

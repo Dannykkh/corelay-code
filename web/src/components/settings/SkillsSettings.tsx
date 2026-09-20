@@ -38,6 +38,10 @@ export function SkillsSettings() {
       return counts;
     }, {});
   }, [skills]);
+  const nameCollisions = useMemo(
+    () => skills.filter((skill) => (skill.shadowed?.length ?? 0) > 0),
+    [skills],
+  );
   const lanes = SKILL_LANES.map((lane) => {
     const source = lane.label.toLowerCase();
     return {
@@ -63,6 +67,7 @@ export function SkillsSettings() {
     const lines = [
       `Skills: ${skills.length}`,
       `Sources: ${Object.entries(sourceCounts).map(([source, count]) => `${source}:${count}`).join(", ") || "none"}`,
+      `Name collisions: ${nameCollisions.length}`,
       "Policy: preload only named, allowed skill references",
     ];
 
@@ -171,6 +176,27 @@ export function SkillsSettings() {
           <span className="text-xs text-surface-500">{harness.error || "No skills loaded."}</span>
         )}
       </div>
+
+      {nameCollisions.length > 0 && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mt-4 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-amber-200"
+        >
+          <p className="text-xs font-semibold">Skill names overlap</p>
+          <p className="mt-1 text-xs leading-relaxed text-amber-100/80">
+            Bare slash commands keep the first matching skill. Use a namespace to select another copy.
+          </p>
+          <ul className="mt-2 space-y-1 text-xs">
+            {nameCollisions.map((skill) => (
+              <li key={`${skill.namespace}:${skill.name}`}>
+                <span className="font-mono">/{skill.name}</span> uses {skill.namespace}; other copies: {" "}
+                {skill.shadowed?.map((origin) => `/${origin.namespace}/${origin.name}`).join(", ")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <SettingRow
         label="Skill preload policy"

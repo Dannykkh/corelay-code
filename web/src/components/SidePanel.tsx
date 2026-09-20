@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { fetchJSON, postJSON } from '../lib/api';
 import { getLang } from '../lib/i18n';
 import { listSessions, type SessionSummary } from '../lib/sessions';
 import { showToast } from '../lib/toast';
+import { sameWorkspacePath } from '../lib/workspace';
 
 // parentPath returns the parent of a filesystem path, handling Windows drive
 // roots correctly: `D:/git` -> `D:/`, NOT `D:` (which Windows treats as the
@@ -75,6 +76,7 @@ function FileTreeNode({ node, depth, onFileClick }: { node: TreeNode; depth: num
 interface Props {
   visible: boolean;
   mode: 'files' | 'chat';
+  selectedWorkspace: string;
   onFileClick?: (path: string) => void;
   onSessionClick?: (id: string) => void;
   onNewChat?: () => void;
@@ -87,10 +89,6 @@ interface TreeNode {
   isDir: boolean;
   size?: number;
   children?: TreeNode[];
-}
-
-interface WorkspaceResponse {
-  path?: string;
 }
 
 interface BrowseEntry {
@@ -108,7 +106,7 @@ function errorMessage(err: unknown): string | undefined {
   return err instanceof Error ? err.message : undefined;
 }
 
-export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewChat, onProjectSwitch }: Props) {
+export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSessionClick, onNewChat, onProjectSwitch }: Props) {
   const [sessionSearch, setSessionSearch] = useState('');
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -117,42 +115,57 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
   const [browseEntries, setBrowseEntries] = useState<BrowseEntry[]>([]);
   const [browsePath, setBrowsePath] = useState('');
   const [fileTree, setFileTree] = useState<TreeNode[]>([]);
+  const workspaceRequestRef = useRef(0);
   const ko = getLang() === 'ko';
 
-  const activeProject = projects.find(p => p.active);
+  const activeProject = projects.find(p => sameWorkspacePath(p.path, selectedWorkspace));
 
-  async function loadSessions() {
-    const ws = (await fetchJSON<WorkspaceResponse>('/api/workspace').catch(() => null))?.path;
+  const loadSessions = useCallback(async (workspace: string, requestId: number) => {
+    if (!workspace) {
+      if (workspaceRequestRef.current === requestId) setSessions([]);
+      return;
+    }
     // Backend returns `null` (not `[]`) for a workspace with no sessions;
     // unwrapped that bypasses the [] default and makes render crash on
     // `sessions.length`. Coerce here defensively in addition to the backend fix.
-    listSessions(ws || undefined).then((s) => setSessions(s || [])).catch(() => setSessions([]));
-  }
-
-  async function loadFileTree() {
     try {
-      const data = await fetchJSON<TreeNode[]>('/api/tree');
-      setFileTree(data || []);
-    } catch { setFileTree([]); }
-  }
+      const next = await listSessions(workspace);
+      if (workspaceRequestRef.current === requestId) setSessions(next || []);
+    } catch {
+      if (workspaceRequestRef.current === requestId) setSessions([]);
+    }
+  }, []);
 
-  async function loadProjects() {
+  const loadFileTree = useCallback(async (workspace: string, requestId: number) => {
+    if (!workspace) {
+      if (workspaceRequestRef.current === requestId) setFileTree([]);
+      return;
+    }
+    try {
+      const data = await fetchJSON<TreeNode[]>(`/api/tree?workDir=${encodeURIComponent(workspace)}`);
+      if (workspaceRequestRef.current === requestId) setFileTree(data || []);
+    } catch {
+      if (workspaceRequestRef.current === requestId) setFileTree([]);
+    }
+  }, []);
+
+  const loadWorkspaceData = useCallback((workspace: string) => {
+    const requestId = ++workspaceRequestRef.current;
+    void loadSessions(workspace, requestId);
+    void loadFileTree(workspace, requestId);
+    return requestId;
+  }, [loadSessions, loadFileTree]);
+
+  const loadProjects = useCallback(async () => {
     try {
       const data = await fetchJSON<ProjectInfo[]>('/api/projects');
       setProjects(data);
     } catch { setProjects([]); }
-  }
+  }, []);
 
   async function switchProject(path: string) {
     try {
-      await fetchJSON('/api/workspace', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
       await loadProjects();
-      loadSessions();
-      loadFileTree();
       setShowProjectList(false);
       onProjectSwitch?.(path);
     } catch (e: unknown) {
@@ -164,8 +177,6 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
     try {
       await postJSON('/api/projects', { path });
       await loadProjects();
-      loadSessions();
-      loadFileTree();
       setShowAddProject(false);
       setShowProjectList(false);
       onProjectSwitch?.(path);
@@ -181,6 +192,10 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
     e.stopPropagation();
     await fetchJSON(`/api/projects?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
     await loadProjects();
+    if (sameWorkspacePath(path, selectedWorkspace)) {
+      const fallback = projects.find((project) => !sameWorkspacePath(project.path, path));
+      onProjectSwitch?.(fallback?.path || '');
+    }
   }
 
   async function loadBrowse(path: string) {
@@ -201,14 +216,22 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
     loadBrowse(startPath);
   }
 
-  // Load projects + file tree
+  // Project switching is a client selection. Workspace-scoped views receive
+  // that path explicitly and never change the server's shared default.
   useEffect(() => {
+    queueMicrotask(() => { void loadProjects(); });
+  }, [loadProjects]);
+
+  useEffect(() => {
+    let active = true;
     queueMicrotask(() => {
-      void loadProjects();
-      void loadSessions();
-      void loadFileTree();
+      if (active) loadWorkspaceData(selectedWorkspace);
     });
-  }, []);
+    return () => {
+      active = false;
+      workspaceRequestRef.current += 1;
+    };
+  }, [selectedWorkspace, loadWorkspaceData]);
 
   if (!visible) return null;
 
@@ -255,7 +278,7 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
                   <div className="text-xs font-medium truncate">{p.name}</div>
                   <div className="text-[9px] text-[var(--color-text2)] truncate">{p.path}</div>
                 </div>
-                {p.active && <span className="text-[9px] text-[var(--color-accent)]">●</span>}
+                {sameWorkspacePath(p.path, selectedWorkspace) && <span className="text-[9px] text-[var(--color-accent)]">●</span>}
                 <button
                   onClick={(e) => removeProject(p.path, e)}
                   className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] px-1"
@@ -381,7 +404,7 @@ export function SidePanel({ visible, mode, onFileClick, onSessionClick, onNewCha
                       onClick={async (e) => {
                         e.stopPropagation();
                         await fetchJSON(`/api/sessions/${s.id}`, { method: 'DELETE' });
-                        loadSessions();
+                        loadWorkspaceData(selectedWorkspace);
                       }}
                       className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] opacity-0 group-hover:opacity-100 transition-opacity ml-1 shrink-0"
                       title={ko ? '삭제' : 'Delete'}

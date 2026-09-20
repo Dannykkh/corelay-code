@@ -147,7 +147,7 @@ func TestDurableSessionPreExecutionJournalSurvivesHardProcessExit(t *testing.T) 
 	runCAP033Helper(t, "blocked", stateRoot, workDir, session.ID, interrupted.Revision, counterPath, 0)
 	assertHardCrashCounter(t, counterPath, 1)
 
-	reconciled, err := freshStore.MarkReconciled(session.ID, interrupted.Revision)
+	reconciled, err := reconcileSessionWithReceiptForTest(t, freshStore, session.ID, interrupted.Revision)
 	if err != nil {
 		t.Fatal(err)
 	}

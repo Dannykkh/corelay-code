@@ -36,6 +36,7 @@ var (
 // Executor. There are deliberately no prompt, response, error-message, URL,
 // header, or credential fields in this contract.
 type ProbeObservation struct {
+	LessonDigest   string
 	SchemaVersion  int
 	Success        bool
 	Malformed      bool
@@ -53,6 +54,7 @@ type ProbeObservation struct {
 // ObservationRecord is the persisted, bounded result of one fixed probe
 // attempt.
 type ObservationRecord struct {
+	LessonDigest          string        `json:"lessonDigest,omitempty"`
 	SchemaVersion         int           `json:"schemaVersion"`
 	ObservedSchemaVersion int           `json:"observedSchemaVersion"`
 	CaseID                string        `json:"caseId"`
@@ -110,6 +112,8 @@ type ScoringPolicySnapshot struct {
 }
 
 type ProfileProvenance struct {
+	Lessons          LessonPolicy          `json:"lessons,omitempty"`
+	LessonDigest     string                `json:"lessonDigest,omitempty"`
 	ProfilerVersion  string                `json:"profilerVersion"`
 	PlanVersion      string                `json:"planVersion"`
 	PlanDigest       string                `json:"planDigest"`
@@ -283,12 +287,23 @@ func validateProfileSnapshot(snapshot ProfileSnapshot) error {
 		return fmt.Errorf("%w: duplicate or unordered quarantine reasons", ErrInvalidProfile)
 	}
 	for _, observation := range snapshot.Observations {
+		if observation.LessonDigest != "" && !validDigest(observation.LessonDigest) {
+			return fmt.Errorf("%w: invalid lesson evidence", ErrInvalidProfile)
+		}
+		if snapshot.Provenance.LessonDigest != "" && observation.LessonDigest != snapshot.Provenance.LessonDigest {
+			return fmt.Errorf("%w: lesson execution evidence mismatch", ErrInvalidProfile)
+		}
 		if err := validateObservationRecord(observation); err != nil {
 			return err
 		}
 	}
 	if len(snapshot.Observations) > snapshot.Provenance.ExpectedAttempts {
 		return fmt.Errorf("%w: observation count exceeds plan", ErrInvalidProfile)
+	}
+	if !snapshot.Provenance.Lessons.Valid() ||
+		(snapshot.Provenance.Lessons != 0 && snapshot.Provenance.LessonDigest == "") ||
+		(snapshot.Provenance.LessonDigest != "" && snapshot.Provenance.LessonDigest != snapshot.Provenance.Lessons.Digest()) {
+		return fmt.Errorf("%w: invalid lesson policy", ErrInvalidProfile)
 	}
 	if err := validateObservationSet(snapshot.Observations); err != nil {
 		return err

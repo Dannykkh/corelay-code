@@ -62,7 +62,7 @@ func TestDurableExecutionJournalSameRunParallelIsPersistedAndIdempotent(t *testi
 
 	// Same-run idempotency is conditional on the exact marker still being on
 	// disk. Clearing it behind this live run makes the next tool fail closed.
-	if _, err := store.MarkReconciled(session.ID, persisted.Revision); err != nil {
+	if _, err := reconcileSessionWithReceiptForTest(t, store, session.ID, persisted.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if err := run.JournalToolExecution(agent.ToolExecutionJournalEntry{

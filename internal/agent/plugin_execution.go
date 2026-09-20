@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
@@ -36,6 +37,7 @@ const (
 type PluginExecutionOptions struct {
 	Runner           sandbox.Runner
 	Policy           sandbox.Policy
+	ExecutionPolicy  executionpolicy.Snapshot
 	Workspace        string
 	Timeout          time.Duration
 	OutputLimitBytes int64
@@ -46,18 +48,19 @@ type PluginExecutionOptions struct {
 // intentionally excludes executable paths, arguments, input, environment and
 // captured process output.
 type PluginExecutionReport struct {
-	Plugin           string               `json:"plugin"`
-	Tool             string               `json:"tool"`
-	ExecutorID       string               `json:"executorId"`
-	Runner           string               `json:"runner"`
-	Started          bool                 `json:"started"`
-	ExitCode         int                  `json:"exitCode"`
-	TimedOut         bool                 `json:"timedOut,omitempty"`
-	OutputTruncated  bool                 `json:"outputTruncated,omitempty"`
-	Failure          sandbox.FailureCode  `json:"failure,omitempty"`
-	AppliedIsolation sandbox.Capabilities `json:"appliedIsolation"`
-	DurationMillis   int64                `json:"durationMillis"`
-	Detail           string               `json:"detail,omitempty"`
+	Plugin           string                   `json:"plugin"`
+	Tool             string                   `json:"tool"`
+	ExecutorID       string                   `json:"executorId"`
+	ExecutionPolicy  executionpolicy.Snapshot `json:"executionPolicy"`
+	Runner           string                   `json:"runner"`
+	Started          bool                     `json:"started"`
+	ExitCode         int                      `json:"exitCode"`
+	TimedOut         bool                     `json:"timedOut,omitempty"`
+	OutputTruncated  bool                     `json:"outputTruncated,omitempty"`
+	Failure          sandbox.FailureCode      `json:"failure,omitempty"`
+	AppliedIsolation sandbox.Capabilities     `json:"appliedIsolation"`
+	DurationMillis   int64                    `json:"durationMillis"`
+	Detail           string                   `json:"detail,omitempty"`
 }
 
 type pluginToolRuntimeMetadata struct {
@@ -82,27 +85,29 @@ type pluginExecutorBinding struct {
 	runnerName       string
 	runnerCaps       sandbox.Capabilities
 	policy           sandbox.Policy
+	executionPolicy  executionpolicy.Snapshot
 	timeout          time.Duration
 	outputLimit      int64
 	observe          func(PluginExecutionReport)
 }
 
 type pluginExecutorContentDescriptor struct {
-	Protocol         string               `json:"protocol"`
-	PluginName       string               `json:"plugin_name"`
-	PluginVersion    string               `json:"plugin_version"`
-	ToolName         string               `json:"tool_name"`
-	SchemaDigest     string               `json:"schema_digest"`
-	ManifestDigest   string               `json:"manifest_digest"`
-	Executable       string               `json:"executable"`
-	ExecutableDigest string               `json:"executable_digest"`
-	ExecutableSize   int64                `json:"executable_size"`
-	Args             []string             `json:"args"`
-	RunnerName       string               `json:"runner_name"`
-	RunnerCaps       sandbox.Capabilities `json:"runner_capabilities"`
-	Policy           sandbox.Policy       `json:"policy"`
-	TimeoutNanos     int64                `json:"timeout_nanos"`
-	OutputLimit      int64                `json:"output_limit"`
+	Protocol         string                   `json:"protocol"`
+	PluginName       string                   `json:"plugin_name"`
+	PluginVersion    string                   `json:"plugin_version"`
+	ToolName         string                   `json:"tool_name"`
+	SchemaDigest     string                   `json:"schema_digest"`
+	ManifestDigest   string                   `json:"manifest_digest"`
+	Executable       string                   `json:"executable"`
+	ExecutableDigest string                   `json:"executable_digest"`
+	ExecutableSize   int64                    `json:"executable_size"`
+	Args             []string                 `json:"args"`
+	RunnerName       string                   `json:"runner_name"`
+	RunnerCaps       sandbox.Capabilities     `json:"runner_capabilities"`
+	Policy           sandbox.Policy           `json:"policy"`
+	ExecutionPolicy  executionpolicy.Snapshot `json:"execution_policy"`
+	TimeoutNanos     int64                    `json:"timeout_nanos"`
+	OutputLimit      int64                    `json:"output_limit"`
 }
 
 // LoadExecutablePluginTools is the narrow composition helper for callers that
@@ -120,7 +125,7 @@ func resolveRunPluginToolDefs(
 	workDir string,
 	runRunner sandbox.Runner,
 ) ([]types.ToolDef, error) {
-	if opts.DisablePlugins || opts.PluginDirs != nil && len(opts.PluginDirs) == 0 {
+	if opts.DisablePlugins || opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeReadOnly || opts.PluginDirs != nil && len(opts.PluginDirs) == 0 {
 		return nil, nil
 	}
 	directories := opts.PluginDirs
@@ -128,6 +133,13 @@ func resolveRunPluginToolDefs(
 		directories = DefaultPluginDirs(workDir)
 	}
 	execution := PluginExecutionOptions{Runner: runRunner, Workspace: workDir}
+	if opts.ExecutionPolicy != nil {
+		execution.ExecutionPolicy = *opts.ExecutionPolicy
+		if opts.ExecutionPolicy.Mode == ExecutionModeFull {
+			execution.Runner = sandbox.NewUnconfinedRunner()
+			execution.Policy = sandbox.Policy{Enforcement: sandbox.EnforcementDisabled}
+		}
+	}
 	if opts.PluginExecution != nil {
 		execution = *opts.PluginExecution
 		if execution.Runner == nil {
@@ -135,6 +147,9 @@ func resolveRunPluginToolDefs(
 		}
 		if strings.TrimSpace(execution.Workspace) == "" {
 			execution.Workspace = workDir
+		}
+		if opts.ExecutionPolicy != nil {
+			execution.ExecutionPolicy = *opts.ExecutionPolicy
 		}
 	}
 	return LoadExecutablePluginTools(append([]string(nil), directories...), execution)
@@ -215,42 +230,58 @@ func normalizePluginExecutionOptions(options PluginExecutionOptions) (PluginExec
 	}
 
 	policy := options.Policy
-	if policy.Enforcement == "" {
-		policy.Enforcement = sandbox.EnforcementRequired
-	}
-	if policy.Enforcement != sandbox.EnforcementRequired {
-		return PluginExecutionOptions{}, errors.New("plugin sandbox enforcement must be required")
-	}
-	if policy.Workspace == "" {
-		policy.Workspace = canonical
+	fullMode := options.ExecutionPolicy.Mode == ExecutionModeFull
+	if fullMode {
+		if _, ok := options.Runner.(*sandbox.UnconfinedRunner); !ok || policy.Enforcement != sandbox.EnforcementDisabled {
+			return PluginExecutionOptions{}, errors.New("full-mode plugins require the explicit unconfined runner")
+		}
+		if policy.Workspace != "" || policy.WorkspaceAccess != sandbox.WorkspaceAccessUnspecified || policy.Network != sandbox.NetworkAccessUnspecified {
+			return PluginExecutionOptions{}, errors.New("full-mode plugin policy cannot claim workspace or network isolation")
+		}
 	} else {
-		policyWorkspace, err := canonicalWorkspace(policy.Workspace)
-		if err != nil {
-			return PluginExecutionOptions{}, fmt.Errorf("plugin policy workspace: %w", err)
+		if policy.Enforcement == "" {
+			policy.Enforcement = sandbox.EnforcementRequired
 		}
-		if !sameCanonicalPath(policyWorkspace, canonical) {
-			return PluginExecutionOptions{}, errors.New("plugin workspace does not match sandbox policy workspace")
+		if policy.Enforcement != sandbox.EnforcementRequired {
+			return PluginExecutionOptions{}, errors.New("plugin sandbox enforcement must be required")
 		}
-		policy.Workspace = policyWorkspace
+		if policy.Workspace == "" {
+			policy.Workspace = canonical
+		} else {
+			policyWorkspace, err := canonicalWorkspace(policy.Workspace)
+			if err != nil {
+				return PluginExecutionOptions{}, fmt.Errorf("plugin policy workspace: %w", err)
+			}
+			if !sameCanonicalPath(policyWorkspace, canonical) {
+				return PluginExecutionOptions{}, errors.New("plugin workspace does not match sandbox policy workspace")
+			}
+			policy.Workspace = policyWorkspace
+		}
+		if policy.WorkspaceAccess == sandbox.WorkspaceAccessUnspecified {
+			policy.WorkspaceAccess = sandbox.WorkspaceReadOnly
+		}
+		if policy.WorkspaceAccess != sandbox.WorkspaceReadOnly && policy.WorkspaceAccess != sandbox.WorkspaceReadWrite {
+			return PluginExecutionOptions{}, errors.New("plugin sandbox requires explicit read_only or read_write workspace access")
+		}
+		if policy.Network == sandbox.NetworkAccessUnspecified {
+			policy.Network = sandbox.NetworkDenied
+		}
+		if policy.Network != sandbox.NetworkDenied {
+			return PluginExecutionOptions{}, errors.New("plugin sandbox network access must be denied")
+		}
+		policy.Required.FilesystemIsolation = true
+		policy.Required.NetworkIsolation = true
+		policy.Required.EnvironmentFiltering = true
+		policy.Required.Timeouts = true
+		policy.Required.ProcessTreeKill = true
 	}
-	if policy.WorkspaceAccess == sandbox.WorkspaceAccessUnspecified {
-		policy.WorkspaceAccess = sandbox.WorkspaceReadOnly
-	}
-	if policy.WorkspaceAccess != sandbox.WorkspaceReadOnly && policy.WorkspaceAccess != sandbox.WorkspaceReadWrite {
-		return PluginExecutionOptions{}, errors.New("plugin sandbox requires explicit read_only or read_write workspace access")
-	}
-	if policy.Network == sandbox.NetworkAccessUnspecified {
-		policy.Network = sandbox.NetworkDenied
-	}
-	if policy.Network != sandbox.NetworkDenied {
-		return PluginExecutionOptions{}, errors.New("plugin sandbox network access must be denied")
-	}
-	policy.Required.FilesystemIsolation = true
-	policy.Required.NetworkIsolation = true
-	policy.Required.EnvironmentFiltering = true
-	policy.Required.Timeouts = true
-	policy.Required.ProcessTreeKill = true
 	capabilities := options.Runner.Capabilities()
+	if options.ExecutionPolicy.Mode != "" {
+		if err := executionpolicy.ValidateSnapshot(options.ExecutionPolicy); err != nil {
+			return PluginExecutionOptions{}, fmt.Errorf("invalid plugin execution policy: %w", err)
+		}
+		options.ExecutionPolicy.RuntimeCapabilities = capabilities
+	}
 	if err := sandbox.ValidatePolicy(policy, capabilities); err != nil {
 		return PluginExecutionOptions{}, fmt.Errorf("plugin sandbox cannot satisfy secure policy: %w", err)
 	}
@@ -298,6 +329,7 @@ func buildPluginExecutorBinding(plugin Plugin, tool PluginTool, options PluginEx
 		runnerName:       options.Runner.Name(),
 		runnerCaps:       options.Runner.Capabilities(),
 		policy:           options.Policy,
+		executionPolicy:  options.ExecutionPolicy,
 		timeout:          options.Timeout,
 		outputLimit:      options.OutputLimitBytes,
 		observe:          options.ObserveReport,
@@ -329,6 +361,7 @@ func pluginExecutorIDForProtocol(binding pluginExecutorBinding, protocol string)
 		RunnerName:       binding.runnerName,
 		RunnerCaps:       binding.runnerCaps,
 		Policy:           binding.policy,
+		ExecutionPolicy:  binding.executionPolicy,
 		TimeoutNanos:     int64(binding.timeout),
 		OutputLimit:      binding.outputLimit,
 	}
@@ -534,13 +567,15 @@ func executeBoundPluginTool(
 	if err := sandbox.ValidatePolicy(binding.policy, binding.runner.Capabilities()); err != nil {
 		return "[PLUGIN BLOCKED] secure sandbox is unavailable: " + sanitizeReceiptString(err.Error()), true
 	}
-	if err := validatePluginApproval(
+	if err := validatePluginApprovalBound(
 		opts.pluginApproval,
 		name,
 		identity.ExecutorID,
 		input,
 		opts.ExpectedSessionID,
 		opts.ExpectedRunID,
+		opts.ToolCallID,
+		opts.ExecutionPolicy,
 	); err != nil {
 		return "[PLUGIN BLOCKED] explicit per-call approval is required: " + sanitizeReceiptString(err.Error()), true
 	}
@@ -612,6 +647,7 @@ func safePluginExecutionReport(binding pluginExecutorBinding, result sandbox.Res
 		Plugin:           sanitizeReceiptString(binding.pluginName),
 		Tool:             sanitizeReceiptString(binding.toolName),
 		ExecutorID:       binding.executorID,
+		ExecutionPolicy:  binding.executionPolicy,
 		Runner:           sanitizeReceiptString(report.Runner),
 		Started:          result.Started,
 		ExitCode:         result.ExitCode,

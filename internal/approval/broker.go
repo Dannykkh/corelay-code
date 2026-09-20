@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 )
 
 const (
@@ -19,14 +22,15 @@ const (
 )
 
 var (
-	ErrInvalidDraft     = errors.New("invalid approval draft")
-	ErrInvalidDecision  = errors.New("invalid approval decision")
-	ErrApprovalNotFound = errors.New("approval not found")
-	ErrAlreadyResolved  = errors.New("approval already resolved")
-	ErrApprovalExpired  = errors.New("approval expired")
-	ErrSessionCanceled  = errors.New("approval session canceled")
-	ErrBrokerClosed     = errors.New("approval broker closed")
-	ErrIDCollision      = errors.New("approval id collision")
+	ErrInvalidDraft         = errors.New("invalid approval draft")
+	ErrInvalidDecision      = errors.New("invalid approval decision")
+	ErrApprovalNotFound     = errors.New("approval not found")
+	ErrAlreadyResolved      = errors.New("approval already resolved")
+	ErrApprovalExpired      = errors.New("approval expired")
+	ErrSessionCanceled      = errors.New("approval session canceled")
+	ErrBrokerClosed         = errors.New("approval broker closed")
+	ErrIDCollision          = errors.New("approval id collision")
+	ErrInvalidFullModeGrant = errors.New("invalid full-mode grant")
 )
 
 type request struct {
@@ -37,18 +41,27 @@ type request struct {
 	timer      *time.Timer
 }
 
+type fullModeGrant struct {
+	pending Pending
+	policy  executionpolicy.Snapshot
+	timer   *time.Timer
+}
+
 // Broker coordinates one-time approval requests. State is process-local and
 // bounded by TTL; the broker performs no filesystem or external persistence.
 type Broker struct {
 	mu               sync.Mutex
 	ttl              time.Duration
 	requests         map[string]*request
+	fullModeGrants   map[string]*fullModeGrant
 	canceledSessions map[string]struct{}
 	closed           bool
 	idGenerator      func() (string, error)
 }
 
 var _ Requester = (*Broker)(nil)
+var _ FullModeIssuer = (*Broker)(nil)
+var _ FullModeGrantConsumer = (*Broker)(nil)
 
 // NewBroker creates a broker. A non-positive ttl selects DefaultTTL.
 func NewBroker(ttl time.Duration) *Broker {
@@ -58,6 +71,7 @@ func NewBroker(ttl time.Duration) *Broker {
 	return &Broker{
 		ttl:              ttl,
 		requests:         make(map[string]*request),
+		fullModeGrants:   make(map[string]*fullModeGrant),
 		canceledSessions: make(map[string]struct{}),
 		idGenerator:      generateID,
 	}
@@ -84,19 +98,23 @@ func (b *Broker) Open(draft Draft) (Pending, error) {
 	}
 	now := time.Now()
 	pending := Pending{
-		ID:              id,
-		SessionID:       draft.SessionID,
-		SessionRevision: draft.SessionRevision,
-		RunID:           draft.RunID,
-		ToolCallID:      draft.ToolCallID,
-		ToolName:        draft.ToolName,
-		RedactedInput:   draft.RedactedInput,
-		InputDigest:     draft.InputDigest,
-		DangerLevel:     draft.DangerLevel,
-		Scope:           draft.Scope,
-		RememberAllowed: draft.RememberAllowed,
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(b.ttl),
+		ID:                      id,
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		ApprovalSource:          ApprovalSourceUser,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		RememberAllowed:         draft.RememberAllowed,
+		CreatedAt:               now,
+		ExpiresAt:               now.Add(b.ttl),
 	}
 	entry := &request{pending: pending, done: make(chan struct{})}
 	b.requests[id] = entry
@@ -104,6 +122,189 @@ func (b *Broker) Open(draft Draft) (Pending, error) {
 		b.expire(id, entry)
 	})
 	return pending, nil
+}
+
+// IssueFullModeGrant creates an internal one-time authorization without
+// opening a user-facing approval request. The selected policy and exact call
+// identity are stored in the broker and must be presented unchanged to the
+// consumer before execution.
+func (b *Broker) IssueFullModeGrant(
+	draft Draft,
+	policy executionpolicy.Snapshot,
+) (Pending, error) {
+	if err := validateFullModePolicy(policy); err != nil {
+		return Pending{}, err
+	}
+	if err := validateFullModeDraft(draft, policy); err != nil {
+		return Pending{}, err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return Pending{}, ErrBrokerClosed
+	}
+	if _, canceled := b.canceledSessions[draft.SessionID]; canceled {
+		return Pending{}, ErrSessionCanceled
+	}
+
+	id, err := b.allocateIDLocked()
+	if err != nil {
+		return Pending{}, err
+	}
+	now := time.Now()
+	pending := Pending{
+		ID:                      id,
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		ApprovalSource:          ApprovalSourceUserSelectedFull,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		RememberAllowed:         false,
+		CreatedAt:               now,
+		ExpiresAt:               now.Add(b.ttl),
+	}
+	entry := &fullModeGrant{pending: pending, policy: policy}
+	b.fullModeGrants[id] = entry
+	entry.timer = time.AfterFunc(b.ttl, func() {
+		b.expireFullModeGrant(id, entry)
+	})
+	return pending, nil
+}
+
+// ConsumeFullModeGrant verifies every stored call and policy field before
+// atomically deleting the one-time grant. A mismatch leaves the valid grant
+// available for the exact intended invocation; expiry, cancellation, replay,
+// and broker shutdown all fail closed.
+func (b *Broker) ConsumeFullModeGrant(
+	grant Pending,
+	expected Draft,
+	policy executionpolicy.Snapshot,
+) error {
+	if err := validateFullModePolicy(policy); err != nil {
+		return err
+	}
+	if err := validateFullModeDraft(expected, policy); err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return ErrBrokerClosed
+	}
+	entry, ok := b.fullModeGrants[grant.ID]
+	if !ok || grant.ID == "" {
+		return ErrApprovalNotFound
+	}
+	if _, canceled := b.canceledSessions[expected.SessionID]; canceled {
+		delete(b.fullModeGrants, grant.ID)
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		return ErrSessionCanceled
+	}
+	if !time.Now().Before(entry.pending.ExpiresAt) {
+		delete(b.fullModeGrants, grant.ID)
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		return ErrApprovalExpired
+	}
+	if !sameFullModePending(grant, entry.pending) ||
+		!fullModeDraftMatchesPending(expected, entry.pending) ||
+		policy != entry.policy {
+		return ErrInvalidFullModeGrant
+	}
+	delete(b.fullModeGrants, grant.ID)
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+	return nil
+}
+
+func validateFullModePolicy(policy executionpolicy.Snapshot) error {
+	if err := executionpolicy.ValidateSnapshot(policy); err != nil || policy.Mode != executionpolicy.ModeFull ||
+		policy.FullSelectionRevision == 0 {
+		return ErrInvalidFullModeGrant
+	}
+	switch policy.Source {
+	case executionpolicy.SourceUserSelected:
+		if policy.FullSelectionRevision != policy.Revision {
+			return ErrInvalidFullModeGrant
+		}
+	case executionpolicy.SourceInherited, executionpolicy.SourceChildRestriction:
+		// A child may inherit only a full authority that has explicit selected
+		// provenance in its validated parent snapshot.
+		if policy.ParentRevision != policy.Revision {
+			return ErrInvalidFullModeGrant
+		}
+	default:
+		return ErrInvalidFullModeGrant
+	}
+	return nil
+}
+
+func validateFullModeDraft(draft Draft, policy executionpolicy.Snapshot) error {
+	if validateDraft(draft) != nil ||
+		strings.TrimSpace(draft.ToolCallID) == "" ||
+		strings.TrimSpace(draft.ExecutorID) == "" ||
+		!validFullModeInputDigest(draft.InputDigest) ||
+		draft.ExecutionPolicyRevision != policy.Revision ||
+		draft.FullSelectionRevision != policy.FullSelectionRevision ||
+		draft.RememberAllowed {
+		return ErrInvalidFullModeGrant
+	}
+	return nil
+}
+
+func validFullModeInputDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, "sha256:")
+	if len(encoded) != 64 || strings.ToLower(encoded) != encoded {
+		return false
+	}
+	_, err := hex.DecodeString(encoded)
+	return err == nil
+}
+
+func fullModeDraftMatchesPending(draft Draft, pending Pending) bool {
+	return draft.SessionID == pending.SessionID &&
+		draft.SessionRevision == pending.SessionRevision &&
+		draft.RunID == pending.RunID &&
+		draft.ToolCallID == pending.ToolCallID &&
+		draft.ToolName == pending.ToolName &&
+		draft.ExecutorID == pending.ExecutorID &&
+		draft.RedactedInput == pending.RedactedInput &&
+		draft.InputDigest == pending.InputDigest &&
+		draft.ExecutionPolicyRevision == pending.ExecutionPolicyRevision &&
+		draft.FullSelectionRevision == pending.FullSelectionRevision &&
+		draft.DangerLevel == pending.DangerLevel &&
+		draft.Scope == pending.Scope &&
+		!draft.RememberAllowed && !pending.RememberAllowed
+}
+
+func sameFullModePending(left, right Pending) bool {
+	leftCreatedAt, rightCreatedAt := left.CreatedAt, right.CreatedAt
+	leftExpiresAt, rightExpiresAt := left.ExpiresAt, right.ExpiresAt
+	left.CreatedAt = time.Time{}
+	right.CreatedAt = time.Time{}
+	left.ExpiresAt = time.Time{}
+	right.ExpiresAt = time.Time{}
+	if left != right {
+		return false
+	}
+	return leftCreatedAt.Equal(rightCreatedAt) && leftExpiresAt.Equal(rightExpiresAt)
 }
 
 // Await waits for a terminal resolution. Context cancellation atomically
@@ -191,6 +392,14 @@ func (b *Broker) CancelSession(sessionID string) {
 			resolveLocked(entry, OutcomeDeny, ReasonSessionCanceled)
 		}
 	}
+	for id, grant := range b.fullModeGrants {
+		if grant.pending.SessionID == sessionID {
+			delete(b.fullModeGrants, id)
+			if grant.timer != nil {
+				grant.timer.Stop()
+			}
+		}
+	}
 }
 
 // Shutdown idempotently denies all pending requests and releases broker-owned
@@ -211,6 +420,12 @@ func (b *Broker) Shutdown() {
 		}
 	}
 	b.requests = nil
+	for _, grant := range b.fullModeGrants {
+		if grant.timer != nil {
+			grant.timer.Stop()
+		}
+	}
+	b.fullModeGrants = nil
 }
 
 func validateDraft(draft Draft) error {
@@ -252,11 +467,24 @@ func (b *Broker) allocateIDLocked() (string, error) {
 		if id == "" {
 			return "", fmt.Errorf("generate approval id: empty id")
 		}
-		if _, exists := b.requests[id]; !exists {
+		_, existsRequest := b.requests[id]
+		_, existsGrant := b.fullModeGrants[id]
+		if !existsRequest && !existsGrant {
 			return id, nil
 		}
 	}
 	return "", ErrIDCollision
+}
+
+func (b *Broker) expireFullModeGrant(id string, expected *fullModeGrant) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	if grant, ok := b.fullModeGrants[id]; ok && grant == expected {
+		delete(b.fullModeGrants, id)
+	}
 }
 
 func resolveLocked(entry *request, outcome Outcome, reason ResolutionReason) Resolution {

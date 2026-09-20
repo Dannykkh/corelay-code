@@ -42,7 +42,8 @@ type PlanModeStep struct {
 	Status      string   `json:"status"` // pending, in_progress, completed
 }
 
-// PlanModeManager manages the plan mode lifecycle.
+// Deprecated: PlanModeManager is not connected to the runtime. Durable plan
+// ownership belongs to the revisioned Workstream Plan store.
 type PlanModeManager struct {
 	current *PlanMode
 	workDir string
@@ -162,7 +163,7 @@ func (pm *PlanModeManager) IsToolAllowed(toolName string) (bool, string) {
 	// In explore/design phase: only read-only tools
 	if pm.current.State == PlanModeExplore || pm.current.State == PlanModeDesign {
 		readOnly := map[string]bool{
-			"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true,
+			"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true, "LSP": true,
 			"Bash":  false, // bash needs further check
 			"Write": false, "Edit": false,
 		}

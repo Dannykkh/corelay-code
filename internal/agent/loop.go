@@ -49,6 +49,10 @@ func isLocalProvider(name string) bool {
 // config (readOnlyExploreRounds).
 const defaultReadOnlyExploreRounds = 5
 
+// defaultReadOnlyContinuationRounds permits targeted reads after the initial
+// exploration budget, while keeping the final answer boundary finite.
+const defaultReadOnlyContinuationRounds = 2
+
 // Read-only exploration is weighted by what the model actually consumed:
 // content reads advance the budget faster than navigation, so listing
 // directories doesn't burn the rounds a model needs to read real content.
@@ -59,7 +63,9 @@ const (
 
 // isNavTool reports whether a tool only navigates (lists/finds) rather than
 // reading file content.
-func isNavTool(name string) bool { return name == "LS" || name == "Glob" || name == "RepoMap" }
+func isNavTool(name string) bool {
+	return name == "LS" || name == "Glob" || name == "RepoMap" || name == "LSP"
+}
 
 // iterationWeight scores one tool-using round for the read-only budget: a round
 // that called any content tool counts full; a navigation-only round counts half.
@@ -75,8 +81,8 @@ func iterationWeight(toolUses []toolUseBlock) float64 {
 // planModeTools is the read-only tool surface allowed in plan mode: the agent
 // explores but cannot change anything, so it produces a plan instead of acting.
 var planModeTools = map[string]bool{
-	"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true,
-	loadToolResultToolName: true, reportCompletionToolName: true,
+	"Read": true, "Glob": true, "Grep": true, "LS": true, "RepoMap": true, "LSP": true,
+	loadToolResultToolName: true, loadSkillToolName: true, reportCompletionToolName: true,
 }
 
 // filterReadOnlyTools keeps only the read-only tools used by plan mode.
@@ -270,11 +276,12 @@ The ONLY way to change the filesystem, run code, or inspect the project is to em
 - Prefer acting over explaining. Make the tool call first; keep any prose short. After tools report success, give a brief confirmation of what the tools actually did.
 - If a task needs several steps, call tools across multiple turns until it is genuinely done.
 
-## Tools: Bash, Read, Write, Edit, Glob, Grep, Git, LS, RepoMap, WebSearch, WebFetch, WebResearch, TaskCreate/Update/List, NotebookRead/Edit, Screenshot, MouseClick, TypeText, OpenApp, FileManager, Clipboard
+## Tools: Bash, Read, Write, Edit, Glob, Grep, Git, LS, RepoMap, LSP, WebSearch, WebFetch, WebResearch, TaskCreate/Update/List, NotebookRead/Edit, Screenshot, MouseClick, TypeText, OpenApp, FileManager, Clipboard
 
 ## Rules
 - To create a new file, call Write. To change an existing file, Read it first, then call Edit.
 - Use RepoMap for a bounded structural overview and Glob/Grep to find files instead of guessing paths
+- Use LSP for semantic Go definition/references/diagnostics when its configured gopls executable is available; RepoMap output is structural only
 - Run tests after changes when possible
 - For git: use Git tool (not Bash)
 - Keep changes minimal and focused
@@ -565,21 +572,128 @@ func RunLoop(
 	RunLoopWithOptions(ctx, provider, model, userMessages, workDir, RunOptions{ResponseLang: responseLang}, eventCh)
 }
 
-// isExplicitUndoRequest defines the consent boundary for /undo. Only an exact
+type undoRequestMode uint8
+
+const (
+	undoRequestAll undoRequestMode = iota
+	undoRequestList
+	undoRequestSelected
+)
+
+type undoRequest struct {
+	mode undoRequestMode
+	ids  []string
+}
+
+func parseUndoCommand(command string) (undoRequest, bool, error) {
+	command = strings.TrimSpace(command)
+	if !strings.EqualFold(command, "/undo") {
+		if len(command) < len("/undo") || !strings.EqualFold(command[:len("/undo")], "/undo") ||
+			(command[len("/undo")] != ' ' && command[len("/undo")] != '\t') {
+			return undoRequest{}, false, nil
+		}
+	}
+	if strings.EqualFold(command, "/undo") {
+		return undoRequest{mode: undoRequestAll}, true, nil
+	}
+	args := strings.Fields(strings.TrimSpace(command[len("/undo"):]))
+	if len(args) == 0 {
+		return undoRequest{mode: undoRequestAll}, true, nil
+	}
+	switch strings.ToLower(args[0]) {
+	case "--list":
+		if len(args) != 1 {
+			return undoRequest{}, true, errors.New("usage: /undo --list")
+		}
+		return undoRequest{mode: undoRequestList}, true, nil
+	case "--select":
+		if len(args) < 2 {
+			return undoRequest{}, true, errors.New("usage: /undo --select <id> [id ...]")
+		}
+		seen := make(map[string]struct{}, len(args)-1)
+		ids := make([]string, 0, len(args)-1)
+		for _, id := range args[1:] {
+			if len(id) != 12 {
+				return undoRequest{}, true, errors.New("checkpoint entry IDs must be 12 lowercase hexadecimal characters")
+			}
+			for _, char := range id {
+				if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+					return undoRequest{}, true, errors.New("checkpoint entry IDs must be 12 lowercase hexadecimal characters")
+				}
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return undoRequest{}, true, fmt.Errorf("checkpoint entry ID %q was selected more than once", id)
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		return undoRequest{mode: undoRequestSelected, ids: ids}, true, nil
+	default:
+		if strings.HasPrefix(args[0], "--") {
+			return undoRequest{}, true, errors.New("usage: /undo, /undo --list, or /undo --select <id> [id ...]")
+		}
+		return undoRequest{}, false, nil
+	}
+}
+
+// explicitUndoRequest defines the consent boundary for /undo. Only a parsed
 // top-level role=user slash command qualifies. Team workers are excluded
 // because their role=user prompt is generated by the orchestrator/model, and
 // assistant or tool-result messages cannot trigger this pre-loop branch.
-func isExplicitUndoRequest(messages []types.Message, opts RunOptions) bool {
+func explicitUndoRequest(messages []types.Message, opts RunOptions) (undoRequest, bool, error) {
 	if len(messages) == 0 || strings.TrimSpace(opts.WorkerID) != "" || opts.RunMode != nil {
-		return false
+		return undoRequest{}, false, nil
 	}
 	lastMessage := messages[len(messages)-1]
 	if lastMessage.Role != "user" {
-		return false
+		return undoRequest{}, false, nil
 	}
 	var command string
-	return json.Unmarshal(lastMessage.Content, &command) == nil &&
-		strings.EqualFold(strings.TrimSpace(command), "/undo")
+	if json.Unmarshal(lastMessage.Content, &command) != nil {
+		return undoRequest{}, false, nil
+	}
+	return parseUndoCommand(command)
+}
+
+func isExplicitUndoRequest(messages []types.Message, opts RunOptions) bool {
+	_, explicit, _ := explicitUndoRequest(messages, opts)
+	return explicit
+}
+
+func formatUndoPreview(previews []undoPreview) string {
+	if len(previews) == 0 {
+		return "되돌릴 변경이 없습니다."
+	}
+	var output strings.Builder
+	output.WriteString("체크포인트 파일 목록:\n")
+	for _, preview := range previews {
+		status := "충돌: 파일이 달라짐"
+		switch preview.Status {
+		case undoEntryRestorable:
+			status = "복원 가능"
+		case undoEntryAlreadyRestored:
+			status = "이미 원본 상태"
+		case undoEntryExternalBlocked:
+			status = "외부 파일: 현재 전체 권한 필요"
+		case undoEntryUnavailable:
+			status = "복원 불가: 체크포인트 항목 확인 필요"
+		}
+		fmt.Fprintf(&output, "- [%s] %s — %s\n", status, preview.ID, preview.Path)
+	}
+	output.WriteString("선택 복원: /undo --select <id> [id ...]")
+	return output.String()
+}
+
+func undoPreviewPayload(previews []undoPreview) []map[string]string {
+	entries := make([]map[string]string, 0, len(previews))
+	for _, preview := range previews {
+		entries = append(entries, map[string]string{
+			"id":     preview.ID,
+			"path":   preview.Path,
+			"status": string(preview.Status),
+		})
+	}
+	return entries
 }
 
 func RunLoopWithOptions(
@@ -593,10 +707,111 @@ func RunLoopWithOptions(
 ) {
 	terminal := newRunTerminalFinalizer(eventCh, opts.Recorder)
 	defer terminal.Finalize()
+	var imageInputCapability types.ImageInputCapability
+	imageInputCapabilityResolved := false
+	resolveImageInputCapability := func() types.ImageInputCapability {
+		if !imageInputCapabilityResolved {
+			imageInputCapability = ResolveModelImageInputCapability(provider, model)
+			imageInputCapabilityResolved = true
+		}
+		return imageInputCapability
+	}
+	if MessagesContainImageInput(userMessages) {
+		imageErr := ValidateImageInputCapability(resolveImageInputCapability(), true)
+		if imageErr != nil {
+			terminal.Fail(RunTerminalFailed, imageErr.Code(), imageErr.Error(), nil)
+			eventCh <- Event{Type: "error", Data: imageErr.Error()}
+			return
+		}
+	}
+
+	cfg, _, configErr := config.LoadChecked()
+	if configErr != nil {
+		message := "Configuration failed: run cannot load workspace skill policy"
+		terminal.Fail(RunTerminalFailed, "skill_configuration_invalid", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	skillSettings, skillSettingsErr := config.ResolveSkillSettings(cfg, workDir)
+	if skillSettingsErr != nil {
+		message := "Skill configuration failed: run cannot resolve the workspace skill policy"
+		terminal.Fail(RunTerminalFailed, "skill_configuration_invalid", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	if source := config.NormalizeSkillSource(opts.SkillSource); source != "" {
+		if !config.ValidSkillSource(source) {
+			message := "Skill configuration failed: run has an invalid skill source"
+			terminal.Fail(RunTerminalFailed, "skill_configuration_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		skillSettings.Source = source
+	}
+	if opts.SkillDirs != nil {
+		skillSettings.Dirs = cloneStringsPreserveNil(opts.SkillDirs)
+	}
+	if opts.ProjectSkillDirs != nil {
+		skillSettings.ProjectDirs = cloneStringsPreserveNil(opts.ProjectSkillDirs)
+	}
+	opts.SkillSource = skillSettings.Source
+	opts.SkillDirs = cloneStringsPreserveNil(skillSettings.Dirs)
+	opts.ProjectSkillDirs = cloneStringsPreserveNil(skillSettings.ProjectDirs)
+	if opts.ExecutionPolicy != nil && opts.ExecutionPolicyRequest != nil {
+		message := "Execution policy configuration failed: run cannot combine a resolved policy with a new request"
+		terminal.Fail(RunTerminalFailed, "execution_policy_invalid", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	var executionPolicy ExecutionPolicySnapshot
+	if opts.ExecutionPolicy != nil {
+		executionPolicy = *opts.ExecutionPolicy
+		if err := ValidateExecutionPolicySnapshot(executionPolicy); err != nil {
+			message := "Execution policy configuration failed: invalid inherited policy"
+			terminal.Fail(RunTerminalFailed, "execution_policy_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+	} else {
+		request := ExecutionPolicyRequest{}
+		if opts.ExecutionPolicyRequest != nil {
+			request = *opts.ExecutionPolicyRequest
+		}
+		var err error
+		// "moderate" is the existing kernel default permission threshold. It
+		// migrates to workspace authority and never implies unrestricted access.
+		executionPolicy, err = ResolveExecutionPolicy(request, "moderate", sandbox.Capabilities{})
+		if err != nil {
+			message := "Execution policy configuration failed: " + err.Error()
+			terminal.Fail(RunTerminalFailed, "execution_policy_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+	}
+	opts.ExecutionPolicy = &executionPolicy
 
 	responseLang := opts.ResponseLang
 	if responseLang == "" {
 		responseLang = "auto"
+	}
+	checkpointSession := strings.TrimSpace(opts.DurableSessionID)
+	if opts.CheckpointScope != nil {
+		owner := opts.CheckpointScope.ownerSnapshot()
+		if !owner.valid() || (checkpointSession != "" && owner.SessionID != checkpointSession) ||
+			owner.SessionRevision != opts.SessionRevision {
+			message := "Checkpoint scope is invalid or belongs to a different session revision"
+			terminal.Fail(RunTerminalFailed, "checkpoint_scope_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		checkpointSession = owner.SessionID
+	} else if checkpointSession == "" {
+		// Ephemeral callers still get a private checkpoint namespace. A later
+		// request should provide DurableSessionID to address the same undo scope.
+		checkpointSession = strings.TrimSpace(opts.SessionID)
+		if checkpointSession == "" {
+			checkpointSession = "ephemeral-" + newActiveRunID()
+		}
 	}
 
 	messages := make([]types.Message, len(userMessages))
@@ -606,20 +821,61 @@ func RunLoopWithOptions(
 	// /undo is an explicit user-consent command. It is handled before any model
 	// call, but only after the role/worker boundary above has rejected messages
 	// that a model, tool result, or team orchestrator could have produced.
-	if isExplicitUndoRequest(messages, opts) {
-		reverted, ok, err := undoCheckpointSecure(workDir)
+	undo, explicitUndo, undoParseErr := explicitUndoRequest(messages, opts)
+	if explicitUndo && undo.mode != undoRequestList && opts.ExecutionPolicy.Mode == ExecutionModeReadOnly {
+		message := "Read-only execution mode blocks /undo"
+		eventCh <- Event{Type: "blocked", Data: message}
+		terminal.Fail(RunTerminalFailed, "execution_policy_blocked", message, nil)
+		return
+	}
+	if explicitUndo {
+		if undoParseErr != nil {
+			eventCh <- Event{Type: "text", Data: undoParseErr.Error()}
+			terminal.Complete(RunTerminalCommand, "undo_usage", RunTerminalDurableNone, nil, RunSummary{})
+			return
+		}
+		if undo.mode == undoRequestList {
+			previews, err := inspectCheckpointUndo(workDir, checkpointSession, opts.ExecutionPolicy)
+			if err != nil {
+				eventCh <- Event{Type: "text", Data: "안전하게 체크포인트를 확인하지 못했습니다: " + err.Error()}
+				eventCh <- Event{Type: "undo_preview", Data: map[string]any{"entries": []map[string]string{}, "error": err.Error()}}
+			} else {
+				eventCh <- Event{Type: "undo_preview", Data: map[string]any{"entries": undoPreviewPayload(previews)}}
+				eventCh <- Event{Type: "text", Data: formatUndoPreview(previews)}
+			}
+			terminal.Complete(RunTerminalCommand, "undo_list", RunTerminalDurableNone, nil, RunSummary{})
+			return
+		}
+		reverted, previews, ok, err := undoCheckpointSelectedWithPolicy(workDir, checkpointSession, opts.ExecutionPolicy, undo.ids)
+		undoResult := map[string]any{
+			"ok":       ok,
+			"reverted": reverted,
+			"entries":  undoPreviewPayload(previews),
+		}
 		if err != nil {
+			undoResult["error"] = err.Error()
 			log.Printf("[Agent] /undo safety validation failed: %v", err)
 			if ok {
 				eventCh <- Event{Type: "text", Data: "되돌렸지만 체크포인트 정리에 실패했습니다:\n- " + strings.Join(reverted, "\n- ")}
 			} else {
-				eventCh <- Event{Type: "text", Data: "안전 검증에 실패하여 변경을 되돌리지 않았습니다."}
+				eventCh <- Event{Type: "text", Data: "안전하게 복원하지 않았습니다: " + err.Error()}
 			}
 		} else if ok {
 			eventCh <- Event{Type: "text", Data: "되돌렸습니다:\n- " + strings.Join(reverted, "\n- ")}
+			if undo.mode == undoRequestSelected {
+				remaining, listErr := inspectCheckpointUndo(workDir, checkpointSession, opts.ExecutionPolicy)
+				if listErr == nil && len(remaining) > 0 {
+					eventCh <- Event{Type: "text", Data: "남은 체크포인트:\n" + formatUndoPreview(remaining)}
+				}
+			}
 		} else {
-			eventCh <- Event{Type: "text", Data: "되돌릴 변경이 없습니다."}
+			if len(previews) > 0 {
+				eventCh <- Event{Type: "text", Data: "대상 파일은 이미 원본 상태입니다. 체크포인트를 정리했습니다."}
+			} else {
+				eventCh <- Event{Type: "text", Data: "되돌릴 변경이 없습니다."}
+			}
 		}
+		eventCh <- Event{Type: "undo_result", Data: undoResult}
 		terminal.Complete(
 			RunTerminalCommand,
 			"undo",
@@ -630,7 +886,6 @@ func RunLoopWithOptions(
 		return
 	}
 
-	cfg := config.Load()
 	runHarness, err := resolveRunHarnessWithCapability(
 		provider,
 		model,
@@ -647,6 +902,21 @@ func RunLoopWithOptions(
 		return
 	}
 	compiledHarness := runHarness.Profile
+	if opts.PlanBinding != nil {
+		if opts.PlanAnchor == nil || !opts.PlanAnchor.Valid() {
+			message := "Plan-bound execution requires an immutable PlanAnchor"
+			terminal.Fail(RunTerminalFailed, "plan_binding_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+		compiledHarness, err = compiledHarness.WithPlanAnchorMode(harness.PlanAnchorStrict)
+		if err != nil {
+			message := "Plan-bound completion policy could not be resolved"
+			terminal.Fail(RunTerminalFailed, "plan_binding_policy_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+	}
 	runModeSystemSuffix, err := resolveRunMode(opts.RunMode)
 	if err != nil {
 		message := "Run mode resolution failed: " + err.Error()
@@ -668,6 +938,10 @@ func RunLoopWithOptions(
 		eventCh <- Event{Type: "error", Data: message}
 		return
 	}
+	// Replace any caller-claimed capability values with facts from this run's
+	// actual executor. The selected mode and provenance remain immutable.
+	executionPolicy.RuntimeCapabilities = sandboxRunner.Capabilities()
+	opts.ExecutionPolicy = &executionPolicy
 	planAnchorPrompt, err := renderRunPlanAnchor(compiledHarness, opts.PlanAnchor)
 	if err != nil {
 		message := "PlanAnchor resolution failed: " + err.Error()
@@ -676,6 +950,10 @@ func RunLoopWithOptions(
 		return
 	}
 	activeRunID := newActiveRunID()
+	checkpointScope := opts.CheckpointScope
+	if checkpointScope == nil {
+		checkpointScope = newCheckpointScope(newCheckpointOwner(checkpointSession, opts.SessionRevision, activeRunID))
+	}
 	evidence := NewEvidenceLedger(lastUserText(userMessages), opts.EvidencePolicy)
 	completionContract, err := newRunCompletionContract(
 		compiledHarness,
@@ -707,9 +985,30 @@ func RunLoopWithOptions(
 	// process-global client registry participates in this composition.
 	mcpConfigDetected := false
 	mcpExecution := DefaultMCPExecutionOptions(ctx, workDir)
+	if opts.ExecutionPolicy.Mode == ExecutionModeFull {
+		mcpExecution = FullModeMCPExecutionOptions(ctx, *opts.ExecutionPolicy)
+	}
 	if opts.MCPExecution != nil {
 		mcpExecution = *opts.MCPExecution
 		mcpExecution.Context = ctx
+	}
+	if opts.ExecutionPolicy.Mode == ExecutionModeFull {
+		if _, ok := mcpExecution.Runner.(*processsupervisor.HostRunner); !ok ||
+			mcpExecution.Policy.Enforcement != sandbox.EnforcementDisabled {
+			message := "Full-mode MCP execution requires the explicit host runner and disabled isolation policy"
+			terminal.Fail(RunTerminalFailed, "mcp_execution_policy_invalid", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
+	} else if mcpExecution.Policy.Enforcement == sandbox.EnforcementDisabled {
+		message := "Disabled MCP host execution requires explicit full mode"
+		terminal.Fail(RunTerminalFailed, "mcp_execution_policy_invalid", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
+	mcpExecution.ExecutionPolicy = *opts.ExecutionPolicy
+	if mcpExecution.Runner != nil {
+		mcpExecution.ExecutionPolicy.RuntimeCapabilities = mcpExecution.Runner.Capabilities()
 	}
 	var mcpReportsMu sync.Mutex
 	var mcpReports []processsupervisor.Report
@@ -725,6 +1024,13 @@ func RunLoopWithOptions(
 		eventCh <- Event{Type: "mcp_process", Data: report}
 	}
 	var runMCP = opts.MCPRuntime
+	if opts.ExecutionPolicy.Mode == ExecutionModeReadOnly {
+		// MCP executors have no trustworthy read-only effect contract. Do not
+		// start or advertise them in a read-only run, including borrowed runtimes.
+		runMCP = nil
+		opts.MCPServers = []MCPServerSpec{}
+		opts.DisableWorkspaceMCP = true
+	}
 	ownedRunMCP := false
 	mcpGeneration := ""
 	var mcpServers []MCPServerSpec
@@ -739,7 +1045,7 @@ func RunLoopWithOptions(
 		mcpConfigDetected = true
 	} else {
 		var configured bool
-		mcpServers, configured, mcpErr = resolveRunMCPServerSpecs(opts, workDir)
+		mcpServers, configured, mcpErr = resolveRunMCPServerSpecs(opts, workDir, cfg.MCPConfigPaths)
 		mcpConfigDetected = configured
 		if mcpErr != nil {
 			message := "MCP configuration failed: " + mcpErr.Error()
@@ -749,6 +1055,13 @@ func RunLoopWithOptions(
 		}
 	}
 	if runMCP == nil && len(mcpServers) > 0 {
+		if opts.ExecutionPolicy.Mode == ExecutionModeWorkspace &&
+			(mcpExecution.Runner == nil || !mcpExecution.Runner.Capabilities().FilesystemIsolation) {
+			message := "Workspace MCP execution requires filesystem isolation; select full mode or configure an isolating MCP runner"
+			terminal.Fail(RunTerminalFailed, "mcp_workspace_isolation_unavailable", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
 		factory := opts.MCPRuntimeFactory
 		if factory == nil {
 			factory = NewMCPRuntime
@@ -763,6 +1076,22 @@ func RunLoopWithOptions(
 			return
 		}
 		ownedRunMCP = true
+	}
+	if runMCP != nil && runMCP.ServerCount() > 0 && opts.ExecutionPolicy.Mode == ExecutionModeWorkspace {
+		requiresIsolation := true
+		if scope, ok := runMCP.(MCPRuntimeFilesystemIsolationProvider); ok {
+			requiresIsolation = scope.RequiresFilesystemIsolation()
+		}
+		capabilityProvider, ok := runMCP.(MCPRuntimeExecutionCapabilityProvider)
+		if requiresIsolation && (!ok || !capabilityProvider.ExecutionCapabilities().FilesystemIsolation) {
+			if ownedRunMCP {
+				runMCP.Close()
+			}
+			message := "Workspace MCP runtime cannot prove filesystem isolation"
+			terminal.Fail(RunTerminalFailed, "mcp_workspace_isolation_unavailable", message, nil)
+			eventCh <- Event{Type: "error", Data: message}
+			return
+		}
 	}
 	if runMCP != nil {
 		if !runMCP.Healthy() {
@@ -794,11 +1123,34 @@ func RunLoopWithOptions(
 		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Connected to %d MCP servers", runMCP.ServerCount())}
 	}
 
+	skills := SkillDescriptorRoots(workDir, opts.SkillSource, opts.ProjectSkillDirs, opts.SkillDirs)
+	skillCandidates := []SkillDescriptor(nil)
+	explicitSkillSelection := false
+	if IsSlashCommand(lastUserText(messages)) {
+		commandToken, _ := slashCommandToken(strings.TrimSpace(lastUserText(messages)))
+		if strings.Contains(commandToken, "/") || !isBuiltInSlashCommand(commandToken) {
+			if selected, ok := selectSkillDescriptor(commandToken, skills); ok {
+				skillCandidates = []SkillDescriptor{selected}
+				explicitSkillSelection = true
+			}
+		}
+	} else {
+		skillCandidates = relevantSkillCandidates(lastUserText(messages), skills)
+	}
+	skillUsage := &skillUsageRecorder{}
+	skillBodyReader := newSkillBodyReaderWithUsage(skillCandidates, skills, skillUsage)
 	baseTools := staticToolDefsWithResultReader(workDir, opts.ToolResultReader)
+	if len(skillCandidates) > 0 {
+		baseTools = append(baseTools, skillLoadToolDefinition())
+	}
 	if runMCP != nil {
 		baseTools = append(baseTools, runMCP.ToolDefs()...)
 	}
-	pluginTools, pluginErr := resolveRunPluginToolDefs(opts, workDir, sandboxRunner)
+	var pluginTools []types.ToolDef
+	var pluginErr error
+	if opts.ExecutionPolicy.Mode != ExecutionModeReadOnly {
+		pluginTools, pluginErr = resolveRunPluginToolDefs(opts, workDir, sandboxRunner)
+	}
 	if pluginErr != nil {
 		detail := sanitizeSnapshotText(pluginErr.Error(), 1000)
 		if explicitRunPluginConfiguration(opts) {
@@ -825,7 +1177,15 @@ func RunLoopWithOptions(
 	// Plugin definitions enter the same immutable catalog, pruning and routing
 	// pipeline as built-ins and MCP. No parallel plugin-only loop exists.
 	tools := applyEditPolicyToToolDefs(baseTools, compiledHarness.EditPolicy())
+	imageReadSink, imageErr := newImageReadPayloadSink(messages)
+	if imageErr != nil {
+		message := "Image input validation failed: " + imageErr.Error()
+		terminal.Fail(RunTerminalFailed, "invalid_image_input", message, nil)
+		eventCh <- Event{Type: "error", Data: message}
+		return
+	}
 	toolExecOptions := ToolExecutionOptions{
+		ExecutionPolicy:            opts.ExecutionPolicy,
 		WorkerID:                   opts.WorkerID,
 		OwnershipChecker:           opts.OwnershipChecker,
 		ExpectedSessionID:          opts.SessionID,
@@ -835,8 +1195,10 @@ func RunLoopWithOptions(
 		SandboxPolicy:              sandboxPolicy,
 		EditPolicy:                 compiledHarness.EditPolicy(),
 		ToolResultReader:           opts.ToolResultReader,
+		SkillBodyReader:            skillBodyReader,
 		CompletionContract:         completionContract,
 		CompletionEvidenceResolver: evidence.ResolveCompletionEvidence,
+		imageReadSink:              imageReadSink,
 	}
 	var sandboxReports sync.Map
 	var sandboxRecordsMu sync.Mutex
@@ -852,13 +1214,16 @@ func RunLoopWithOptions(
 	if interactiveDirectives && len(messages) > 0 {
 		var last string
 		if json.Unmarshal(messages[len(messages)-1].Content, &last) == nil {
-			if trimmed := strings.TrimSpace(last); strings.HasPrefix(strings.ToLower(trimmed), "/plan") {
-				planMode = true
-				planTask = strings.TrimSpace(trimmed[len("/plan"):])
-				if planTask == "" {
-					planTask = "Plan the requested work."
+			if IsSlashCommand(last) {
+				commandToken, cmdArgs := slashCommandToken(strings.TrimSpace(last))
+				if strings.EqualFold(commandToken, "plan") {
+					planMode = true
+					planTask = cmdArgs
+					if planTask == "" {
+						planTask = "Plan the requested work."
+					}
+					messages[len(messages)-1] = types.Message{Role: "user", Content: mustJSON(planTask)}
 				}
-				messages[len(messages)-1] = types.Message{Role: "user", Content: mustJSON(planTask)}
 			}
 		}
 	}
@@ -922,11 +1287,15 @@ func RunLoopWithOptions(
 	if toolBudget > 0 {
 		var dropped int
 		var pruneErr error
+		requiredToolNames := completionRequiredToolNames(completionContract)
+		if explicitSkillSelection {
+			requiredToolNames = append(requiredToolNames, loadSkillToolName)
+		}
 		tools, dropped, pruneErr = pruneToolsPreservingRequired(
 			tools,
 			lastUserText(messages),
 			toolBudget,
-			completionRequiredToolNames(completionContract),
+			requiredToolNames,
 		)
 		if pruneErr != nil {
 			message := "Tool budget construction failed: " + sanitizeSnapshotText(pruneErr.Error(), 1000)
@@ -936,6 +1305,20 @@ func RunLoopWithOptions(
 		}
 		if dropped > 0 {
 			log.Printf("[Agent] tool budget %d: kept %d, dropped %d (provider=%s)", toolBudget, len(tools), dropped, provider.Name())
+		}
+		if len(skillCandidates) > 0 {
+			loaderAvailable := false
+			for _, tool := range tools {
+				if tool.Name == loadSkillToolName {
+					loaderAvailable = true
+					break
+				}
+			}
+			if !loaderAvailable {
+				skillCandidates = nil
+				skillBodyReader = newSkillBodyReader(nil)
+				toolExecOptions.SkillBodyReader = skillBodyReader
+			}
 		}
 	}
 	routing, err := newToolRoutingState(compiledHarness, tools, lastUserText(messages))
@@ -1021,7 +1404,13 @@ func RunLoopWithOptions(
 	// ── Hook system: load from project + skill source ──
 	hookRegistry := opts.HookRegistry
 	if hookRegistry == nil {
-		hookRegistry = hooks.NewRegistry()
+		hookRegistry = hooks.NewRegistryWithOptions(hooks.RegistryOptions{
+			Runner:          sandboxRunner,
+			Policy:          sandboxPolicy,
+			ExecutionPolicy: *opts.ExecutionPolicy,
+		})
+	} else {
+		hookRegistry.SetExecutionPolicy(*opts.ExecutionPolicy)
 	}
 	_ = hookRegistry.Load(workDir, "") // "" = all sources; failures remain quarantined
 	var hookResultsMu sync.Mutex
@@ -1059,7 +1448,7 @@ func RunLoopWithOptions(
 
 	// ── Permission snapshot (immutable for this session) ──
 	permissions := hooks.CapturePermissions(workDir)
-	readLedger := NewReadLedger(workDir)
+	readLedger := NewReadLedger(workDir, opts.ExecutionPolicy.Mode == ExecutionModeFull)
 	runGuard := NewRunGuard(compiledHarness.RepeatLimit())
 
 	// ── Detect project type ──
@@ -1069,7 +1458,7 @@ func RunLoopWithOptions(
 
 	// ── Load project context (CLAUDE.md, AGENTS.md, skills) ──
 	projectCtx := LoadProjectContext(workDir)
-	skills := LoadSkills(workDir)
+	nestedInstructionDisclosure := newProjectInstructionDisclosure()
 
 	// ── Long-term memory: load index + top relevant entries for this turn ──
 	// Computed once before the iteration loop — the snippet only depends
@@ -1087,7 +1476,7 @@ func RunLoopWithOptions(
 		var lastText string
 		json.Unmarshal(lastMsg.Content, &lastText)
 		if IsSlashCommand(lastText) {
-			processed, err := ProcessSlashCommand(lastText, skills)
+			processed, err := ProcessSkillSlashCommandWithReader(lastText, skills, skillBodyReader)
 			if err != nil {
 				terminal.Fail(RunTerminalFailed, "slash_command_failed", err.Error(), nil)
 				eventCh <- Event{Type: "error", Data: err.Error()}
@@ -1109,7 +1498,8 @@ func RunLoopWithOptions(
 				eventCh <- Event{Type: "status", Data: "Compressing context..."}
 			}
 			// /help → return directly, no LLM needed
-			if strings.HasPrefix(lastText, "/help") {
+			commandToken, _ := slashCommandToken(lastText)
+			if strings.EqualFold(commandToken, "help") {
 				eventCh <- Event{Type: "text", Data: processed}
 				terminal.Complete(
 					RunTerminalCommand,
@@ -1129,27 +1519,17 @@ func RunLoopWithOptions(
 		}
 	}
 
-	// Mention skills as a single pointer line — do NOT enumerate them and do
-	// NOT inline their content. Two separate failures were observed driving an
-	// open model (Qwen3 via Ollama/SGLang) and confirmed by replaying captured
-	// requests directly against the backend:
-	//   1. Inlining every SKILL.md balloons the prompt to ~700KB (~180K tokens),
-	//      overflowing a local model's ~32K context so it loses the task/tools.
-	//   2. Even a compact name+description index of ~100 skills SUPPRESSES tool
-	//      calling: the model reads the list as a menu and answers with prose
-	//      ("here is the code…") instead of emitting a tool_use — and then
-	//      hallucinates that it created the file. Dropping the enumeration and
-	//      keeping a one-line pointer restores reliable tool calls.
-	// Skills stay fully usable: the user invokes one with /<name> and
-	// ProcessSlashCommand (above) expands its full prompt before the LLM runs,
-	// so the model never needs to see the catalog to use it.
-	skillText := ""
+	// Never inline the full catalog or all bodies. The descriptor shortlist is
+	// limited to positive matches for the current request; only an explicit
+	// slash selection or LoadSkill call reads a single selected body. This keeps
+	// irrelevant skill menus away from local models whose tool calling degrades
+	// when the system prompt enumerates the whole catalog.
+	skillText := renderSkillPrompt(skills, skillCandidates)
 	if len(skills) > 0 {
-		skillText = fmt.Sprintf("\n\n## Skills\n%d task skills are available; the user invokes one by typing /<name>. Skills are not tools — never try to call them. Just do the work with the tools above.", len(skills))
 		eventCh <- Event{Type: "status", Data: fmt.Sprintf("Loaded %d skills", len(skills))}
 	}
 	if projectCtx != "" {
-		eventCh <- Event{Type: "status", Data: "Project context loaded (CLAUDE.md)"}
+		eventCh <- Event{Type: "status", Data: "Project instruction context loaded"}
 	}
 	if mcpConfigDetected {
 		eventCh <- Event{Type: "status", Data: "MCP config detected"}
@@ -1166,14 +1546,15 @@ func RunLoopWithOptions(
 	// a model that lists a lot still gets enough rounds to read real content
 	// before being forced to answer.
 	var exploreScore float64
+	var continuationScore float64
+	readOnlyCheckpointed := false
 
 	// Auto-verify state: whether the model edited any file this session, and how
 	// many times we've already asked it to fix failing tests.
 	didEdit := false
 	verifyAttempts := 0
-	checkpointStarted := false // clear the undo buffer on this turn's first edit
-	var editedFiles []string   // files changed this session, for the completion summary
-	testResult := ""           // auto-verify outcome for the summary ("passed"/"failed"/"")
+	var editedFiles []string // files changed this session, for the completion summary
+	testResult := ""         // auto-verify outcome for the summary ("passed"/"failed"/"")
 	recoverySnapshot := func() *RunGuardSnapshot {
 		snapshot := runGuard.Snapshot()
 		if snapshot.Denied == 0 {
@@ -1195,8 +1576,10 @@ func RunLoopWithOptions(
 			PlanMode:     planMode,
 			Iterations:   iterations,
 			EditedFiles:  uniqueStrings(editedFiles),
+			Skills:       skillUsage.snapshot(),
 			Verification: verification,
 			Recovery:     recovery,
+			PlanBinding:  opts.PlanBinding,
 		}
 		path, receiptErr := terminal.WriteReceipt(workDir, receipt)
 		if receiptErr != nil {
@@ -1211,6 +1594,11 @@ func RunLoopWithOptions(
 		projectCtx +
 		skillText
 	systemCoreSuffix := workstreamContext
+	lessons := opts.EvaluatedLessons
+	if opts.CapabilityProfile != nil && opts.HarnessProfile == nil {
+		lessons = opts.CapabilityProfile.LessonsFor(provider.Name(), model, time.Now())
+	}
+	systemCoreSuffix += lessons.Prompt()
 	if runModeSystemSuffix != "" {
 		systemCoreSuffix += "\n\n" + runModeSystemSuffix
 	}
@@ -1232,40 +1620,80 @@ func RunLoopWithOptions(
 	runModeTotalTools := 0
 	runModeEstimatedTokens := 0
 	for i := 0; i < maxIterations; i++ {
-		// ── Read-only over-exploration guard ──
-		// Once a pure question has explored enough rounds, collapse the
-		// tool_use/tool_result history into a single "here is what I read"
-		// message and drop tools. Removing the tool-call pattern is essential:
-		// local models (qwen3-coder via Ollama) keep emitting tool calls that the
-		// backend parses even when the tools field is empty, as long as the
-		// conversation still shows the pattern. With a clean digest + no tools the
-		// model answers in text and the loop ends — instead of crawling the whole
-		// tree to the iteration cap and returning "Max iterations reached" with no
-		// answer. Edit/action tasks are exempt (readOnly is false for them).
+		// ── Read-only exploration boundary ──
+		// The first weighted budget is a checkpoint, not an immediate stop. Fold
+		// the transcript into a clean evidence digest, then allow only a small
+		// bounded number of targeted, read-only follow-ups. At the hard boundary,
+		// retain the checkpoint plus follow-up evidence, remove exploration tools,
+		// and ask for a partial answer with an explicit stop reason.
 		if readOnly && exploreScore >= float64(readOnlyRounds) {
-			digest := flattenToolResults(messages)
-			if len(digest) > 12000 {
-				digest = digest[:12000] + "\n…(truncated)"
+			if !readOnlyCheckpointed {
+				digest := flattenToolResults(messages)
+				if len(digest) > 12000 {
+					digest = digest[:12000] + "\n…(truncated)"
+				}
+				collapseQuestion := lastUserText(userMessages)
+				collapseClosing := fmt.Sprintf(
+					"\n\nThe initial weighted exploration budget is reached. You may use up to %d additional weighted read-only rounds only if a material unresolved fact needs a specific source. If no important evidence gap remains, answer now. If the additional budget ends, give the best partial answer supported by the gathered sources, name what remains unverified, and say the bounded read budget ended; the user may ask for a targeted follow-up.",
+					defaultReadOnlyContinuationRounds,
+				)
+				if planMode {
+					collapseQuestion = planTask
+					collapseClosing = fmt.Sprintf(
+						"\n\nThe initial weighted exploration budget is reached. You may use up to %d additional weighted read-only rounds only if a material unresolved fact needs a specific source. If no important evidence gap remains, produce the step-by-step implementation plan now. If the additional budget ends, provide the best plan supported by gathered sources, name the missing evidence, and state that the bounded read budget ended. Do NOT make changes.",
+						defaultReadOnlyContinuationRounds,
+					)
+				}
+				collapsed := renderRecentUserInstructions(userMessages, collapseQuestion) +
+					"\n\n## Context I gathered from the codebase\n" + digest +
+					collapseClosing + langReminder(responseLang)
+				messages = []types.Message{{Role: "user", Content: mustJSON(collapsed)}}
+				routeRestricted := routing.restrictToReadOnly()
+				tools, err = pinCompletionControlTool(routing.tools(), completionContract)
+				if err != nil {
+					message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
+					terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				if routeRestricted && compiledHarness.ToolRouting() != harness.ToolRoutingDirect {
+					record := routing.record()
+					record.Exposed = len(tools)
+					eventCh <- Event{Type: "tool_route", Data: record}
+				}
+				readOnlyCheckpointed = true
+				eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+					"Read-only question — initial weighted budget reached (%.1f); up to %d additional weighted rounds are available for material evidence gaps.",
+					exploreScore, defaultReadOnlyContinuationRounds,
+				)}
+			} else if continuationScore >= float64(defaultReadOnlyContinuationRounds) {
+				basePrompt := lastUserText(messages)
+				digest := flattenToolResults(messages)
+				if len(digest) > 12000 {
+					digest = digest[:12000] + "\n…(truncated)"
+				}
+				if digest != "" {
+					basePrompt += "\n\n## Additional evidence from bounded follow-up reads\n" + digest
+				}
+				if planMode {
+					basePrompt += "\n\nThe bounded read-only continuation budget is exhausted. Provide the best implementation plan supported by this evidence, name any unresolved source or uncertainty, and state that the read budget ended. Do NOT make changes."
+				} else {
+					basePrompt += "\n\nThe bounded read-only continuation budget is exhausted. Give the best partial answer supported by this evidence, name what remains uncertain or unverified, and explicitly state that the read budget ended. The user may ask for another targeted read."
+				}
+				messages = []types.Message{{Role: "user", Content: mustJSON(basePrompt + langReminder(responseLang))}}
+				tools, err = pinCompletionControlTool(nil, completionContract)
+				if err != nil {
+					message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
+					terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
+					eventCh <- Event{Type: "error", Data: message}
+					return
+				}
+				readOnly = false
+				eventCh <- Event{Type: "status", Data: fmt.Sprintf(
+					"Read-only exploration stopped: the initial budget plus %.1f weighted follow-up rounds are exhausted; answer partially and name the unresolved evidence.",
+					continuationScore,
+				)}
 			}
-			collapseQuestion := lastUserText(userMessages)
-			collapseClosing := "\n\nAnswer the question above directly and concisely from this context. Do not request any more files."
-			if planMode {
-				collapseQuestion = planTask
-				collapseClosing = "\n\nNow produce the step-by-step implementation plan from this context (which files to change and what to do in each). Do NOT make changes; do not request more files."
-			}
-			collapsed := collapseQuestion +
-				"\n\n## Context I gathered from the codebase\n" + digest +
-				collapseClosing + langReminder(responseLang)
-			messages = []types.Message{{Role: "user", Content: mustJSON(collapsed)}}
-			tools, err = pinCompletionControlTool(nil, completionContract)
-			if err != nil {
-				message := "Tool catalog construction failed: " + sanitizeSnapshotText(err.Error(), 1000)
-				terminal.Fail(RunTerminalFailed, "tool_catalog_failed", message, nil)
-				eventCh <- Event{Type: "error", Data: message}
-				return
-			}
-			readOnly = false // collapse once; the next pass produces the answer
-			eventCh <- Event{Type: "status", Data: fmt.Sprintf("Read-only question — explored %d rounds, answering now", i)}
 		}
 
 		// Normalize before planning so the estimate describes the exact message
@@ -1283,7 +1711,7 @@ func RunLoopWithOptions(
 				}
 			}
 			if lastUser != "" {
-				ragResults := RAGSearch(workDir, lastUser, 3)
+				ragResults := RAGSearch(workDir, lastUser, 3, SkillIndexExclusionPaths(workDir, opts.ProjectSkillDirs, opts.SkillDirs)...)
 				ragContext = FormatRAGContext(ragResults)
 			}
 		}
@@ -1364,10 +1792,12 @@ func RunLoopWithOptions(
 				planningInput,
 				planned,
 				CompactionState{
-					Objective:   lastUserText(userMessages),
-					PlanAnchor:  opts.PlanAnchor,
-					EditedFiles: uniqueStrings(editedFiles),
-					Evidence:    evidence,
+					Objective:        lastUserText(userMessages),
+					PlanAnchor:       opts.PlanAnchor,
+					EditedFiles:      uniqueStrings(editedFiles),
+					Evidence:         evidence,
+					UserInstructions: userInstructionTexts(userMessages),
+					Context:          compactionContextForRun(opts.CompactionContext, opts.PlanBinding),
 				},
 			)
 			if outcome.Snapshot.Version != 0 {
@@ -1438,6 +1868,16 @@ func RunLoopWithOptions(
 
 		var ch <-chan types.SSEEvent
 		var err error
+		if MessagesContainImageInput(req.Messages) {
+			imageErr := ValidateImageInputCapability(resolveImageInputCapability(), true)
+			if imageErr != nil {
+				stopHeartbeat()
+				finishMakerSpan("failed", map[string]string{"error": imageErr.Code()})
+				terminal.Fail(RunTerminalFailed, imageErr.Code(), imageErr.Error(), nil)
+				eventCh <- Event{Type: "error", Data: imageErr.Error()}
+				return
+			}
+		}
 		for retry := 0; retry < 3; retry++ {
 			ch, err = provider.StreamMessage(ctx, req, nil)
 			if err == nil {
@@ -1857,7 +2297,8 @@ func RunLoopWithOptions(
 
 			receiptPath := ""
 			recovery := recoverySnapshot()
-			if didEdit || planMode || completionSnapshot != nil || recovery != nil {
+			appliedSkills := skillUsage.snapshot()
+			if didEdit || planMode || completionSnapshot != nil || recovery != nil || len(appliedSkills) > 0 {
 				receipt := AgentReceipt{
 					Provider:     provider.Name(),
 					Model:        model,
@@ -1865,9 +2306,11 @@ func RunLoopWithOptions(
 					PlanMode:     planMode,
 					Iterations:   i + 1,
 					EditedFiles:  uniqueStrings(editedFiles),
+					Skills:       appliedSkills,
 					Verification: completionVerification,
 					Completion:   completionSnapshot,
 					Recovery:     recovery,
+					PlanBinding:  opts.PlanBinding,
 				}
 				if path, err := terminal.WriteReceipt(workDir, receipt); err != nil {
 					log.Printf("[Agent] receipt write failed: %v", err)
@@ -1974,7 +2417,11 @@ func RunLoopWithOptions(
 
 		// Advance the read-only exploration budget, weighting content reads above
 		// navigation (see exploreScore / iterationWeight).
-		exploreScore += iterationWeight(toolUses)
+		weight := iterationWeight(toolUses)
+		exploreScore += weight
+		if readOnlyCheckpointed {
+			continuationScore += weight
+		}
 		runModeTotalTools += len(toolUses)
 
 		// ── Build assistant message with tool_use blocks ──
@@ -1996,14 +2443,27 @@ func RunLoopWithOptions(
 
 		permissionConfig := DefaultPermissionConfig()
 		permissionConfig.AutoApprove = "moderate"
+		for _, call := range toolUses {
+			if call.Name == "ImageRead" {
+				imageErr := ValidateImageInputCapability(resolveImageInputCapability(), true)
+				if imageErr == nil {
+					break
+				}
+				terminal.Fail(RunTerminalFailed, imageErr.Code(), imageErr.Error(), nil)
+				eventCh <- Event{Type: "error", Data: imageErr.Error()}
+				return
+			}
+		}
 		dispatchResults := dispatchToolCalls(toolUses, toolDispatchOptions{
 			Context:           ctx,
+			ExecutionPolicy:   opts.ExecutionPolicy,
 			WorkDir:           workDir,
 			AllowedTools:      allowedTools,
 			PlanMode:          planMode,
 			PermissionConfig:  permissionConfig,
 			ApprovalRequester: opts.ApprovalRequester,
 			SessionID:         opts.SessionID,
+			SessionRevision:   opts.SessionRevision,
 			RunID:             activeRunID,
 			ReadBeforeWrite:   compiledHarness.ReadBeforeWrite(),
 			ReadLedger:        readLedger,
@@ -2027,6 +2487,11 @@ func RunLoopWithOptions(
 				}
 				return checker(workerID, dispatchFilePath(call.Input))
 			},
+			InstructionCheck: func(call toolUseBlock) (bool, string) {
+				return nestedInstructionDisclosure.CheckTool(workDir, opts.ExecutionPolicy, call)
+			},
+			InstructionBegin:  nestedInstructionDisclosure.BeginBatch,
+			InstructionFinish: nestedInstructionDisclosure.FinishBatch,
 			PreHook: func(call toolUseBlock) (bool, string) {
 				for _, result := range executeHooks(
 					hooks.HookPreToolUse,
@@ -2056,26 +2521,32 @@ func RunLoopWithOptions(
 					"TOOL_ERROR":  fmt.Sprintf("%v", isError),
 				})
 			},
-			BeforeExecute: func(call toolUseBlock) toolMutationPreview {
+			BeforeExecute: func(call toolUseBlock) (toolMutationPreview, error) {
 				if call.Name != "Write" && call.Name != "Edit" {
-					return toolMutationPreview{}
+					return toolMutationPreview{}, nil
 				}
 				file := editFilePath(call.Input)
 				preview := toolMutationPreview{
 					File:   file,
 					Before: editFileBefore(call.Name, call.Input, workDir),
 				}
-				if !checkpointStarted {
-					startCheckpoint(workDir)
-					checkpointStarted = true
+				if err := checkpointScope.captureBeforeMutation(workDir, file, resolvePath(file, workDir)); err != nil {
+					return preview, err
 				}
-				checkpointFile(workDir, file, resolvePath(file, workDir))
-				return preview
+				preview.CheckpointCaptured = true
+				return preview, nil
+			},
+			MutationBatchCommitted: func(mutations []committedFileMutation) error {
+				return checkpointScope.recordPostimages(workDir, mutations)
+			},
+			MutationBatchSettled: func(paths []string) error {
+				return checkpointScope.settleFailedBatch(workDir, paths)
 			},
 			PreExecutionJournal: opts.PreExecutionJournal,
 			Execute: func(call toolUseBlock) (string, bool) {
 				log.Printf("[Agent] Executing: %s", call.Name)
 				execOptions := toolExecOptions
+				execOptions.ToolCallID = call.ID
 				execOptions.ObserveSandbox = func(report sandbox.Report) {
 					sandboxReports.Store(call.ID, report)
 				}
@@ -2085,7 +2556,10 @@ func RunLoopWithOptions(
 					workDir,
 					execOptions,
 				)
-				if !isError && call.Name != loadToolResultToolName && opts.ToolResultStore != nil {
+				// LoadSkill pages are already bounded to 8KB and carry their own
+				// byte continuation metadata. Keep each page inline so it does not
+				// become a second, hidden LoadToolResult pagination layer.
+				if !isError && call.Name != loadToolResultToolName && call.Name != loadSkillToolName && opts.ToolResultStore != nil {
 					content, isError = persistSuccessfulToolResult(opts.ToolResultStore, call.Name, content)
 				}
 				return content, isError
@@ -2098,6 +2572,16 @@ func RunLoopWithOptions(
 		concurrentExecuted := 0
 		var toolResults []map[string]interface{}
 		for _, result := range dispatchResults {
+			var imageBlock types.ContentBlockParam
+			var hasImageBlock bool
+			if result.Tool.Name == "ImageRead" {
+				imageBlock, hasImageBlock = imageReadSink.take(result.Tool.ID)
+				if result.Executed && !result.IsError && !hasImageBlock {
+					result.Content = "Image read failed: the image payload was not captured for this tool call"
+					result.Display = result.Content
+					result.IsError = true
+				}
+			}
 			if result.Concurrent && result.Executed {
 				concurrentExecuted++
 			}
@@ -2173,6 +2657,12 @@ func RunLoopWithOptions(
 				"content":     result.Content,
 				"is_error":    result.IsError,
 			})
+			if result.Executed && !result.IsError && hasImageBlock {
+				toolResults = append(toolResults, map[string]interface{}{
+					"type":   imageBlock.Type,
+					"source": imageBlock.Source,
+				})
+			}
 		}
 		if concurrentExecuted > 1 {
 			log.Printf("[Agent] Parallel: %d authorized tools", concurrentExecuted)

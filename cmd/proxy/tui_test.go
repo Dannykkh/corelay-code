@@ -17,18 +17,27 @@ import (
 type fakeTUIBackend struct {
 	mu sync.Mutex
 
-	calls             []string
-	saveResult        sessionSaveResult
-	saveExpected      []*uint64
-	savedSessions     []*agent.Session
-	startRequests     []agentTurnRequest
-	approvalDecisions []string
-	cancelCalls       int
-	loopWorkDirs      []string
-	activeLoopsErr    error
-	reconcileCalls    []struct {
+	calls         []string
+	saveResult    sessionSaveResult
+	saveExpected  []*uint64
+	savedSessions []*agent.Session
+	startRequests []agentTurnRequest
+	loadedSession *agent.Session
+	forkedSession *agent.Session
+	forkRequests  []struct {
 		id       string
 		revision uint64
+	}
+	approvalDecisions     []string
+	cancelCalls           int
+	loopWorkDirs          []string
+	activeLoopsErr        error
+	reconciliationPreview agent.SessionReconciliationAssessment
+	reconcileCalls        []struct {
+		id             string
+		revision       uint64
+		evidenceDigest string
+		manualAck      bool
 	}
 }
 
@@ -76,9 +85,18 @@ func (f *fakeTUIBackend) ListSessions(context.Context, string) ([]agent.SessionS
 	return nil, nil
 }
 
-func (f *fakeTUIBackend) GetSession(context.Context, string) (*agent.Session, error) {
-	f.record("get-session")
-	return nil, nil
+func (f *fakeTUIBackend) GetSession(_ context.Context, id string) (*agent.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "get-session")
+	if f.loadedSession == nil {
+		return nil, nil
+	}
+	loaded := cloneTUISession(f.loadedSession)
+	if loaded.ID == "" {
+		loaded.ID = id
+	}
+	return loaded, nil
 }
 
 func (f *fakeTUIBackend) SaveSession(_ context.Context, session *agent.Session, expected *uint64) (sessionSaveResult, error) {
@@ -95,19 +113,40 @@ func (f *fakeTUIBackend) SaveSession(_ context.Context, session *agent.Session, 
 	return f.saveResult, nil
 }
 
-func (f *fakeTUIBackend) ForkSession(context.Context, string, uint64) (*agent.Session, error) {
-	f.record("fork")
-	return nil, nil
+func (f *fakeTUIBackend) ForkSession(_ context.Context, id string, revision uint64) (*agent.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "fork")
+	f.forkRequests = append(f.forkRequests, struct {
+		id       string
+		revision uint64
+	}{id: id, revision: revision})
+	return cloneTUISession(f.forkedSession), nil
 }
 
-func (f *fakeTUIBackend) ReconcileSession(_ context.Context, id string, revision uint64) (*agent.Session, error) {
+func (f *fakeTUIBackend) ReconciliationPreview(_ context.Context, id string, revision uint64) (agent.SessionReconciliationAssessment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "reconciliation-preview")
+	assessment := f.reconciliationPreview
+	assessment.SessionID = id
+	assessment.Revision = revision
+	if assessment.EvidenceDigest == "" {
+		assessment.EvidenceDigest = "sha256:preview-token"
+	}
+	return assessment, nil
+}
+
+func (f *fakeTUIBackend) ReconcileSession(_ context.Context, id string, revision uint64, evidenceDigest string, manualAck bool) (*agent.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "reconcile")
 	f.reconcileCalls = append(f.reconcileCalls, struct {
-		id       string
-		revision uint64
-	}{id: id, revision: revision})
+		id             string
+		revision       uint64
+		evidenceDigest string
+		manualAck      bool
+	}{id: id, revision: revision, evidenceDigest: evidenceDigest, manualAck: manualAck})
 	return &agent.Session{ID: id, Revision: revision + 1, LifecycleStatus: agent.SessionLifecycleActive}, nil
 }
 
@@ -202,6 +241,58 @@ func TestTUIViewResponsiveBounds(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTUISessionRailUsesPersistedAndFreshSessionContext(t *testing.T) {
+	backend := &fakeTUIBackend{}
+	model := newTUIModel(backend, tuiOptions{NoColor: true, Mode: agent.ExecutionModeFull})
+	model.resize(140, 40)
+
+	loaded := &agent.Session{
+		ID: "session-1", Revision: 12, Turns: 2, LifecycleStatus: agent.SessionLifecycleActive,
+		WorkstreamID: "workstream-a", PlanID: "plan-b", PlanRevision: 3, StageID: "stage-c",
+		ExecutionPolicy: &agent.ExecutionPolicySnapshot{Mode: agent.ExecutionModeWorkspace, Revision: 4},
+	}
+	model.loadSession(loaded)
+	view := model.View()
+	for _, want := range []string{"workstream-a", "plan-b@3", "stage-c", "workspace@4"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("loaded session rail omitted %q:\n%s", want, view)
+		}
+	}
+
+	model.applyWireEvent(agentWireEvent{Type: "session", Data: json.RawMessage(`{"sessionId":"run-1","executionPolicy":{"mode":"full","revision":9}}`)})
+	if lines := strings.Join(model.sessionRailLines(), "\n"); !strings.Contains(lines, "PERM full@9") {
+		t.Fatalf("fresh run policy not shown in session rail: %q", lines)
+	}
+
+	model.applyWireEvent(agentWireEvent{Type: "session", Data: json.RawMessage(`{"sessionId":"run-2"}`)})
+	if lines := strings.Join(model.sessionRailLines(), "\n"); !strings.Contains(lines, "PERM —") {
+		t.Fatalf("missing fresh policy should be shown as unknown: %q", lines)
+	}
+
+	synced := cloneTUISession(loaded)
+	synced.Revision = 13
+	synced.ExecutionPolicy = &agent.ExecutionPolicySnapshot{Mode: agent.ExecutionModeReadOnly, Revision: 6}
+	model.syncSessionAfterRun(synced)
+	if lines := strings.Join(model.sessionRailLines(), "\n"); !strings.Contains(lines, "PERM read-only@6") {
+		t.Fatalf("synced session policy not restored from persisted snapshot: %q", lines)
+	}
+}
+
+func TestTUISessionRailDoesNotInferMissingPermissionFromCLIOption(t *testing.T) {
+	model := newTUIModel(&fakeTUIBackend{}, tuiOptions{NoColor: true, Mode: agent.ExecutionModeFull})
+	model.resize(140, 40)
+	model.loadSession(&agent.Session{
+		ID: "session-1", Revision: 1, LifecycleStatus: agent.SessionLifecycleActive,
+		ExecutionPolicy: &agent.ExecutionPolicySnapshot{Mode: agent.ExecutionModeWorkspace},
+	})
+	if lines := strings.Join(model.sessionRailLines(), "\n"); !strings.Contains(lines, "PERM —") {
+		t.Fatalf("unknown persisted permission should remain unknown: %q", lines)
+	}
+	if view := model.View(); !strings.Contains(view, "PERM —") {
+		t.Fatalf("unknown permission is not visible in the rendered session rail:\n%s", view)
 	}
 }
 
@@ -358,6 +449,23 @@ func TestTUIAssistantSegmentsPreserveWireEventOrder(t *testing.T) {
 	for index := range wantKinds {
 		if model.entries[index].Kind != wantKinds[index] || model.entries[index].Text != wantTexts[index] {
 			t.Fatalf("entry %d = %#v, want kind=%q text=%q", index, model.entries[index], wantKinds[index], wantTexts[index])
+		}
+	}
+}
+
+func TestTUIAccumulatesRunDiffsAndListsChangedFiles(t *testing.T) {
+	model := newTUIModel(&fakeTUIBackend{}, tuiOptions{})
+	model.entries = nil
+	model.applyWireEvent(agentWireEvent{Type: "diff", Data: json.RawMessage(`{"file":"one/a.go","diff":"+first"}`)})
+	model.applyWireEvent(agentWireEvent{Type: "diff", Data: json.RawMessage(`{"file":"two/a.go","diff":"-second"}`)})
+	model.applyWireEvent(agentWireEvent{Type: "diff", Data: json.RawMessage(`{"file":"one/a.go","diff":"+third"}`)})
+	if len(model.diffs) != 3 {
+		t.Fatalf("diff records = %d, want 3", len(model.diffs))
+	}
+	summary := formatTUIDiffSummary(model.diffs)
+	for _, want := range []string{"Changed files (2): one/a.go, two/a.go", "[1] one/a.go", "[2] two/a.go", "[3] one/a.go", "+third"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("diff summary missing %q: %s", want, summary)
 		}
 	}
 }
@@ -665,6 +773,82 @@ func TestTUIBootstrapUsesGlobalRunGateAndLocksInput(t *testing.T) {
 	}
 }
 
+func TestTUICommandLineForkUsesLoadedRevisionAndAdoptsSessionWorkspace(t *testing.T) {
+	backend := &fakeTUIBackend{
+		loadedSession: &agent.Session{
+			ID: "session-parent", Revision: 14, Workspace: `D:\projects\target`,
+			LifecycleStatus: agent.SessionLifecycleActive,
+		},
+		forkedSession: &agent.Session{
+			ID: "session-child", Revision: 1, Workspace: `D:\projects\target`,
+			ParentSessionID: "session-parent", ParentRevision: 14,
+			LifecycleStatus: agent.SessionLifecycleActive,
+		},
+	}
+	model := newTUIModel(backend, tuiOptions{
+		BaseURL: "http://127.0.0.1:4000", WorkDir: `D:\launch-directory`,
+		SessionID: "session-parent", ForkSession: true,
+	})
+	message := model.bootstrapCmd()()
+	bootstrap, ok := message.(tuiBootstrapMsg)
+	if !ok || bootstrap.err != nil {
+		t.Fatalf("bootstrap = %#v", message)
+	}
+	if len(backend.forkRequests) != 1 || backend.forkRequests[0].id != "session-parent" || backend.forkRequests[0].revision != 14 {
+		t.Fatalf("fork request = %+v, want parent revision 14", backend.forkRequests)
+	}
+	if bootstrap.session == nil || bootstrap.session.ID != "session-child" || bootstrap.workDir != `D:\projects\target` {
+		t.Fatalf("bootstrap fork/workspace = session %#v workdir %q", bootstrap.session, bootstrap.workDir)
+	}
+	model.applyBootstrap(bootstrap)
+	if model.opts.SessionID != "session-child" || model.opts.ForkSession || model.opts.WorkDir != `D:\projects\target` {
+		t.Fatalf("applied fork state = session %q fork=%v workdir=%q", model.opts.SessionID, model.opts.ForkSession, model.opts.WorkDir)
+	}
+}
+
+func TestTUIRejectsExplicitWorkspaceMismatchBeforeForkOrAppend(t *testing.T) {
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	parent := &agent.Session{
+		ID: "session-parent", Revision: 14, Workspace: workspaceB,
+		LifecycleStatus: agent.SessionLifecycleActive,
+		Messages:        []agent.SessionMessage{{Role: "assistant", Content: "existing"}},
+	}
+	backend := &fakeTUIBackend{
+		loadedSession: cloneTUISession(parent),
+		forkedSession: &agent.Session{
+			ID: "session-child", Revision: 1, Workspace: workspaceB,
+			ParentSessionID: "session-parent", ParentRevision: 14,
+			LifecycleStatus: agent.SessionLifecycleActive,
+		},
+	}
+	model := newTUIModel(backend, tuiOptions{
+		BaseURL: "http://127.0.0.1:4000", WorkDir: workspaceA, WorkDirExplicit: true,
+		SessionID: "session-parent", ForkSession: true,
+	})
+	message := model.bootstrapCmd()()
+	bootstrap, ok := message.(tuiBootstrapMsg)
+	if !ok || bootstrap.err == nil || !strings.Contains(bootstrap.err.Error(), "workspace conflict") {
+		t.Fatalf("mismatched bootstrap = %#v, want clear workspace conflict", message)
+	}
+	if len(backend.forkRequests) != 0 || len(backend.savedSessions) != 0 {
+		t.Fatalf("bootstrap mutated durable session: forks=%v saves=%d", backend.forkRequests, len(backend.savedSessions))
+	}
+
+	backend.calls = nil
+	model.current = cloneTUISession(parent)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	turn := model.prepareTurnCmd(ctx, "must not append", cancel)()
+	prepared, ok := turn.(tuiTurnPreparedMsg)
+	if !ok || prepared.err == nil || !strings.Contains(prepared.err.Error(), "workspace conflict") {
+		t.Fatalf("mismatched turn = %#v, want clear workspace conflict", turn)
+	}
+	if strings.Join(backend.calls, ",") != "" || len(backend.savedSessions) != 0 || len(backend.startRequests) != 0 {
+		t.Fatalf("turn mismatch reached mutation: calls=%v saves=%d starts=%d", backend.calls, len(backend.savedSessions), len(backend.startRequests))
+	}
+}
+
 func TestTUIPreparesDurableTurnBeforeStartingAgent(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -732,8 +916,45 @@ func TestTUIPreparesDurableTurnBeforeStartingAgent(t *testing.T) {
 	}
 }
 
+func TestTUIPropagatesRequestedModeAndShowsServerConfirmedMode(t *testing.T) {
+	backend := &fakeTUIBackend{saveResult: sessionSaveResult{ID: "session-mode", Version: 1, Revision: 1}}
+	model := newTUIModel(backend, tuiOptions{
+		WorkDir: `D:\repo`,
+		Mode:    agent.ExecutionModeFull,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prepared, ok := model.prepareTurnCmd(ctx, "run with full mode", cancel)().(tuiTurnPreparedMsg)
+	if !ok || prepared.err != nil {
+		t.Fatalf("prepare turn = %#v", prepared)
+	}
+	if len(backend.startRequests) != 1 || backend.startRequests[0].ExecutionPolicy == nil ||
+		backend.startRequests[0].ExecutionPolicy.Mode != agent.ExecutionModeFull ||
+		backend.startRequests[0].ExecutionPolicy.Revision != 0 {
+		t.Fatalf("turn policy = %#v, want only requested mode", backend.startRequests)
+	}
+
+	model.applyWireEvent(agentWireEvent{
+		Type: "session",
+		Data: json.RawMessage(`{"sessionId":"run-1","executionPolicy":{"mode":"workspace","revision":7}}`),
+	})
+	if model.runtimeID != "run-1" {
+		t.Fatalf("runtime ID = %q, want run-1", model.runtimeID)
+	}
+	if model.lastStatus != "Execution mode: workspace (revision 7)" {
+		t.Fatalf("effective mode status = %q", model.lastStatus)
+	}
+}
+
 func TestTUIInterruptedSessionRequiresExplicitReconcile(t *testing.T) {
-	backend := &fakeTUIBackend{}
+	backend := &fakeTUIBackend{reconciliationPreview: agent.SessionReconciliationAssessment{
+		EvidenceDigest:             "sha256:preview-token",
+		CheckpointStatus:           "unavailable",
+		SideEffectJudgment:         agent.ReconciliationJudgmentUnknown,
+		ManualConfirmationRequired: true,
+		ManualConfirmationReason:   "confirm shell effects",
+		Files:                      []agent.ReconciliationFileEvidence{{Path: "<checkpoint>", Status: agent.ReconciliationFileUnavailable}},
+	}}
 	model := newTUIModel(backend, tuiOptions{})
 	model.resize(100, 30)
 	model.entries = nil
@@ -768,11 +989,20 @@ func TestTUIInterruptedSessionRequiresExplicitReconcile(t *testing.T) {
 
 	blocked.input.SetValue("/reconcile")
 	next, command = blocked.submitInput()
-	confirming := next.(tuiModel)
-	if command != nil || confirming.confirm == nil || confirming.confirm.Action != "reconcile" {
-		t.Fatalf("reconcile did not open confirmation: command=%v confirm=%#v", command, confirming.confirm)
+	checking := next.(tuiModel)
+	if command == nil || checking.confirm != nil {
+		t.Fatalf("reconcile did not check evidence first: command=%v confirm=%#v", command, checking.confirm)
 	}
-	for _, expected := range []string{"authorized command", "shell", "sha256:bounded", "may_have_applied"} {
+	preview, ok := command().(tuiReconciliationPreviewMsg)
+	if !ok || preview.err != nil || preview.revision != 12 {
+		t.Fatalf("reconciliation preview = %#v", preview)
+	}
+	updated, nextCommand := checking.Update(preview)
+	confirming := updated.(tuiModel)
+	if nextCommand != nil || confirming.confirm == nil || confirming.confirm.Action != "reconcile" {
+		t.Fatalf("reconcile preview did not open confirmation: command=%v confirm=%#v", nextCommand, confirming.confirm)
+	}
+	for _, expected := range []string{"checkpoint=unavailable", "judgment=unknown", "manual confirmation required", "sha256:preview-token"} {
 		if !strings.Contains(confirming.confirm.Description, expected) {
 			t.Fatalf("confirmation omits %q: %q", expected, confirming.confirm.Description)
 		}
@@ -786,7 +1016,9 @@ func TestTUIInterruptedSessionRequiresExplicitReconcile(t *testing.T) {
 	if !ok || operation.err != nil || operation.action != "reconcile" {
 		t.Fatalf("reconcile operation = %#v", operation)
 	}
-	if len(backend.reconcileCalls) != 1 || backend.reconcileCalls[0].id != "session-1" || backend.reconcileCalls[0].revision != 12 {
+	if len(backend.reconcileCalls) != 1 || backend.reconcileCalls[0].id != "session-1" ||
+		backend.reconcileCalls[0].revision != 12 || backend.reconcileCalls[0].evidenceDigest != "sha256:preview-token" ||
+		!backend.reconcileCalls[0].manualAck {
 		t.Fatalf("reconcile CAS calls = %#v", backend.reconcileCalls)
 	}
 }

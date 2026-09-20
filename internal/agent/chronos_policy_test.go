@@ -130,11 +130,63 @@ func TestRunChronosMaxCyclesEmitsFailedRunModeSnapshot(t *testing.T) {
 	}
 }
 
+func TestRunChronosForwardsFullExecutionPolicyToKernel(t *testing.T) {
+	isolateEvidenceLoopTest(t)
+	workDir := t.TempDir()
+	externalDir := t.TempDir()
+	target := filepath.Join(externalDir, "chronos-full-mode.txt")
+	provider := &scriptedLoopProvider{steps: []scriptedLoopStep{
+		toolUseStep("toolu_chronos_full_write", "Write", map[string]string{
+			"file_path": target,
+			"content":   "chronos external write",
+		}),
+		textStep("[COMPLETE]"),
+	}}
+	policy := ExecutionPolicySnapshot{
+		Mode:                  ExecutionModeFull,
+		Revision:              91,
+		FullSelectionRevision: 91,
+		Source:                "user-selected",
+	}
+	cfg := DefaultChronosConfig()
+	cfg.MaxCycles = 1
+	cfg.MaxIterations = 3
+	cfg.TotalTimeout = 5 * time.Second
+	cfg.HarnessProfile = directAlternateLoopHarness(t)
+	cfg.ExecutionPolicy = &policy
+	events := make(chan Event, 64)
+
+	RunChronos(context.Background(), provider, "model", "write the external file", workDir, cfg, events)
+
+	var sawApproval, sawWrite bool
+	for event := range events {
+		switch event.Type {
+		case "approval_required":
+			sawApproval = true
+		case "tool_result":
+			if result, ok := event.Data.(map[string]interface{}); ok && result["id"] == "toolu_chronos_full_write" {
+				sawWrite = result["executed"] == true && result["isError"] != true
+			}
+		}
+	}
+	if sawApproval || !sawWrite {
+		t.Fatalf("Chronos full-mode approval/write = %t/%t", sawApproval, sawWrite)
+	}
+	contents, err := os.ReadFile(target)
+	if err != nil || string(contents) != "chronos external write" {
+		t.Fatalf("Chronos full-mode external write contents/error = %q/%v", contents, err)
+	}
+}
+
 func directAlternateLoopHarness(t *testing.T) *harness.HarnessProfile {
 	t.Helper()
 	profile, err := harness.ResolveProfile(harness.ProfileSpec{
-		ID:            "alternate-loop-test-direct",
-		ContextWindow: 16_384,
+		ID: "alternate-loop-test-direct",
+		// Full-mode Chronos carries the complete tool/policy contract in its
+		// system request. Keep this policy-forwarding fixture above that fixed
+		// prompt footprint so the test reaches tool dispatch instead of testing
+		// the separate context-overflow gate.
+		ContextWindow: 32_768,
 		OutputReserve: 2_048,
 		ToolRouting:   harness.ToolRoutingDirect,
 	})

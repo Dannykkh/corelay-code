@@ -33,14 +33,14 @@ func ExtendedToolDefs() []types.ToolDef {
 		},
 		{
 			Name:        "WebFetch",
-			Description: "Fetch a webpage URL and return cleaned readable text, title, links, and metadata. Uses direct HTTP fetch by default; provider=ollama uses Ollama web_fetch when OLLAMA_API_KEY is set.",
+			Description: "Fetch a webpage URL and return readable Markdown, title, links, and metadata. Use this tool to read a user-provided URL. Auto mode tries HTTP, then local headless Chromium for JavaScript shells or HTTP failures. Use provider=browser to force rendering, or direct for HTTP only. No external browser server is required.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"url": {"type": "string", "description": "URL to fetch"},
 					"prompt": {"type": "string", "description": "What to extract from the page"},
 					"max_chars": {"type": "integer", "description": "Maximum content characters to return (default 12000, max 30000)"},
-					"provider": {"type": "string", "description": "Fetch provider: auto, ollama, direct"}
+					"provider": {"type": "string", "description": "Fetch provider: auto (default), browser (local headless Chromium), direct, ollama"}
 				},
 				"required": ["url"]
 			}`),
@@ -99,6 +99,22 @@ func ExtendedToolDefs() []types.ToolDef {
 					"include_signatures": {"type": "boolean", "description": "Include bounded declaration signatures (default: true)"},
 					"max_files": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum source files to include (default: 400)"}
 				},
+				"additionalProperties": false
+			}`),
+		},
+		{
+			Name:        "LSP",
+			Description: "Read-only semantic Go navigation and diagnostics through the configured gopls executable. Supports definition, references, and diagnostics. If unavailable, returns a clearly labeled RepoMap fallback; it never treats regex results as semantic.",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"operation": {"type": "string", "enum": ["definition", "references", "diagnostics"], "description": "Semantic operation"},
+					"file_path": {"type": "string", "description": "Go source file path, relative to the workspace or absolute in full mode"},
+					"line": {"type": "integer", "minimum": 1, "description": "1-based source line"},
+					"column": {"type": "integer", "minimum": 1, "description": "1-based UTF-8 source column"},
+					"max_results": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum locations or diagnostics (default 50)"}
+				},
+				"required": ["operation", "file_path"],
 				"additionalProperties": false
 			}`),
 		},
@@ -163,7 +179,7 @@ func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir 
 		r, e := executeWebSearch(input, workDir)
 		return r, e, true
 	case "WebFetch":
-		r, e := executeWebFetch(input, workDir)
+		r, e := executeWebFetchWithContext(opts.Context, input)
 		return r, e, true
 	case "WebResearch":
 		r, e := executeWebResearch(input, workDir)
@@ -172,10 +188,13 @@ func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir 
 		r, e := executeGit(input, workDir, opts)
 		return r, e, true
 	case "LS":
-		r, e := executeLS(input, workDir)
+		r, e := executeLSWithOptions(input, workDir, opts)
 		return r, e, true
 	case "RepoMap":
 		r, e := executeRepoMap(input, workDir, opts)
+		return r, e, true
+	case "LSP":
+		r, e := executeLSPWithOptions(input, workDir, opts)
 		return r, e, true
 	case "TaskCreate":
 		r, e := executeTaskCreate(input)
@@ -187,10 +206,10 @@ func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir 
 		r, e := executeTaskList()
 		return r, e, true
 	case "NotebookRead":
-		r, e := executeNotebookRead(input, workDir)
+		r, e := executeNotebookReadWithOptions(input, workDir, opts)
 		return r, e, true
 	case "NotebookEdit":
-		r, e := executeNotebookEdit(input, workDir)
+		r, e := executeNotebookEditWithOptions(input, workDir, opts)
 		return r, e, true
 	default:
 		return "", false, false // not handled
@@ -202,7 +221,7 @@ func ExecuteExtendedToolWithOptions(name string, input json.RawMessage, workDir 
 // ── Git ──
 
 func executeGit(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
-	paths, err := executionToolWorkspacePaths("Git", input, workDir)
+	paths, err := executionToolWorkspacePathsWithPolicy("Git", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Git blocked: " + err.Error(), true
 	}
@@ -235,7 +254,11 @@ func executeGit(input json.RawMessage, workDir string, opts ToolExecutionOptions
 // ── LS ──
 
 func executeLS(input json.RawMessage, workDir string) (string, bool) {
-	paths, err := executionToolWorkspacePaths("LS", input, workDir)
+	return executeLSWithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeLSWithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
+	paths, err := executionToolWorkspacePathsWithPolicy("LS", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "LS blocked: " + err.Error(), true
 	}
@@ -342,7 +365,11 @@ type notebookCell struct {
 }
 
 func executeNotebookRead(input json.RawMessage, workDir string) (string, bool) {
-	paths, err := executionToolWorkspacePaths("NotebookRead", input, workDir)
+	return executeNotebookReadWithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeNotebookReadWithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
+	paths, err := executionToolWorkspacePathsWithPolicy("NotebookRead", input, workDir, opts.ExecutionPolicy)
 	if err != nil {
 		return "Notebook read blocked: " + err.Error(), true
 	}
@@ -373,10 +400,14 @@ func executeNotebookRead(input json.RawMessage, workDir string) (string, bool) {
 }
 
 func executeNotebookEdit(input json.RawMessage, workDir string) (string, bool) {
+	return executeNotebookEditWithOptions(input, workDir, ToolExecutionOptions{})
+}
+
+func executeNotebookEditWithOptions(input json.RawMessage, workDir string, opts ToolExecutionOptions) (string, bool) {
 	// Forced or cached calls fail closed too. Notebook mutation must be expressed
 	// through the ordinary Read + Edit tools, which bind execution to a read
 	// ledger revision and use the staged transactional mutation pipeline.
-	if _, err := executionToolWorkspacePaths("NotebookEdit", input, workDir); err != nil {
+	if _, err := executionToolWorkspacePathsWithPolicy("NotebookEdit", input, workDir, opts.ExecutionPolicy); err != nil {
 		return "Notebook edit blocked: " + err.Error(), true
 	}
 	return "Notebook edit blocked: NotebookEdit is disabled; use Read followed by Edit", true

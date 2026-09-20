@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,25 @@ import (
 	"github.com/Dannykkh/corelay-code/internal/providers"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
+
+func TestProfileVersionReportsBuildMetadata(t *testing.T) {
+	var output bytes.Buffer
+	if code := runProfileVersion(&output); code != 0 {
+		t.Fatalf("version code=%d output=%q", code, output.String())
+	}
+	for _, want := range []string{"Corelay Code profiler version: dev", "Build commit: unknown", "Go runtime: " + runtime.Version()} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("version output=%q missing %q", output.String(), want)
+		}
+	}
+}
+
+func TestProfileVersionDoesNotRequireRuntimeComposition(t *testing.T) {
+	var output bytes.Buffer
+	if code := runCLI(context.Background(), []string{"version"}, &output, &output, cliDependencies{}); code != 0 {
+		t.Fatalf("version exit code = %d, output=%q", code, output.String())
+	}
+}
 
 func TestRunFailsClosedBeforeProviderValidationOrStreamWithoutIsolation(t *testing.T) {
 	const rawEndpoint = "https://private-profile-endpoint.invalid/tenant-secret"

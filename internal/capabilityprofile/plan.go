@@ -13,7 +13,7 @@ import (
 const (
 	CurrentProbePlanSchemaVersion = 2
 	LegacyProbePlanVersion        = "corelay-capability-probes-v1"
-	DefaultProbePlanVersion       = "corelay-capability-probes-v2"
+	DefaultProbePlanVersion       = "corelay-capability-probes-v4"
 	maxProbeRepeats               = 20
 )
 
@@ -53,25 +53,31 @@ func (s ProbeStage) valid() bool { return s == StageCalibration || s == StageHol
 type ProbeCategory string
 
 const (
-	CategoryProtocolNative   ProbeCategory = "protocol-native"
-	CategoryFormatHermes     ProbeCategory = "format-hermes"
-	CategoryFormatLiquid     ProbeCategory = "format-liquid"
-	CategoryFormatCodeblock  ProbeCategory = "format-tool-codeblock"
-	CategoryFormatTokenized  ProbeCategory = "format-tokenized"
-	CategoryFormatFencedJSON ProbeCategory = "format-fenced-json"
-	CategoryFormatBareJSON   ProbeCategory = "format-bare-json"
-	CategoryToolCatalog      ProbeCategory = "tool-catalog"
-	CategoryTwoStageRouting  ProbeCategory = "two-stage-routing"
-	CategoryRepositoryMap    ProbeCategory = "repository-map"
-	CategoryContextCeiling   ProbeCategory = "context-ceiling"
-	CategoryEditPatch        ProbeCategory = "edit-patch"
-	CategoryEditExact        ProbeCategory = "edit-exact"
-	CategoryEditFuzzy        ProbeCategory = "edit-fuzzy"
-	CategoryRepetition       ProbeCategory = "repetition"
-	CategoryTruncation       ProbeCategory = "truncation"
-	CategoryPlanAnchor       ProbeCategory = "plan-anchor"
-	CategorySafetyBoundary   ProbeCategory = "safety-boundary"
-	CategorySafetyToolDenial ProbeCategory = "safety-tool-denial"
+	CategoryProtocolNative    ProbeCategory = "protocol-native"
+	CategoryFormatHermes      ProbeCategory = "format-hermes"
+	CategoryFormatLiquid      ProbeCategory = "format-liquid"
+	CategoryFormatCodeblock   ProbeCategory = "format-tool-codeblock"
+	CategoryFormatTokenized   ProbeCategory = "format-tokenized"
+	CategoryFormatFencedJSON  ProbeCategory = "format-fenced-json"
+	CategoryFormatBareJSON    ProbeCategory = "format-bare-json"
+	CategoryToolCatalog       ProbeCategory = "tool-catalog"
+	CategoryTwoStageRouting   ProbeCategory = "two-stage-routing"
+	CategoryRepositoryMap     ProbeCategory = "repository-map"
+	CategoryContextCeiling    ProbeCategory = "context-ceiling"
+	CategoryEditPatch         ProbeCategory = "edit-patch"
+	CategoryEditExact         ProbeCategory = "edit-exact"
+	CategoryEditFuzzy         ProbeCategory = "edit-fuzzy"
+	CategoryRepetition        ProbeCategory = "repetition"
+	CategoryTruncation        ProbeCategory = "truncation"
+	CategoryPlanAnchor        ProbeCategory = "plan-anchor"
+	CategorySafetyBoundary    ProbeCategory = "safety-boundary"
+	CategorySafetyToolDenial  ProbeCategory = "safety-tool-denial"
+	CategoryMultiFileBug      ProbeCategory = "validation-multi-file-bug"
+	CategoryNewFeatureTest    ProbeCategory = "validation-new-feature-test"
+	CategoryFixFailingTest    ProbeCategory = "validation-fix-failing-test"
+	CategoryDecisionRetention ProbeCategory = "validation-decision-retention"
+	CategoryProjectSwitch     ProbeCategory = "validation-project-switch"
+	CategoryInterruptRecovery ProbeCategory = "validation-interrupt-recovery"
 )
 
 func (c ProbeCategory) valid() bool {
@@ -82,7 +88,9 @@ func (c ProbeCategory) valid() bool {
 		CategoryTwoStageRouting, CategoryRepositoryMap, CategoryContextCeiling, CategoryEditPatch,
 		CategoryEditExact, CategoryEditFuzzy, CategoryRepetition,
 		CategoryTruncation, CategoryPlanAnchor, CategorySafetyBoundary,
-		CategorySafetyToolDenial:
+		CategorySafetyToolDenial, CategoryMultiFileBug, CategoryNewFeatureTest,
+		CategoryFixFailingTest, CategoryDecisionRetention, CategoryProjectSwitch,
+		CategoryInterruptRecovery:
 		return true
 	default:
 		return false
@@ -220,6 +228,12 @@ func ProbePlanForVariant(variant HarnessVariant) (ProbePlan, error) {
 			probe("plan-anchor", StageCalibration, CategoryPlanAnchor, 503, 3, 0, 8, false, false),
 			probe("workspace-boundary", StageCalibration, CategorySafetyBoundary, 601, 3, 0, 4, true, true),
 			probe("unsafe-tool-denial", StageCalibration, CategorySafetyToolDenial, 602, 3, 0, 4, true, false),
+			probe("validation-multi-file-bug", StageCalibration, CategoryMultiFileBug, 801, 3, 0, 16, false, true),
+			probe("validation-new-feature-test", StageCalibration, CategoryNewFeatureTest, 802, 3, 0, 16, false, true),
+			probe("validation-fix-failing-test", StageCalibration, CategoryFixFailingTest, 803, 3, 0, 16, false, true),
+			probe("validation-decision-retention", StageCalibration, CategoryDecisionRetention, 804, 3, 24_000, 16, false, true),
+			probe("validation-project-switch", StageCalibration, CategoryProjectSwitch, 805, 3, 0, 16, false, true),
+			probe("validation-interrupt-recovery", StageCalibration, CategoryInterruptRecovery, 806, 3, 0, 16, false, true),
 			probe("holdout-native", StageHoldout, CategoryProtocolNative, 701, 2, 0, 12, false, false),
 			probe("holdout-context", StageHoldout, CategoryContextCeiling, 702, 2, 24_000, 12, false, false),
 			probe("holdout-edit", StageHoldout, CategoryEditPatch, 703, 2, 0, 12, false, true),

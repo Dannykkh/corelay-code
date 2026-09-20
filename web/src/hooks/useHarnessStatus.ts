@@ -19,9 +19,22 @@ export interface AgentTypeInfo {
 }
 
 export interface SkillInfo {
+  id?: string;
   name: string;
+  description?: string;
   path: string;
   source: string;
+  digest?: string;
+  namespace?: string;
+  shadowed?: Array<{
+    id?: string;
+    name: string;
+    description?: string;
+    source: string;
+    namespace: string;
+    path: string;
+    digest?: string;
+  }>;
 }
 
 export interface AgentLoopSnapshot {

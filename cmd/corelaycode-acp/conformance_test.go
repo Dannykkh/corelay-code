@@ -139,6 +139,22 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 	if created.SessionID == "" || !hasConfigOption(created.ConfigOptions, "model") || !hasConfigOption(created.ConfigOptions, "reasoning") {
 		t.Fatalf("session/new result = %#v", created)
 	}
+	if created.Modes == nil || created.Modes.CurrentModeID != "workspace" || len(created.Modes.AvailableModes) != 3 {
+		t.Fatalf("session/new execution modes = %#v", created.Modes)
+	}
+	modeFrames := process.requestFrames(t, 211, acp.MethodSessionSetMode, map[string]any{
+		"sessionId": created.SessionID, "modeId": "full",
+	}, nil)
+	decodeConformanceResult(t, modeFrames[len(modeFrames)-1], &acp.SetSessionModeResponse{})
+	modeUpdated := false
+	for _, frame := range modeFrames[:len(modeFrames)-1] {
+		if frame.Method == acp.MethodSessionUpdate {
+			modeUpdated = true
+		}
+	}
+	if !modeUpdated {
+		t.Fatalf("session/set_mode did not emit a mode update: %#v", modeFrames)
+	}
 
 	setConfig := process.request(t, 21, acp.MethodSessionSetConfigOption, map[string]any{
 		"sessionId": created.SessionID, "configId": "reasoning", "value": "progress",
@@ -164,7 +180,11 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 	loadedFrames := process.requestFrames(t, 25, acp.MethodSessionLoad, map[string]any{
 		"sessionId": created.SessionID, "cwd": workspace, "mcpServers": []any{},
 	}, nil)
-	decodeConformanceResult(t, loadedFrames[len(loadedFrames)-1], &acp.LoadSessionResponse{})
+	var loaded acp.LoadSessionResponse
+	decodeConformanceResult(t, loadedFrames[len(loadedFrames)-1], &loaded)
+	if loaded.Modes == nil || loaded.Modes.CurrentModeID != "full" {
+		t.Fatalf("session/load lost the selected mode: %#v", loaded.Modes)
+	}
 	if countTranscriptChunks(loadedFrames, created.SessionID) < 2 {
 		t.Fatalf("session/load did not replay committed transcript before terminal response: %#v", loadedFrames)
 	}
@@ -177,8 +197,16 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 		t.Fatalf("session/resume did not replay committed transcript: %#v", resumedFrames)
 	}
 
+	permissionSessionFrame := process.request(t, 261, acp.MethodSessionNew, map[string]any{
+		"cwd": workspace, "mcpServers": []any{},
+	}, nil)
+	var permissionSession acp.NewSessionResponse
+	decodeConformanceResult(t, permissionSessionFrame, &permissionSession)
+	if permissionSession.Modes == nil || permissionSession.Modes.CurrentModeID != "workspace" {
+		t.Fatalf("permission session did not default to workspace: %#v", permissionSession.Modes)
+	}
 	permissionSeen := false
-	permissionFrames := process.prompt(t, 26, created.SessionID, "permission-fixture", func(frame conformanceFrame) {
+	permissionFrames := process.prompt(t, 26, permissionSession.SessionID, "permission-fixture", func(frame conformanceFrame) {
 		if frame.Method != acp.MethodSessionRequestPermission {
 			t.Fatalf("unexpected client request during permission prompt: %#v", frame)
 		}
@@ -200,14 +228,14 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 	process.send(t, map[string]any{
 		"jsonrpc": "2.0", "id": 27, "method": acp.MethodSessionPrompt,
 		"params": map[string]any{
-			"sessionId": created.SessionID,
+			"sessionId": permissionSession.SessionID,
 			"prompt":    []map[string]string{{"type": "text", "text": "cancel-fixture"}},
 		},
 	})
 	upstream.waitForCancellationRequest(t)
 	process.send(t, map[string]any{
 		"jsonrpc": "2.0", "method": acp.MethodSessionCancel,
-		"params": map[string]string{"sessionId": created.SessionID},
+		"params": map[string]string{"sessionId": permissionSession.SessionID},
 	})
 	cancelFrames := process.awaitResponse(t, "27", nil)
 	assertPromptResult(t, cancelFrames[len(cancelFrames)-1], acp.StopCancelled)
@@ -215,8 +243,13 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 
 	process.mustOK(t, 28, acp.MethodSessionClose, map[string]any{"sessionId": created.SessionID})
 	process.mustOK(t, 29, acp.MethodSessionDelete, map[string]any{"sessionId": created.SessionID})
+	process.mustOK(t, 30, acp.MethodSessionClose, map[string]any{"sessionId": permissionSession.SessionID})
+	process.mustOK(t, 31, acp.MethodSessionDelete, map[string]any{"sessionId": permissionSession.SessionID})
 
-	mcpMarker := filepath.Join(t.TempDir(), "mcp-called")
+	// The secure MCP runner grants write access only to the selected workspace;
+	// keep the fixture marker inside that boundary so the test observes a real
+	// tool call without requiring an out-of-workspace write.
+	mcpMarker := filepath.Join(workspace, "mcp-called")
 	mcpExecutable, err := filepath.Abs(os.Args[0])
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +270,7 @@ func TestAdvertisedSurfaceConformanceThroughCommand(t *testing.T) {
 	decodeConformanceResult(t, mcpCreatedFrame, &mcpCreated)
 	assertStateDoesNotContain(t, filepath.Join(configDir, "acp"), conformanceMCPSpec)
 
-	if processsupervisor.NewAutoRunner().Capabilities().ProcessIsolation {
+	if capabilities := processsupervisor.NewAutoRunner().Capabilities(); capabilities.ProcessIsolation && capabilities.FilesystemIsolation {
 		mcpFrames := process.prompt(t, 41, mcpCreated.SessionID, "mcp-fixture", nil)
 		assertPromptResult(t, mcpFrames[len(mcpFrames)-1], acp.StopEndTurn)
 		assertStreamingBeforeTerminal(t, mcpFrames, "mcp fixture complete")
@@ -564,7 +597,8 @@ func startACPCommand(t *testing.T, binary, configDir string) *acpCommandProcess 
 func conformanceEnvironment(configDir string) []string {
 	blocked := map[string]struct{}{
 		"CORELAY_CONFIG_DIR": {}, "CORELAY_MEMORY": {}, "CORELAY_AUTOSKILL": {},
-		"CORELAY_AUTOVERIFY": {}, "OPENAI_API_KEY": {},
+		"CORELAY_AUTOVERIFY": {}, "OPENAI_API_KEY": {}, "HOME": {}, "USERPROFILE": {},
+		"HOMEDRIVE": {}, "HOMEPATH": {},
 	}
 	environment := make([]string, 0, len(os.Environ())+4)
 	for _, item := range os.Environ() {
@@ -578,6 +612,8 @@ func conformanceEnvironment(configDir string) []string {
 	}
 	return append(environment,
 		"CORELAY_CONFIG_DIR="+configDir,
+		"HOME="+configDir,
+		"USERPROFILE="+configDir,
 		"CORELAY_MEMORY=off",
 		"CORELAY_AUTOSKILL=off",
 		"CORELAY_AUTOVERIFY=off",

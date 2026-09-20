@@ -10,7 +10,9 @@ import { SettingsPage } from './pages/RuntimeSettings';
 import { MemoryPage } from './pages/Memory';
 import { TeamPage } from './pages/Team';
 import { fetchJSON, putJSON } from './lib/api';
+import { fileResponseContent, isEditableFileType, readWorkspaceFile, type FileReadKind } from './lib/files';
 import { useToast } from './lib/toast';
+import { loadWorkspaceSelection, sameWorkspacePath, saveWorkspaceSelection } from './lib/workspace';
 import './lib/i18n';
 
 interface ProjectInfo {
@@ -27,10 +29,6 @@ interface AppConfig {
   model: string;
   routerEnabled?: boolean;
   workDir?: string;
-}
-
-interface FileResponse {
-  content?: string;
 }
 
 type Theme = 'dark' | 'light';
@@ -72,18 +70,23 @@ function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
-  const [viewingFile, setViewingFile] = useState<{ path: string; content: string } | null>(null);
+  const [selectedWorkspace, setSelectedWorkspace] = useState(loadWorkspaceSelection);
+  const [viewingFile, setViewingFile] = useState<{ path: string; content: string; workspace: string; type: FileReadKind | string; size: number; truncated?: boolean } | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [editContent, setEditContent] = useState('');
 
-  const activeProject = projects.find(p => p.active);
+  const activeProject = projects.find(p => sameWorkspacePath(p.path, selectedWorkspace));
   const { toast, dismissToast } = useToast();
 
   const loadProjects = useCallback(async () => {
     try {
       const data = await fetchJSON<ProjectInfo[]>('/api/projects');
       setProjects(data);
-    } catch { setProjects([]); }
+      return data;
+    } catch {
+      setProjects([]);
+      return [];
+    }
   }, []);
 
   useEffect(() => {
@@ -94,14 +97,28 @@ function App() {
       } catch { setStatus(null); }
     };
     load();
-    queueMicrotask(() => { void loadProjects(); });
+    queueMicrotask(() => {
+      void (async () => {
+        const [workspace, registeredProjects] = await Promise.all([
+          fetchJSON<{ path?: string }>('/api/workspace').catch(() => ({ path: undefined as string | undefined })),
+          loadProjects(),
+        ]);
+        setSelectedWorkspace((current) => {
+          const currentIsKnown = registeredProjects.some((project) => sameWorkspacePath(project.path, current)) ||
+            (!!workspace.path && sameWorkspacePath(workspace.path, current));
+          const next = currentIsKnown ? current : workspace.path || '';
+          if (next) saveWorkspaceSelection(next);
+          return next;
+        });
+      })();
+    });
     const interval = setInterval(load, 15000);
     return () => clearInterval(interval);
   }, [loadProjects]);
 
-  async function switchProject(path: string) {
-    await putJSON('/api/workspace', { path });
-    await loadProjects();
+  function switchProject(path: string) {
+    setSelectedWorkspace(path);
+    saveWorkspaceSelection(path);
     setShowProjectPicker(false);
   }
 
@@ -138,21 +155,33 @@ function App() {
         <SidePanel
           visible={true}
           mode={sidePanelMode as 'files' | 'chat'}
+          selectedWorkspace={selectedWorkspace}
           onNewChat={() => setLoadSessionId('__new__')}
           onSessionClick={(id) => setLoadSessionId(id)}
-          onProjectSwitch={() => loadProjects()}
+          onProjectSwitch={switchProject}
           onFileClick={async (path) => {
             try {
-              const data = await fetchJSON<FileResponse | string>(`/api/file?path=${encodeURIComponent(path)}`);
-              setViewingFile({ path, content: typeof data === 'string' ? data : data.content || '' });
-            } catch { setViewingFile({ path, content: 'Failed to load file' }); }
+              const data = await readWorkspaceFile(selectedWorkspace, path);
+              setViewingFile({
+                path: data.path || path,
+                workspace: selectedWorkspace,
+                content: fileResponseContent(data),
+                type: data.type,
+                size: data.size,
+                truncated: data.truncated,
+              });
+              setEditMode(false);
+            } catch (error) {
+              setViewingFile({ path, workspace: selectedWorkspace, content: error instanceof Error ? error.message : 'Failed to load file', type: 'error', size: 0 });
+              setEditMode(false);
+            }
           }}
         />
       )}
 
       {/* Main Content */}
       <main className="flex-1 min-w-0 h-[calc(100vh-24px)] overflow-hidden flex">
-        {page === 'chat' && <ChatPage loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />}
+        {page === 'chat' && <ChatPage selectedWorkspace={selectedWorkspace} loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />}
         {page === 'files' && (
           viewingFile ? (
             <div className="flex flex-col h-full w-full">
@@ -160,6 +189,7 @@ function App() {
                 <div className="flex items-center gap-2">
                   <div className="text-xs font-mono text-[var(--color-accent)]">{viewingFile.path}</div>
                   {editMode && <span className="text-[9px] bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded">EDITING</span>}
+                  {!editMode && <span className="text-[9px] text-[var(--color-text2)]">{viewingFile.type}{viewingFile.size > 0 ? ` · ${viewingFile.size} B` : ''}</span>}
                 </div>
                 <div className="flex items-center gap-2">
                   {editMode ? (
@@ -169,7 +199,7 @@ function App() {
                           await fetch('/api/file/write', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ path: viewingFile.path, content: editContent }),
+                            body: JSON.stringify({ path: viewingFile.path, content: editContent, workDir: viewingFile.workspace }),
                           });
                           setViewingFile({ ...viewingFile, content: editContent });
                           setEditMode(false);
@@ -178,12 +208,12 @@ function App() {
                       >Save</button>
                       <button onClick={() => { setEditMode(false); setEditContent(''); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Cancel</button>
                     </>
-                  ) : (
+                  ) : isEditableFileType(viewingFile.type) ? (
                     <button
                       onClick={() => { setEditMode(true); setEditContent(viewingFile.content); }}
                       className="text-xs px-2 py-0.5 bg-[var(--color-surface2)] text-[var(--color-text)] rounded hover:bg-[var(--color-border)]"
                     >Edit</button>
-                  )}
+                  ) : null}
                   <button onClick={() => { setViewingFile(null); setEditMode(false); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Close</button>
                 </div>
               </div>
@@ -198,8 +228,8 @@ function App() {
                 <pre className="flex-1 overflow-auto p-4 text-xs font-mono text-[var(--color-text)] bg-[var(--color-bg)] leading-relaxed whitespace-pre-wrap">{viewingFile.content}</pre>
               )}
             </div>
-          ) : (
-            <ChatPage loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />
+            ) : (
+            <ChatPage selectedWorkspace={selectedWorkspace} loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />
           )
         )}
         {page === 'routes' && <RoutesPage />}
@@ -279,9 +309,9 @@ function App() {
                 <button
                   key={p.path}
                   onClick={() => switchProject(p.path)}
-                  className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-[var(--color-surface2)] transition-colors flex items-center gap-2 ${p.active ? 'text-[var(--color-accent)]' : ''}`}
+                  className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-[var(--color-surface2)] transition-colors flex items-center gap-2 ${sameWorkspacePath(p.path, selectedWorkspace) ? 'text-[var(--color-accent)]' : ''}`}
                 >
-                  <span>{p.active ? '●' : '○'}</span>
+                  <span>{sameWorkspacePath(p.path, selectedWorkspace) ? '●' : '○'}</span>
                   <span className="truncate">{p.name}</span>
                   <span className="text-[9px] text-[var(--color-text2)] ml-auto">{p.type}</span>
                 </button>

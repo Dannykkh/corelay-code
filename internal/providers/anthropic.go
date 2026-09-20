@@ -38,14 +38,14 @@ func (p *AnthropicProvider) Name() string        { return "anthropic" }
 func (p *AnthropicProvider) DisplayName() string { return "Anthropic (passthrough)" }
 func (p *AnthropicProvider) Models() []types.ModelInfo {
 	return []types.ModelInfo{
-		{ID: "claude-opus-4-8", DisplayName: "Claude Opus 4.8 (최신 최상급)", ContextWindow: 1000000},
-		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6 (균형)", ContextWindow: 1000000},
-		{ID: "claude-haiku-4-5-20251001", DisplayName: "Claude Haiku 4.5 (빠름/저가)", ContextWindow: 200000},
-		{ID: "claude-opus-4-7", DisplayName: "Claude Opus 4.7 (legacy)", ContextWindow: 1000000},
-		{ID: "claude-opus-4-6-20250205", DisplayName: "Claude Opus 4.6 (legacy)", ContextWindow: 1000000},
-		{ID: "claude-sonnet-4-6-20250217", DisplayName: "Claude Sonnet 4.6 dated (legacy)", ContextWindow: 1000000},
-		{ID: "claude-opus-4-20250514", DisplayName: "Claude Opus 4 (legacy)", ContextWindow: 200000},
-		{ID: "claude-sonnet-4-20250514", DisplayName: "Claude Sonnet 4 (legacy)", ContextWindow: 200000},
+		{ID: "claude-opus-4-8", DisplayName: "Claude Opus 4.8 (최신 최상급)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6 (균형)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-haiku-4-5-20251001", DisplayName: "Claude Haiku 4.5 (빠름/저가)", ContextWindow: 200000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-opus-4-7", DisplayName: "Claude Opus 4.7 (legacy)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-opus-4-6-20250205", DisplayName: "Claude Opus 4.6 (legacy)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-sonnet-4-6-20250217", DisplayName: "Claude Sonnet 4.6 dated (legacy)", ContextWindow: 1000000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-opus-4-20250514", DisplayName: "Claude Opus 4 (legacy)", ContextWindow: 200000, ImageInput: types.ImageInputSupported},
+		{ID: "claude-sonnet-4-20250514", DisplayName: "Claude Sonnet 4 (legacy)", ContextWindow: 200000, ImageInput: types.ImageInputSupported},
 	}
 }
 func (p *AnthropicProvider) Validate() error { return nil }

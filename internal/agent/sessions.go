@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 var (
@@ -48,6 +50,13 @@ var (
 	// metadata. Terminal state is committed with the transcript revision it
 	// describes and must never be accepted as an unvalidated side channel.
 	ErrSessionTerminalInvalid = errors.New("invalid session terminal metadata")
+	// ErrSessionAssociationInvalid reports malformed project/workstream/plan
+	// identity stored on a session. Referential ownership is checked by the
+	// request resolver that has access to those stores.
+	ErrSessionAssociationInvalid = errors.New("invalid session association")
+	// ErrSessionImageReferenceInvalid reports malformed or unowned durable
+	// image metadata. Image payloads are stored separately from transcripts.
+	ErrSessionImageReferenceInvalid = errors.New("invalid session image reference")
 )
 
 var (
@@ -57,8 +66,12 @@ var (
 )
 
 const (
-	maxSessionIDAttempts  = 16
-	currentSessionVersion = 1
+	maxSessionIDAttempts       = 16
+	legacyVersionedSession     = 1
+	associationSessionVersion  = 2
+	planRevisionSessionVersion = 3
+	sessionImageVersion        = 4
+	currentSessionVersion      = 4
 )
 
 // SessionRevisionConflictError exposes both sides of an optimistic write
@@ -145,6 +158,26 @@ type SessionInterruption struct {
 	InputDigest     string                 `json:"inputDigest,omitempty"`
 	SideEffectState SessionSideEffectState `json:"sideEffectState,omitempty"`
 	Summary         string                 `json:"summary,omitempty"`
+}
+
+// SessionReconciliationReceipt is a compact, content-free audit record of a
+// successful interruption review. It records the evidence snapshot and the
+// user's acknowledgement without persisting file contents or tool input.
+type SessionReconciliationReceipt struct {
+	Version                        int                              `json:"version"`
+	At                             time.Time                        `json:"at"`
+	RunID                          string                           `json:"runId,omitempty"`
+	EvidenceDigest                 string                           `json:"evidenceDigest"`
+	CheckpointStatus               string                           `json:"checkpointStatus"`
+	SideEffectJudgment             ReconciliationSideEffectJudgment `json:"sideEffectJudgment"`
+	FileCount                      int                              `json:"fileCount"`
+	MatchesPreimage                int                              `json:"matchesPreimage"`
+	MatchesPostimage               int                              `json:"matchesPostimage"`
+	Diverged                       int                              `json:"diverged"`
+	PostimageUnrecorded            int                              `json:"postimageUnrecorded"`
+	Unavailable                    int                              `json:"unavailable"`
+	ManualConfirmationRequired     bool                             `json:"manualConfirmationRequired"`
+	ManualConfirmationAcknowledged bool                             `json:"manualConfirmationAcknowledged"`
 }
 
 // AggregateToolExecutionJournal reduces one run's content-free execution
@@ -241,35 +274,108 @@ const (
 
 // Session represents a saved chat conversation.
 type Session struct {
-	Version               int                         `json:"version,omitempty"`
-	Revision              uint64                      `json:"revision,omitempty"`
-	ID                    string                      `json:"id"`
-	Title                 string                      `json:"title"`
-	Workspace             string                      `json:"workspace"` // project directory path
-	Messages              []SessionMessage            `json:"messages"`
-	Provider              string                      `json:"provider"`
-	Model                 string                      `json:"model"`
-	CreatedAt             time.Time                   `json:"createdAt"`
-	UpdatedAt             time.Time                   `json:"updatedAt"`
-	Turns                 int                         `json:"turns"`
-	ParentSessionID       string                      `json:"parentSessionId,omitempty"`
-	ParentRevision        uint64                      `json:"parentRevision,omitempty"`
-	LifecycleStatus       SessionLifecycleStatus      `json:"lifecycleStatus,omitempty"`
-	LastCommittedRevision uint64                      `json:"lastCommittedRevision,omitempty"`
-	ReconcileRequired     bool                        `json:"reconcileRequired,omitempty"`
-	Interruption          *SessionInterruption        `json:"interruption,omitempty"`
-	LastRunTerminal       *DurableRunTerminalMetadata `json:"lastRunTerminal,omitempty"`
+	Version               int                           `json:"version,omitempty"`
+	Revision              uint64                        `json:"revision,omitempty"`
+	ID                    string                        `json:"id"`
+	Title                 string                        `json:"title"`
+	Workspace             string                        `json:"workspace"` // project directory path
+	WorkstreamID          string                        `json:"workstreamId,omitempty"`
+	PlanID                string                        `json:"planId,omitempty"`
+	PlanRevision          uint64                        `json:"planRevision,omitempty"`
+	StageID               string                        `json:"stageId,omitempty"`
+	ExecutionPolicy       *ExecutionPolicySnapshot      `json:"executionPolicy,omitempty"`
+	Messages              []SessionMessage              `json:"messages"`
+	Provider              string                        `json:"provider"`
+	Model                 string                        `json:"model"`
+	CreatedAt             time.Time                     `json:"createdAt"`
+	UpdatedAt             time.Time                     `json:"updatedAt"`
+	Turns                 int                           `json:"turns"`
+	ParentSessionID       string                        `json:"parentSessionId,omitempty"`
+	ParentRevision        uint64                        `json:"parentRevision,omitempty"`
+	LifecycleStatus       SessionLifecycleStatus        `json:"lifecycleStatus,omitempty"`
+	LastCommittedRevision uint64                        `json:"lastCommittedRevision,omitempty"`
+	ReconcileRequired     bool                          `json:"reconcileRequired,omitempty"`
+	Interruption          *SessionInterruption          `json:"interruption,omitempty"`
+	LastReconciliation    *SessionReconciliationReceipt `json:"lastReconciliation,omitempty"`
+	LastRunTerminal       *DurableRunTerminalMetadata   `json:"lastRunTerminal,omitempty"`
 }
 
 // SessionMessage is a message in a session (user, assistant, or tool).
 type SessionMessage struct {
-	Role       string      `json:"role"` // "user", "assistant", "tool"
-	Content    string      `json:"content"`
-	ToolName   string      `json:"toolName,omitempty"`
-	ToolInput  interface{} `json:"toolInput,omitempty"`
-	ToolResult string      `json:"toolResult,omitempty"`
-	IsError    bool        `json:"isError,omitempty"`
-	Timestamp  time.Time   `json:"timestamp"`
+	Role        string                  `json:"role"` // "user", "assistant", "tool"
+	Content     string                  `json:"content"`
+	Attachments []SessionImageReference `json:"attachments,omitempty"`
+	ToolName    string                  `json:"toolName,omitempty"`
+	ToolInput   interface{}             `json:"toolInput,omitempty"`
+	ToolResult  string                  `json:"toolResult,omitempty"`
+	IsError     bool                    `json:"isError,omitempty"`
+	Timestamp   time.Time               `json:"timestamp"`
+}
+
+// SessionImageReference identifies one verified image owned by the session's
+// content-addressed image store. The image bytes are never stored in a session
+// transcript, event, or receipt.
+type SessionImageReference struct {
+	Digest    string `json:"digest"`
+	MediaType string `json:"mediaType"`
+	Size      int64  `json:"size"`
+}
+
+// ValidateSessionImageReferences checks bounded, content-free image metadata.
+// Blob ownership and digest verification are checked by the owning store.
+func ValidateSessionImageReferences(messages []SessionMessage) error {
+	seen := make(map[string]SessionImageReference)
+	for _, message := range messages {
+		if len(message.Attachments) == 0 {
+			continue
+		}
+		if message.Role != "user" || len(message.Attachments) > 8 {
+			return fmt.Errorf("%w: attachments require a user message and at most eight images", ErrSessionImageReferenceInvalid)
+		}
+		for _, reference := range message.Attachments {
+			if !sessionInputDigestPattern.MatchString(reference.Digest) ||
+				reference.Size <= 0 || reference.Size > maxSessionImageBlobBytes {
+				return fmt.Errorf("%w: digest or size is invalid", ErrSessionImageReferenceInvalid)
+			}
+			switch reference.MediaType {
+			case "image/png", "image/jpeg", "image/gif", "image/webp":
+			default:
+				return fmt.Errorf("%w: media type is unsupported", ErrSessionImageReferenceInvalid)
+			}
+			if previous, ok := seen[reference.Digest]; ok && previous != reference {
+				return fmt.Errorf("%w: one digest has conflicting metadata", ErrSessionImageReferenceInvalid)
+			}
+			seen[reference.Digest] = reference
+		}
+	}
+	return nil
+}
+
+func sessionHasImageReferences(messages []SessionMessage) bool {
+	for _, message := range messages {
+		if len(message.Attachments) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func sessionImageReferences(messages []SessionMessage) []SessionImageReference {
+	seen := make(map[string]SessionImageReference)
+	for _, message := range messages {
+		if message.Role != "user" {
+			continue
+		}
+		for _, reference := range message.Attachments {
+			seen[reference.Digest] = reference
+		}
+	}
+	result := make([]SessionImageReference, 0, len(seen))
+	for _, reference := range seen {
+		result = append(result, reference)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Digest < result[j].Digest })
+	return result
 }
 
 // SessionSummary is a lightweight view for listing sessions.
@@ -280,6 +386,10 @@ type SessionSummary struct {
 	Title                 string                      `json:"title"`
 	Preview               string                      `json:"preview"`
 	Workspace             string                      `json:"workspace"`
+	WorkstreamID          string                      `json:"workstreamId,omitempty"`
+	PlanID                string                      `json:"planId,omitempty"`
+	PlanRevision          uint64                      `json:"planRevision,omitempty"`
+	StageID               string                      `json:"stageId,omitempty"`
 	Turns                 int                         `json:"turns"`
 	Provider              string                      `json:"provider"`
 	Model                 string                      `json:"model"`
@@ -301,11 +411,12 @@ type Workspace struct {
 
 // SessionStore manages session persistence.
 type SessionStore struct {
-	mu          *sync.RWMutex
-	baseDir     string
-	dir         string
-	idGenerator func() (string, error)
-	initErr     error
+	mu           *sync.RWMutex
+	baseDir      string
+	dir          string
+	idGenerator  func() (string, error)
+	atomicWriter func(dir, target string, data []byte) error
+	initErr      error
 }
 
 var sessionStoreLocks sync.Map
@@ -554,7 +665,7 @@ func (s *SessionStore) loadStoredSession(path, expectedID string) (Session, erro
 			fmt.Errorf("decode session envelope: %w", err),
 		)
 	}
-	if envelope.Version != 0 && envelope.Version != currentSessionVersion {
+	if envelope.Version < 0 || envelope.Version > currentSessionVersion {
 		return Session{}, s.sessionRecoveryError(
 			ErrSessionVersionUnsupported,
 			path,
@@ -577,7 +688,9 @@ func (s *SessionStore) loadStoredSession(path, expectedID string) (Session, erro
 	if sess.Version == 0 {
 		if sess.Revision != 0 || sess.ParentSessionID != "" || sess.ParentRevision != 0 ||
 			sess.LifecycleStatus != "" || sess.LastCommittedRevision != 0 ||
-			sess.ReconcileRequired || sess.Interruption != nil || sess.LastRunTerminal != nil {
+			sess.ReconcileRequired || sess.Interruption != nil || sess.LastRunTerminal != nil ||
+			sess.ExecutionPolicy != nil || sess.WorkstreamID != "" || sess.PlanID != "" ||
+			sess.PlanRevision != 0 || sess.StageID != "" || sessionHasImageReferences(sess.Messages) {
 			return Session{}, s.sessionRecoveryError(
 				ErrSessionCorrupt,
 				path,
@@ -594,6 +707,45 @@ func (s *SessionStore) loadStoredSession(path, expectedID string) (Session, erro
 			data,
 			errors.New("versioned session has revision zero"),
 		)
+	}
+	if sess.Version < associationSessionVersion &&
+		(sess.WorkstreamID != "" || sess.PlanID != "" || sess.StageID != "") {
+		return Session{}, s.sessionRecoveryError(
+			ErrSessionCorrupt,
+			path,
+			expectedID,
+			data,
+			errors.New("session association fields require the current schema version"),
+		)
+	}
+	if sess.Version < planRevisionSessionVersion && sess.PlanRevision != 0 {
+		return Session{}, s.sessionRecoveryError(
+			ErrSessionCorrupt, path, expectedID, data,
+			errors.New("plan revision field requires the current schema version"),
+		)
+	}
+	if err := validateSessionAssociationIDs(sess); err != nil {
+		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
+	}
+	if sessionHasImageReferences(sess.Messages) && sess.Version < sessionImageVersion {
+		return Session{}, s.sessionRecoveryError(
+			ErrSessionCorrupt, path, expectedID, data,
+			errors.New("session image references require the current schema version"),
+		)
+	}
+	if err := ValidateSessionImageReferences(sess.Messages); err != nil {
+		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
+	}
+	if sess.ExecutionPolicy != nil {
+		if err := ValidateExecutionPolicySnapshot(*sess.ExecutionPolicy); err != nil {
+			return Session{}, s.sessionRecoveryError(
+				ErrSessionCorrupt,
+				path,
+				expectedID,
+				data,
+				fmt.Errorf("invalid execution policy snapshot: %w", err),
+			)
+		}
 	}
 	if err := normalizeSessionLifecycle(&sess); err != nil {
 		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
@@ -653,6 +805,41 @@ func validateSessionParentMetadata(sessionID, parentID string, parentRevision ui
 	return nil
 }
 
+func validateSessionAssociationIDs(sess Session) error {
+	for _, association := range []struct {
+		name  string
+		value string
+	}{
+		{name: "workstreamId", value: sess.WorkstreamID},
+		{name: "planId", value: sess.PlanID},
+		{name: "stageId", value: sess.StageID},
+	} {
+		if association.value == "" {
+			continue
+		}
+		if strings.TrimSpace(association.value) != association.value ||
+			len(association.value) > 256 ||
+			association.value == "." || association.value == ".." ||
+			strings.ContainsAny(association.value, "/\\\x00\t\r\n") {
+			return fmt.Errorf("%w: %s is not a valid identifier", ErrSessionAssociationInvalid, association.name)
+		}
+	}
+	if sess.StageID != "" && sess.PlanID == "" {
+		return fmt.Errorf("%w: stageId requires planId", ErrSessionAssociationInvalid)
+	}
+	if sess.PlanID == "" && sess.PlanRevision != 0 {
+		return fmt.Errorf("%w: planRevision requires planId", ErrSessionAssociationInvalid)
+	}
+	return nil
+}
+
+// ValidateSessionAssociations checks the structure of project association IDs.
+// Referential ownership is validated by the request boundary that has access
+// to the corresponding project stores.
+func ValidateSessionAssociations(sess Session) error {
+	return validateSessionAssociationIDs(sess)
+}
+
 func normalizeSessionLifecycle(sess *Session) error {
 	if sess == nil {
 		return fmt.Errorf("%w: session is nil", ErrSessionLifecycleInvalid)
@@ -671,6 +858,11 @@ func normalizeSessionLifecycle(sess *Session) error {
 	}
 	if sess.LastCommittedRevision > sess.Revision {
 		return fmt.Errorf("%w: last committed revision exceeds current revision", ErrSessionLifecycleInvalid)
+	}
+	if sess.LastReconciliation != nil {
+		if err := ValidateSessionReconciliationReceipt(*sess.LastReconciliation); err != nil {
+			return err
+		}
 	}
 	switch sess.LifecycleStatus {
 	case SessionLifecycleActive, SessionLifecycleClosed:
@@ -915,6 +1107,10 @@ func sessionSummary(sess Session) SessionSummary {
 		Title:                 sess.Title,
 		Preview:               preview,
 		Workspace:             sess.Workspace,
+		WorkstreamID:          sess.WorkstreamID,
+		PlanID:                sess.PlanID,
+		PlanRevision:          sess.PlanRevision,
+		StageID:               sess.StageID,
 		Turns:                 sess.Turns,
 		Provider:              sess.Provider,
 		Model:                 sess.Model,
@@ -1124,7 +1320,7 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 	if err != nil {
 		return nil, err
 	}
-	if parent.Version != currentSessionVersion {
+	if parent.Version == 0 {
 		return nil, fmt.Errorf(
 			"%w: session %s uses schema version %d and must be migrated before fork",
 			ErrSessionVersionUnsupported,
@@ -1151,6 +1347,18 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 	if err != nil {
 		return nil, fmt.Errorf("clone parent session %s: %w", parentID, err)
 	}
+	var childExecutionPolicy *ExecutionPolicySnapshot
+	if parent.ExecutionPolicy != nil {
+		inherited, policyErr := ResolveChildExecutionPolicy(
+			*parent.ExecutionPolicy,
+			"",
+			sandbox.Capabilities{},
+		)
+		if policyErr != nil {
+			return nil, fmt.Errorf("inherit parent session execution policy: %w", policyErr)
+		}
+		childExecutionPolicy = &inherited
+	}
 	_, workspace, err := workspaceStorageKey(parent.Workspace)
 	if err != nil {
 		return nil, err
@@ -1162,6 +1370,10 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 		ID:                    id,
 		Title:                 parent.Title,
 		Workspace:             workspace,
+		WorkstreamID:          parent.WorkstreamID,
+		PlanID:                parent.PlanID,
+		PlanRevision:          parent.PlanRevision,
+		StageID:               parent.StageID,
 		Messages:              messages,
 		Provider:              parent.Provider,
 		Model:                 parent.Model,
@@ -1172,6 +1384,7 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 		ParentRevision:        parent.Revision,
 		LifecycleStatus:       SessionLifecycleActive,
 		LastCommittedRevision: 1,
+		ExecutionPolicy:       childExecutionPolicy,
 		LastRunTerminal:       cloneDurableRunTerminalMetadata(parent.LastRunTerminal),
 	}
 	data, err := json.MarshalIndent(&child, "", "  ")
@@ -1179,8 +1392,9 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 		return nil, fmt.Errorf("encode forked session %q: %w", child.ID, err)
 	}
 	committedResults := committedToolResultDigests(parent.Messages)
+	committedImages := sessionImageReferences(parent.Messages)
 	var childMemory *SessionMemory
-	if len(committedResults) > 0 {
+	if len(committedResults) > 0 || len(committedImages) > 0 {
 		parentMemory, openErr := s.openToolResultMemoryForSessionLocked(*parent)
 		if openErr != nil {
 			return nil, openErr
@@ -1189,9 +1403,17 @@ func (s *SessionStore) Fork(parentID string, expectedParentRevision uint64) (*Se
 		if openErr != nil {
 			return nil, openErr
 		}
-		if cloneErr := parentMemory.CloneResultsTo(childMemory, committedResults); cloneErr != nil {
-			_ = childMemory.CleanupSafe()
-			return nil, fmt.Errorf("clone forked tool results: %w", cloneErr)
+		if len(committedResults) > 0 {
+			if cloneErr := parentMemory.CloneResultsTo(childMemory, committedResults); cloneErr != nil {
+				_ = childMemory.CleanupSafe()
+				return nil, fmt.Errorf("clone forked tool results: %w", cloneErr)
+			}
+		}
+		if len(committedImages) > 0 {
+			if cloneErr := parentMemory.CloneImagesTo(childMemory, committedImages); cloneErr != nil {
+				_ = childMemory.CleanupSafe()
+				return nil, fmt.Errorf("clone forked session images: %w", cloneErr)
+			}
 		}
 	}
 	if err := s.persistSessionLocked(child, "", data); err != nil {
@@ -1216,6 +1438,29 @@ func cloneSessionMessages(messages []SessionMessage) ([]SessionMessage, error) {
 		return nil, err
 	}
 	return clone, nil
+}
+
+func preserveSessionImageReferences(candidate, existing []SessionMessage) []SessionMessage {
+	if candidate == nil {
+		return nil
+	}
+	result := append([]SessionMessage(nil), candidate...)
+	limit := len(result)
+	if len(existing) < limit {
+		limit = len(existing)
+	}
+	for index := 0; index < limit; index++ {
+		current := result[index]
+		previous := existing[index]
+		if current.Role != "user" || previous.Role != "user" ||
+			current.Content != previous.Content || !current.Timestamp.Equal(previous.Timestamp) ||
+			len(current.Attachments) > 0 || len(previous.Attachments) == 0 {
+			continue
+		}
+		current.Attachments = append([]SessionImageReference(nil), previous.Attachments...)
+		result[index] = current
+	}
+	return result
 }
 
 // SessionResumeState is the store-level gate a future resume route must check
@@ -1347,17 +1592,90 @@ func ValidateSessionInterruption(marker SessionInterruption) error {
 	}
 }
 
-// MarkReconciled explicitly acknowledges an interrupted side effect and makes
-// the resulting revision safe to resume.
+// ValidateSessionReconciliationReceipt checks the bounded audit record stored
+// when an interrupted session is explicitly reconciled.
+func ValidateSessionReconciliationReceipt(receipt SessionReconciliationReceipt) error {
+	if receipt.Version != 1 || receipt.At.IsZero() || len(receipt.RunID) > 256 ||
+		!isSHA256Revision(receipt.EvidenceDigest) {
+		return fmt.Errorf("%w: reconciliation receipt identity is invalid", ErrSessionLifecycleInvalid)
+	}
+	if receipt.CheckpointStatus != "available" && receipt.CheckpointStatus != "unavailable" {
+		return fmt.Errorf("%w: reconciliation checkpoint status is invalid", ErrSessionLifecycleInvalid)
+	}
+	if receipt.SideEffectJudgment != ReconciliationJudgmentDigestEvaluated &&
+		receipt.SideEffectJudgment != ReconciliationJudgmentUnknown {
+		return fmt.Errorf("%w: reconciliation judgment is invalid", ErrSessionLifecycleInvalid)
+	}
+	counts := []int{receipt.FileCount, receipt.MatchesPreimage, receipt.MatchesPostimage,
+		receipt.Diverged, receipt.PostimageUnrecorded, receipt.Unavailable}
+	for _, count := range counts {
+		if count < 0 || count > 10000 {
+			return fmt.Errorf("%w: reconciliation receipt count is invalid", ErrSessionLifecycleInvalid)
+		}
+	}
+	if receipt.MatchesPreimage+receipt.MatchesPostimage+receipt.Diverged+
+		receipt.PostimageUnrecorded+receipt.Unavailable != receipt.FileCount {
+		return fmt.Errorf("%w: reconciliation receipt counts are inconsistent", ErrSessionLifecycleInvalid)
+	}
+	if receipt.ManualConfirmationAcknowledged && !receipt.ManualConfirmationRequired {
+		return fmt.Errorf("%w: unexpected manual reconciliation acknowledgement", ErrSessionLifecycleInvalid)
+	}
+	if receipt.ManualConfirmationRequired && !receipt.ManualConfirmationAcknowledged {
+		return fmt.Errorf("%w: manual reconciliation acknowledgement is missing", ErrSessionLifecycleInvalid)
+	}
+	return nil
+}
+
+// MarkReconciled is retained for source compatibility but deliberately refuses
+// to clear an interruption without a fresh evidence-bound receipt. Callers
+// must assess the checkpoint and use MarkReconciledWithReceipt.
 func (s *SessionStore) MarkReconciled(id string, expectedRevision uint64) (*Session, error) {
+	return nil, fmt.Errorf("%w: session %s at revision %d requires a fresh reconciliation evidence receipt", ErrSessionReconcileRequired, id, expectedRevision)
+}
+
+// MarkReconciledWithReceipt atomically records a fresh evidence receipt and
+// clears the interruption marker. The caller must recompute the assessment
+// and verify its EvidenceDigest while holding the durable-session mutation
+// gate before calling this method.
+func (s *SessionStore) MarkReconciledWithReceipt(
+	id string,
+	expectedRevision uint64,
+	expectedRunID string,
+	receipt SessionReconciliationReceipt,
+) (*Session, error) {
+	if err := ValidateSessionReconciliationReceipt(receipt); err != nil {
+		return nil, err
+	}
+	receipt.At = receipt.At.UTC()
+	fileMutationBatchMu.Lock()
+	defer fileMutationBatchMu.Unlock()
 	return s.updateSessionLifecycle(id, expectedRevision, func(sess *Session) error {
-		if !sess.ReconcileRequired ||
+		if !sess.ReconcileRequired || sess.Interruption == nil ||
 			(sess.LifecycleStatus != SessionLifecycleInterrupted && sess.LifecycleStatus != SessionLifecycleRecoveryNeeded) {
 			return fmt.Errorf("%w: session is not awaiting reconciliation", ErrSessionLifecycleInvalid)
+		}
+		if sess.Interruption.RunID != expectedRunID || receipt.RunID != expectedRunID {
+			return fmt.Errorf("%w: interrupted run identity changed", ErrSessionReconcileRequired)
+		}
+		assessment, err := assessSessionReconciliationLocked(sess)
+		if err != nil {
+			return err
+		}
+		if assessment.EvidenceDigest != receipt.EvidenceDigest || assessment.RunID != receipt.RunID ||
+			assessment.CheckpointStatus != receipt.CheckpointStatus || assessment.SideEffectJudgment != receipt.SideEffectJudgment ||
+			len(assessment.Files) != receipt.FileCount || assessment.MatchesPreimage != receipt.MatchesPreimage ||
+			assessment.MatchesPostimage != receipt.MatchesPostimage || assessment.Diverged != receipt.Diverged ||
+			assessment.PostimageUnrecorded != receipt.PostimageUnrecorded || assessment.Unavailable != receipt.Unavailable ||
+			assessment.ManualConfirmationRequired != receipt.ManualConfirmationRequired {
+			return fmt.Errorf("%w: reconciliation evidence changed before acknowledgement", ErrSessionReconcileRequired)
+		}
+		if assessment.ManualConfirmationRequired && !receipt.ManualConfirmationAcknowledged {
+			return fmt.Errorf("%w: manual side-effect confirmation is required", ErrSessionReconcileRequired)
 		}
 		sess.LifecycleStatus = SessionLifecycleActive
 		sess.ReconcileRequired = false
 		sess.Interruption = nil
+		sess.LastReconciliation = cloneSessionReconciliationReceipt(&receipt)
 		return nil
 	})
 }
@@ -1398,7 +1716,7 @@ func (s *SessionStore) updateSessionLifecycle(
 	if err != nil {
 		return nil, fmt.Errorf("load session %q: %w", id, err)
 	}
-	if sess.Version != currentSessionVersion {
+	if sess.Version == 0 {
 		return nil, fmt.Errorf("%w: lifecycle updates require a versioned session", ErrSessionVersionUnsupported)
 	}
 	if sess.Revision != expectedRevision {
@@ -1449,6 +1767,7 @@ func (s *SessionStore) save(
 	}
 
 	candidate := *sess
+	candidate.ExecutionPolicy = cloneExecutionPolicySnapshot(sess.ExecutionPolicy)
 	candidate.LastRunTerminal = cloneDurableRunTerminalMetadata(sess.LastRunTerminal)
 	var existingPath string
 	var existing *Session
@@ -1484,7 +1803,32 @@ func (s *SessionStore) save(
 		if candidate.Workspace != "" && !sameWorkspace(candidate.Workspace, existing.Workspace) {
 			return fmt.Errorf("%w: session %s belongs to another workspace", ErrSessionConflict, candidate.ID)
 		}
+		candidate.Messages = preserveSessionImageReferences(candidate.Messages, existing.Messages)
 		candidate.Workspace = existing.Workspace
+		if candidate.WorkstreamID == "" {
+			candidate.WorkstreamID = existing.WorkstreamID
+		}
+		sameWorkstream := candidate.WorkstreamID == existing.WorkstreamID
+		if candidate.PlanID == "" && sameWorkstream {
+			candidate.PlanID = existing.PlanID
+			candidate.PlanRevision = existing.PlanRevision
+			if candidate.StageID == "" {
+				candidate.StageID = existing.StageID
+			}
+		} else {
+			if sameWorkstream && candidate.PlanID == existing.PlanID && candidate.PlanRevision == 0 {
+				candidate.PlanRevision = existing.PlanRevision
+			}
+			if sameWorkstream && candidate.PlanID == existing.PlanID && candidate.StageID == "" {
+				candidate.StageID = existing.StageID
+			}
+		}
+		if candidate.Provider == "" {
+			candidate.Provider = existing.Provider
+		}
+		if candidate.Model == "" {
+			candidate.Model = existing.Model
+		}
 		if candidate.CreatedAt.IsZero() {
 			candidate.CreatedAt = existing.CreatedAt
 		}
@@ -1508,6 +1852,20 @@ func (s *SessionStore) save(
 	}
 	if existing != nil && candidate.LastRunTerminal == nil {
 		candidate.LastRunTerminal = cloneDurableRunTerminalMetadata(existing.LastRunTerminal)
+	}
+	if existing != nil && candidate.ExecutionPolicy == nil {
+		candidate.ExecutionPolicy = cloneExecutionPolicySnapshot(existing.ExecutionPolicy)
+	}
+	if candidate.ExecutionPolicy != nil {
+		if err := ValidateExecutionPolicySnapshot(*candidate.ExecutionPolicy); err != nil {
+			return fmt.Errorf("invalid execution policy snapshot: %w", err)
+		}
+	}
+	if err := validateSessionAssociationIDs(candidate); err != nil {
+		return err
+	}
+	if err := ValidateSessionImageReferences(candidate.Messages); err != nil {
+		return err
 	}
 	if err := validateOptionalDurableRunTerminal(candidate.LastRunTerminal); err != nil {
 		return err
@@ -1543,6 +1901,15 @@ func (s *SessionStore) save(
 		return err
 	}
 	candidate.Workspace = canonicalWorkspace
+	if sessionHasImageReferences(candidate.Messages) {
+		memory, memoryErr := s.openToolResultMemoryForSessionLocked(candidate)
+		if memoryErr != nil {
+			return fmt.Errorf("open session image store: %w", memoryErr)
+		}
+		if err := memory.ValidateImageReferences(candidate.Messages); err != nil {
+			return err
+		}
+	}
 	if existing == nil && candidate.ParentSessionID != "" {
 		parent, err := s.getLocked(candidate.ParentSessionID)
 		if err != nil {
@@ -1623,6 +1990,7 @@ func prepareInterruptedRunCommit(
 	candidate.ReconcileRequired = false
 	candidate.Interruption = nil
 	candidate.LastCommittedRevision = existing.LastCommittedRevision
+	candidate.LastReconciliation = cloneSessionReconciliationReceipt(existing.LastReconciliation)
 	return nil
 }
 
@@ -1636,6 +2004,9 @@ func prepareSessionLifecycleForSave(candidate *Session, existing *Session) error
 		}
 		if candidate.ReconcileRequired || candidate.Interruption != nil {
 			return fmt.Errorf("%w: new session cannot start interrupted", ErrSessionLifecycleInvalid)
+		}
+		if candidate.LastReconciliation != nil {
+			return fmt.Errorf("%w: new session cannot include a reconciliation receipt", ErrSessionLifecycleInvalid)
 		}
 		candidate.LifecycleStatus = SessionLifecycleActive
 		candidate.LastCommittedRevision = 0
@@ -1660,10 +2031,27 @@ func prepareSessionLifecycleForSave(candidate *Session, existing *Session) error
 		return fmt.Errorf("%w: lifecycle transitions require the lifecycle API", ErrSessionLifecycleInvalid)
 	}
 	candidate.LastCommittedRevision = existing.LastCommittedRevision
+	candidate.LastReconciliation = cloneSessionReconciliationReceipt(existing.LastReconciliation)
 	return nil
 }
 
 func cloneSessionInterruption(value *SessionInterruption) *SessionInterruption {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneSessionReconciliationReceipt(value *SessionReconciliationReceipt) *SessionReconciliationReceipt {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneExecutionPolicySnapshot(value *ExecutionPolicySnapshot) *ExecutionPolicySnapshot {
 	if value == nil {
 		return nil
 	}
@@ -1719,7 +2107,11 @@ func (s *SessionStore) persistSessionLocked(sess Session, existingPath string, d
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(dir, targetPath, data); err != nil {
+	atomicWriter := s.atomicWriter
+	if atomicWriter == nil {
+		atomicWriter = writeFileAtomic
+	}
+	if err := atomicWriter(dir, targetPath, data); err != nil {
 		return err
 	}
 	if existingPath == "" || sameStoragePath(existingPath, targetPath) {
@@ -1774,6 +2166,8 @@ func writeFileAtomic(dir, target string, data []byte) (retErr error) {
 type SessionDeleteResult struct {
 	ResultCount    int   `json:"resultCount"`
 	TotalBytes     int64 `json:"totalBytes"`
+	ImageCount     int   `json:"imageCount"`
+	ImageBytes     int64 `json:"imageBytes"`
 	CleanupPending bool  `json:"cleanupPending"`
 }
 
@@ -1785,9 +2179,9 @@ func (s *SessionStore) Delete(id string) error {
 }
 
 // DeleteExpected removes one exact persisted revision and then cleans only its
-// workspace-bound result namespace. The transcript is removed first so a
-// cleanup failure leaves an orphan for retention rather than a live transcript
-// with broken references.
+// workspace-bound result and image namespace. The transcript is removed first
+// so a cleanup failure leaves an orphan for retention rather than a live
+// transcript with broken references.
 func (s *SessionStore) DeleteExpected(id string, expectedRevision uint64) (SessionDeleteResult, error) {
 	return s.deleteSession(id, &expectedRevision)
 }
@@ -1819,10 +2213,14 @@ func (s *SessionStore) deleteSession(id string, expectedRevision *uint64) (Sessi
 		return SessionDeleteResult{}, err
 	}
 	stats := memory.Stats()
+	imageCount, imageBytes := memory.ImageStats()
 	if err := os.Remove(path); err != nil {
 		return SessionDeleteResult{}, fmt.Errorf("delete session %q: %w", id, err)
 	}
-	result := SessionDeleteResult{ResultCount: stats.ResultCount, TotalBytes: stats.TotalBytes}
+	result := SessionDeleteResult{
+		ResultCount: stats.ResultCount, TotalBytes: stats.TotalBytes,
+		ImageCount: imageCount, ImageBytes: imageBytes,
+	}
 	if err := memory.CleanupSafe(); err != nil {
 		result.CleanupPending = true
 	}

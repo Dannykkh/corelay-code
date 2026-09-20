@@ -100,16 +100,31 @@ func (r *AutoRunner) Capabilities() sandbox.Capabilities {
 
 func (r *AutoRunner) Start(ctx context.Context, policy sandbox.Policy, spec Spec) (*Process, Report) {
 	if r == nil {
-		return nil, Report{Policy: policy, Failure: sandbox.FailureRunnerUnavailable, Detail: "auto runner is nil"}
+		capabilities := r.Capabilities()
+		return nil, Report{
+			Policy: policy, Capabilities: capabilities,
+			ExecutionPolicy: executionPolicyForReport(spec.ExecutionPolicy, capabilities),
+			Failure:         sandbox.FailureRunnerUnavailable, Detail: "auto runner is nil",
+		}
 	}
 	if policy.Enforcement == sandbox.EnforcementDisabled {
 		if r.unconfined == nil {
-			return nil, Report{Runner: r.Name(), Policy: policy, Failure: sandbox.FailureRunnerUnavailable, Detail: "disabled host adapter is unavailable"}
+			capabilities := r.Capabilities()
+			return nil, Report{
+				Runner: r.Name(), Policy: policy, Capabilities: capabilities,
+				ExecutionPolicy: executionPolicyForReport(spec.ExecutionPolicy, capabilities),
+				Failure:         sandbox.FailureRunnerUnavailable, Detail: "disabled host adapter is unavailable",
+			}
 		}
 		return r.unconfined.Start(ctx, policy, spec)
 	}
 	if r.secure == nil {
-		return nil, Report{Runner: r.Name(), Policy: policy, Failure: sandbox.FailureRunnerUnavailable, Detail: "secure streaming adapter is unavailable"}
+		capabilities := r.Capabilities()
+		return nil, Report{
+			Runner: r.Name(), Policy: policy, Capabilities: capabilities,
+			ExecutionPolicy: executionPolicyForReport(spec.ExecutionPolicy, capabilities),
+			Failure:         sandbox.FailureRunnerUnavailable, Detail: "secure streaming adapter is unavailable",
+		}
 	}
 	return r.secure.Start(ctx, policy, spec)
 }

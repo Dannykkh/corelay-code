@@ -81,14 +81,22 @@ func validateCanonicalAuxiliary(request *types.MessagesRequest, toolNames map[st
 	return nil
 }
 
+// ValidateCanonicalHistory validates the canonical message history accepted by
+// the agent endpoint. Keep this at the HTTP boundary before messages reach a
+// provider or durable session runtime.
+func ValidateCanonicalHistory(messages []types.Message) error {
+	return validateCanonicalHistory(messages)
+}
+
 func validateCanonicalHistory(messages []types.Message) error {
 	calls := make(map[string]struct{})
 	results := make(map[string]struct{})
+	imageBudget := &ImageBudget{}
 	for _, message := range messages {
 		if message.Role != "user" && message.Role != "assistant" {
 			return NewError(400, "invalid_message_role", "canonical messages only accept user and assistant roles")
 		}
-		if len(message.Content) == 0 || len(message.Content) > MaxStringBytes*4 {
+		if len(message.Content) == 0 || len(message.Content) > MaxRequestBytes {
 			return NewError(400, "invalid_message_content", "message content is invalid or exceeds the protocol limit")
 		}
 		var plain string
@@ -118,7 +126,11 @@ func validateCanonicalHistory(messages []types.Message) error {
 				if message.Role != "user" {
 					return NewError(400, "invalid_content_block", "image blocks require user role")
 				}
-				if err := validateCanonicalImageBlock(raw); err != nil {
+				imageBytes, err := validateCanonicalImageBlock(raw)
+				if err != nil {
+					return err
+				}
+				if err := imageBudget.reserve(imageBytes); err != nil {
 					return err
 				}
 			case "tool_use":
@@ -177,7 +189,7 @@ func validateCanonicalTextBlock(raw json.RawMessage) error {
 	return validateCacheControl(block.CacheControl)
 }
 
-func validateCanonicalImageBlock(raw json.RawMessage) error {
+func validateCanonicalImageBlock(raw json.RawMessage) (int, error) {
 	var block struct {
 		Type   string `json:"type"`
 		Source struct {
@@ -187,15 +199,13 @@ func validateCanonicalImageBlock(raw json.RawMessage) error {
 		} `json:"source"`
 		CacheControl json.RawMessage `json:"cache_control,omitempty"`
 	}
-	if decodeInboundStrict(raw, &block) != nil || block.Type != "image" || block.Source.Type != "base64" || len(block.Source.Data) > MaxStringBytes*4 {
-		return NewError(400, "invalid_content_block", "image block is invalid")
+	if decodeInboundStrict(raw, &block) != nil || block.Type != "image" || block.Source.Type != "base64" {
+		return 0, NewError(400, "invalid_content_block", "image block is invalid")
 	}
-	switch block.Source.MediaType {
-	case "image/png", "image/jpeg", "image/gif", "image/webp":
-	default:
-		return NewError(400, "invalid_content_block", "image media type is not supported")
+	if err := validateCacheControl(block.CacheControl); err != nil {
+		return 0, err
 	}
-	return validateCacheControl(block.CacheControl)
+	return validateImagePayload(block.Source.MediaType, block.Source.Data)
 }
 
 func validateCanonicalToolUseBlock(raw json.RawMessage) (string, error) {

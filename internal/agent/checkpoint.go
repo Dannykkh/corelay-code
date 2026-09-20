@@ -24,21 +24,22 @@ import (
 // created are deleted, files it modified are reverted. Backups live under
 // <state dir>/undo/<hash> so the user's workspace stays clean.
 
-const checkpointManifestVersion = 1
+const checkpointManifestVersion = 4
 
 type checkpointPaths struct {
-	stateDir string
-	undoDir  string
-	dir      string
-	manifest string
+	stateDir      string
+	undoDir       string
+	dir           string
+	manifest      string
+	sessionDigest string
 }
 
-func checkpointDir(workDir string) string {
+func checkpointDir(workDir string, sessionID ...string) string {
 	canonical, err := canonicalWorkspace(workDir)
 	if err != nil {
 		return ""
 	}
-	paths, err := checkpointPathsFor(canonical)
+	paths, err := checkpointPathsFor(canonical, checkpointSessionID(sessionID...))
 	if err != nil {
 		return ""
 	}
@@ -46,87 +47,361 @@ func checkpointDir(workDir string) string {
 }
 
 type ckptFile struct {
-	Existed bool   `json:"existed"`
-	Backup  string `json:"backup"` // clean relative path within the checkpoint dir
+	Existed           bool    `json:"existed"`
+	Backup            string  `json:"backup"`               // clean relative path within the checkpoint dir
+	TargetPath        string  `json:"targetPath,omitempty"` // canonical absolute path for full-mode external targets
+	PreimageDigest    string  `json:"preimageDigest"`
+	PreimageMode      *uint32 `json:"preimageMode,omitempty"`
+	PostimageDigest   string  `json:"postimageDigest,omitempty"`
+	PostimageExisted  bool    `json:"postimageExisted,omitempty"`
+	PostimageCaptured bool    `json:"postimageCaptured,omitempty"`
 }
 
 type ckptManifest struct {
-	Version int                 `json:"version"`
-	WorkDir string              `json:"workDir"`
-	Files   map[string]ckptFile `json:"files"` // clean workspace-relative path -> info
+	Version         int                 `json:"version"`
+	WorkDir         string              `json:"workDir"`
+	SessionDigest   string              `json:"sessionDigest"`
+	SessionRevision uint64              `json:"sessionRevision,omitempty"`
+	RunID           string              `json:"runId"`
+	Generation      string              `json:"generation"`
+	CheckpointKey   string              `json:"checkpointKey"`
+	Files           map[string]ckptFile `json:"files"` // clean workspace-relative path -> info
 }
 
-// startCheckpoint clears the previous undo buffer to begin a new generation.
-func startCheckpoint(workDir string) {
+type checkpointOwner struct {
+	SessionID       string
+	SessionRevision uint64
+	RunID           string
+	Generation      string
+}
+
+func checkpointSessionID(sessionID ...string) string {
+	if len(sessionID) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(sessionID[0])
+}
+
+func checkpointSessionDigest(sessionID string) string {
+	return artifactBytesRevision([]byte(strings.TrimSpace(sessionID)))
+}
+
+func newCheckpointOwner(sessionID string, sessionRevision uint64, runID string) checkpointOwner {
+	runID = strings.TrimSpace(runID)
+	return checkpointOwner{
+		SessionID:       strings.TrimSpace(sessionID),
+		SessionRevision: sessionRevision,
+		RunID:           runID,
+		Generation:      "checkpoint_" + runID,
+	}
+}
+
+func (owner checkpointOwner) valid() bool {
+	return strings.TrimSpace(owner.RunID) != "" && strings.TrimSpace(owner.Generation) != ""
+}
+
+func checkpointManifestMatchesOwner(manifest ckptManifest, owner checkpointOwner) bool {
+	return owner.valid() && manifest.SessionDigest == checkpointSessionDigest(owner.SessionID) &&
+		manifest.SessionRevision == owner.SessionRevision && manifest.RunID == owner.RunID &&
+		manifest.Generation == owner.Generation &&
+		manifest.CheckpointKey == checkpointManifestKey(manifest.WorkDir, manifest.SessionDigest, manifest.RunID, manifest.Generation)
+}
+
+func checkpointManifestKey(workDir, sessionDigest, runID, generation string) string {
+	identity := strings.Join([]string{
+		checkpointPathKey(workDir),
+		sessionDigest,
+		strings.TrimSpace(runID),
+		strings.TrimSpace(generation),
+	}, "\x00")
+	return artifactBytesRevision([]byte(identity))
+}
+
+// startCheckpoint clears this session's previous undo buffer to begin a new run generation.
+func startCheckpoint(workDir string, owner checkpointOwner) error {
+	if !owner.valid() {
+		return errors.New("checkpoint owner is invalid")
+	}
 	canonical, err := canonicalWorkspace(workDir)
 	if err != nil {
-		return
+		return fmt.Errorf("canonicalize checkpoint workspace: %w", err)
 	}
-	paths, err := prepareCheckpointDirectory(canonical, true)
+	paths, err := prepareCheckpointDirectory(canonical, owner.SessionID, true)
 	if err != nil {
-		return
+		return err
 	}
 	m := ckptManifest{
-		Version: checkpointManifestVersion,
-		WorkDir: canonical,
-		Files:   map[string]ckptFile{},
+		Version:         checkpointManifestVersion,
+		WorkDir:         canonical,
+		SessionDigest:   paths.sessionDigest,
+		SessionRevision: owner.SessionRevision,
+		RunID:           owner.RunID,
+		Generation:      owner.Generation,
+		CheckpointKey:   checkpointManifestKey(canonical, paths.sessionDigest, owner.RunID, owner.Generation),
+		Files:           map[string]ckptFile{},
 	}
-	_ = checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(m), 0o644)
+	if err := checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(m), 0o644); err != nil {
+		return fmt.Errorf("write checkpoint manifest: %w", err)
+	}
+	return nil
 }
 
 // checkpointFile backs up a file's current (pre-edit) state once per generation.
-func checkpointFile(workDir, relPath, absPath string) {
+func checkpointFile(workDir, relPath, absPath string, owner checkpointOwner) error {
+	if !owner.valid() {
+		return errors.New("checkpoint owner is invalid")
+	}
 	canonicalWork, err := canonicalWorkspace(workDir)
 	if err != nil {
-		return
+		return fmt.Errorf("canonicalize checkpoint workspace: %w", err)
 	}
-	paths, err := validateCheckpointControlTree(canonicalWork)
+	paths, err := validateCheckpointControlTree(canonicalWork, owner.SessionID)
 	if err != nil {
-		return
+		return err
 	}
-	m, _, found, err := readManifestStrict(canonicalWork)
+	m, _, found, err := readManifestStrict(canonicalWork, owner.SessionID)
 	if err != nil || !found {
-		return
+		if err != nil {
+			return err
+		}
+		return errors.New("checkpoint manifest is unavailable")
+	}
+	if !checkpointManifestMatchesOwner(m, owner) {
+		return errors.New("checkpoint manifest belongs to a different session or run")
 	}
 
-	canonicalTarget, targetExists, _, err := resolveCheckpointCaptureTarget(canonicalWork, relPath)
+	canonicalTarget, targetExists, targetInfo, err := resolveCheckpointCaptureTarget(canonicalWork, relPath)
 	if err != nil {
-		return
+		return err
 	}
 	providedTarget, _, _, err := resolveCheckpointCaptureTarget(canonicalWork, absPath)
 	if err != nil || !sameCheckpointPath(canonicalTarget, providedTarget) {
-		return
+		if err != nil {
+			return err
+		}
+		return errors.New("checkpoint target does not match supplied path")
 	}
 	if err := rejectProtectedCheckpointTarget(canonicalTarget, canonicalWork, paths.stateDir); err != nil {
-		return
+		return err
 	}
-	storedRel, err := filepath.Rel(canonicalWork, canonicalTarget)
+	storedRel, err := checkpointTargetKey(canonicalWork, canonicalTarget)
 	if err != nil {
-		return
-	}
-	storedRel, err = cleanCheckpointRelative(storedRel)
-	if err != nil {
-		return
+		return err
 	}
 	if _, done := m.Files[storedRel]; done {
-		return
+		return nil
 	}
 
-	entry := ckptFile{}
+	entry := ckptFile{PreimageDigest: checkpointStateRevision(targetExists, nil)}
+	if !pathWithin(canonicalTarget, canonicalWork) {
+		entry.TargetPath = canonicalTarget
+	}
 	if targetExists {
+		if targetInfo == nil || !targetInfo.Mode().IsRegular() {
+			return errors.New("checkpoint preimage metadata is unavailable")
+		}
 		data, err := os.ReadFile(canonicalTarget)
 		if err != nil {
-			return
+			return fmt.Errorf("read checkpoint preimage: %w", err)
 		}
 		entry.Existed = true
+		entry.PreimageDigest = checkpointStateRevision(true, data)
+		preimageMode := uint32(targetInfo.Mode().Perm())
+		entry.PreimageMode = &preimageMode
 		entry.Backup = hex.EncodeToString(sha1Sum(storedRel)) + ".bak"
 		backupPath := filepath.Join(paths.dir, entry.Backup)
 		if err := checkpointAtomicWrite(backupPath, data, 0o600); err != nil {
-			return
+			return fmt.Errorf("write checkpoint preimage: %w", err)
 		}
 	}
 	m.Files[storedRel] = entry
-	_ = checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(m), 0o644)
+	if err := checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(m), 0o644); err != nil {
+		return fmt.Errorf("write checkpoint manifest: %w", err)
+	}
+	return nil
+}
+
+func checkpointStateRevision(exists bool, data []byte) string {
+	if exists {
+		return artifactBytesRevision(data)
+	}
+	return artifactBytesRevision([]byte("corelay-checkpoint-absent-v1"))
+}
+
+func isSHA256Revision(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	decoded, err := hex.DecodeString(value[len("sha256:"):])
+	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
+}
+
+func recordCheckpointPostimages(workDir string, owner checkpointOwner, mutations []committedFileMutation) error {
+	if !owner.valid() || len(mutations) == 0 {
+		return errors.New("checkpoint postimage update is invalid")
+	}
+	canonicalWork, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("canonicalize checkpoint workspace: %w", err)
+	}
+	paths, err := validateCheckpointControlTree(canonicalWork, owner.SessionID)
+	if err != nil {
+		return err
+	}
+	manifest, _, found, err := readManifestStrict(canonicalWork, owner.SessionID)
+	if err != nil {
+		return err
+	}
+	if !found || !checkpointManifestMatchesOwner(manifest, owner) {
+		return errors.New("checkpoint manifest belongs to a different session or run")
+	}
+	updated := make(map[string]ckptFile, len(manifest.Files))
+	for rel, entry := range manifest.Files {
+		updated[rel] = entry
+	}
+	type finalMutationPostimage struct {
+		path     string
+		revision string
+	}
+	finalPostimages := make(map[string]finalMutationPostimage, len(mutations))
+	for _, mutation := range mutations {
+		if !isSHA256Revision(mutation.PostRevision) {
+			return errors.New("mutation postimage digest is invalid")
+		}
+		path, err := filepath.Abs(mutation.Snapshot.Path)
+		if err != nil {
+			return fmt.Errorf("resolve checkpoint postimage: %w", err)
+		}
+		path = filepath.Clean(path)
+		canonicalTarget, err := canonicalizeTarget(path)
+		if err != nil {
+			return fmt.Errorf("canonicalize checkpoint postimage: %w", err)
+		}
+		rel, err := checkpointTargetKey(canonicalWork, canonicalTarget)
+		if err != nil {
+			return fmt.Errorf("invalid checkpoint postimage path: %w", err)
+		}
+		finalPostimages[rel] = finalMutationPostimage{path: canonicalTarget, revision: mutation.PostRevision}
+	}
+	keys := make([]string, 0, len(finalPostimages))
+	for rel := range finalPostimages {
+		keys = append(keys, rel)
+	}
+	sort.Strings(keys)
+	for _, rel := range keys {
+		postimage := finalPostimages[rel]
+		entry, ok := updated[rel]
+		if !ok {
+			return errors.New("checkpoint preimage is missing for a successful mutation")
+		}
+		target, exists, info, err := resolveCheckpointEntryTarget(canonicalWork, rel, entry)
+		if err != nil || !exists || info == nil || !info.Mode().IsRegular() {
+			if err != nil {
+				return fmt.Errorf("resolve checkpoint postimage target: %w", err)
+			}
+			return errors.New("checkpoint postimage target is not a regular file")
+		}
+		if !sameCheckpointPath(target, postimage.path) {
+			return errors.New("checkpoint postimage target does not match the mutation path")
+		}
+		if err := rejectProtectedCheckpointTarget(target, canonicalWork, paths.stateDir); err != nil {
+			return err
+		}
+		currentRevision, err := readLedgerFileRevision(target)
+		if err != nil {
+			return fmt.Errorf("read checkpoint postimage: %w", err)
+		}
+		if currentRevision != postimage.revision {
+			return errors.New("checkpoint postimage changed before it could be recorded")
+		}
+		entry.PostimageDigest = postimage.revision
+		entry.PostimageExisted = true
+		entry.PostimageCaptured = true
+		updated[rel] = entry
+	}
+	manifest.Files = updated
+	if err := checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(manifest), 0o644); err != nil {
+		return fmt.Errorf("write checkpoint postimage manifest: %w", err)
+	}
+	return nil
+}
+
+// settleCheckpointPostimages settles a failed mutation batch only when the
+// target is back at its captured preimage. Entries from earlier successful
+// batches remain unchanged; unexpected concurrent state stays unrecorded.
+func settleCheckpointPostimages(workDir string, owner checkpointOwner, mutationPaths []string) error {
+	if !owner.valid() || len(mutationPaths) == 0 {
+		return errors.New("checkpoint settlement is invalid")
+	}
+	canonicalWork, err := canonicalWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("canonicalize checkpoint workspace: %w", err)
+	}
+	paths, err := validateCheckpointControlTree(canonicalWork, owner.SessionID)
+	if err != nil {
+		return err
+	}
+	manifest, _, found, err := readManifestStrict(canonicalWork, owner.SessionID)
+	if err != nil {
+		return err
+	}
+	if !found || !checkpointManifestMatchesOwner(manifest, owner) {
+		return errors.New("checkpoint manifest belongs to a different session or run")
+	}
+	updated := make(map[string]ckptFile, len(manifest.Files))
+	for rel, entry := range manifest.Files {
+		updated[rel] = entry
+	}
+	seen := make(map[string]struct{}, len(mutationPaths))
+	for _, mutationPath := range mutationPaths {
+		target, exists, info, err := resolveCheckpointCaptureTarget(canonicalWork, mutationPath)
+		if err != nil {
+			return fmt.Errorf("resolve checkpoint settlement target: %w", err)
+		}
+		if exists && (info == nil || !info.Mode().IsRegular()) {
+			return errors.New("checkpoint settlement target is not a regular file")
+		}
+		if err := rejectProtectedCheckpointTarget(target, canonicalWork, paths.stateDir); err != nil {
+			return err
+		}
+		rel, err := checkpointTargetKey(canonicalWork, target)
+		if err != nil {
+			return fmt.Errorf("invalid checkpoint settlement path: %w", err)
+		}
+		if _, duplicate := seen[rel]; duplicate {
+			continue
+		}
+		seen[rel] = struct{}{}
+		entry, ok := updated[rel]
+		if !ok {
+			return fmt.Errorf("checkpoint preimage is missing for failed mutation %q", rel)
+		}
+		if entry.PostimageCaptured {
+			continue
+		}
+		var revision string
+		if exists {
+			data, readErr := os.ReadFile(target)
+			if readErr != nil {
+				return fmt.Errorf("read checkpoint settlement postimage: %w", readErr)
+			}
+			revision = checkpointStateRevision(true, data)
+		} else {
+			revision = checkpointStateRevision(false, nil)
+		}
+		if exists != entry.Existed || revision != entry.PreimageDigest {
+			return fmt.Errorf("checkpoint settlement target %q was not restored to its preimage", rel)
+		}
+		entry.PostimageDigest = revision
+		entry.PostimageExisted = exists
+		entry.PostimageCaptured = true
+		updated[rel] = entry
+	}
+	manifest.Files = updated
+	if err := checkpointAtomicWrite(paths.manifest, mustMarshalCheckpoint(manifest), 0o644); err != nil {
+		return fmt.Errorf("write checkpoint settlement manifest: %w", err)
+	}
+	return nil
 }
 
 func sha1Sum(s string) []byte {
@@ -137,171 +412,17 @@ func sha1Sum(s string) []byte {
 // undoCheckpoint preserves the original helper contract. Invalid checkpoint
 // state is safely treated as non-revertible; the explicit command path uses
 // undoCheckpointSecure so it can tell the user that validation was refused.
-func undoCheckpoint(workDir string) (reverted []string, ok bool) {
-	reverted, ok, _ = undoCheckpointSecure(workDir)
+func undoCheckpoint(workDir string, sessionID ...string) (reverted []string, ok bool) {
+	reverted, ok, _ = undoCheckpointSecure(workDir, sessionID...)
 	return reverted, ok
 }
 
-type undoAction struct {
-	rel        string
-	target     string
-	backup     []byte
-	delete     bool
-	original   []byte
-	origMode   os.FileMode
-	origExists bool
-}
-
-// undoCheckpointSecure validates and preloads the complete manifest before it
-// mutates a single workspace path. This is the critical all-or-nothing
-// preflight: one malicious or stale entry rejects the entire undo operation.
-func undoCheckpointSecure(workDir string) (reverted []string, ok bool, retErr error) {
+func readManifestStrict(workDir, sessionID string) (ckptManifest, checkpointPaths, bool, error) {
 	canonicalWork, err := canonicalWorkspace(workDir)
 	if err != nil {
-		return nil, false, fmt.Errorf("canonical workspace: %w", err)
+		return ckptManifest{}, checkpointPaths{}, false, fmt.Errorf("canonicalize checkpoint workspace: %w", err)
 	}
-	m, paths, found, err := readManifestStrict(canonicalWork)
-	if err != nil {
-		return nil, false, err
-	}
-	if !found || len(m.Files) == 0 {
-		return nil, false, nil
-	}
-
-	actions, err := preflightUndoManifest(canonicalWork, paths, m)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(actions) == 0 {
-		if err := os.RemoveAll(paths.dir); err != nil {
-			return nil, false, fmt.Errorf("clear exhausted checkpoint: %w", err)
-		}
-		return nil, false, nil
-	}
-
-	applied := make([]undoAction, 0, len(actions))
-	for _, action := range actions {
-		if action.delete {
-			if err := os.Remove(action.target); err != nil {
-				rollbackUndoActions(applied)
-				return nil, false, fmt.Errorf("delete created file %q: %w", action.rel, err)
-			}
-			reverted = append(reverted, action.rel+" (created → deleted)")
-		} else {
-			if err := checkpointAtomicWrite(action.target, action.backup, 0o644); err != nil {
-				rollbackUndoActions(applied)
-				return nil, false, fmt.Errorf("restore %q: %w", action.rel, err)
-			}
-			reverted = append(reverted, action.rel)
-		}
-		applied = append(applied, action)
-	}
-
-	if err := os.RemoveAll(paths.dir); err != nil {
-		return reverted, true, fmt.Errorf("undo completed but checkpoint cleanup failed: %w", err)
-	}
-	return reverted, len(reverted) > 0, nil
-}
-
-func preflightUndoManifest(workDir string, paths checkpointPaths, m ckptManifest) ([]undoAction, error) {
-	keys := make([]string, 0, len(m.Files))
-	for rel := range m.Files {
-		keys = append(keys, rel)
-	}
-	sort.Strings(keys)
-
-	actions := make([]undoAction, 0, len(keys))
-	targets := make(map[string]string, len(keys))
-	backups := make(map[string]string, len(keys))
-	for _, manifestRel := range keys {
-		entry := m.Files[manifestRel]
-		rel, err := cleanCheckpointRelative(manifestRel)
-		if err != nil {
-			return nil, fmt.Errorf("invalid manifest target %q: %w", manifestRel, err)
-		}
-		target, exists, info, err := resolveCheckpointTarget(workDir, rel)
-		if err != nil {
-			return nil, fmt.Errorf("resolve manifest target %q: %w", rel, err)
-		}
-		if err := rejectProtectedCheckpointTarget(target, workDir, paths.stateDir); err != nil {
-			return nil, fmt.Errorf("protected manifest target %q: %w", rel, err)
-		}
-		key := checkpointPathKey(target)
-		if previous, duplicate := targets[key]; duplicate {
-			return nil, fmt.Errorf("manifest targets %q and %q resolve to the same path", previous, rel)
-		}
-		targets[key] = rel
-
-		action := undoAction{rel: rel, target: target}
-		if exists {
-			if info == nil || !info.Mode().IsRegular() {
-				return nil, fmt.Errorf("manifest target %q is not a regular file", rel)
-			}
-			action.original, err = os.ReadFile(target)
-			if err != nil {
-				return nil, fmt.Errorf("preload current target %q: %w", rel, err)
-			}
-			action.origMode = info.Mode().Perm()
-			action.origExists = true
-		}
-
-		if entry.Existed {
-			backupRel, err := cleanCheckpointRelative(entry.Backup)
-			if err != nil {
-				return nil, fmt.Errorf("invalid backup for %q: %w", rel, err)
-			}
-			if isCheckpointControlRelative(backupRel) {
-				return nil, fmt.Errorf("backup for %q names checkpoint control state", rel)
-			}
-			backupPath, err := resolveCheckpointBackup(paths, backupRel)
-			if err != nil {
-				return nil, fmt.Errorf("resolve backup for %q: %w", rel, err)
-			}
-			backupKey := checkpointPathKey(backupPath)
-			if previous, duplicate := backups[backupKey]; duplicate {
-				return nil, fmt.Errorf("manifest entries %q and %q share one backup", previous, rel)
-			}
-			backups[backupKey] = rel
-			action.backup, err = os.ReadFile(backupPath)
-			if err != nil {
-				return nil, fmt.Errorf("preload backup for %q: %w", rel, err)
-			}
-		} else {
-			if entry.Backup != "" {
-				return nil, fmt.Errorf("created-file entry %q must not name a backup", rel)
-			}
-			if !exists {
-				continue
-			}
-			lexicalInfo, err := os.Lstat(filepath.Join(workDir, rel))
-			if err != nil {
-				return nil, fmt.Errorf("inspect created-file target %q: %w", rel, err)
-			}
-			if lexicalInfo.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf("created-file target %q changed into a symlink", rel)
-			}
-			// Generated checkpoints only mark regular newly-created files. A
-			// symlink or directory here means state changed after capture.
-			action.delete = true
-		}
-		actions = append(actions, action)
-	}
-	return actions, nil
-}
-
-func rollbackUndoActions(actions []undoAction) {
-	for index := len(actions) - 1; index >= 0; index-- {
-		action := actions[index]
-		if action.origExists {
-			_ = checkpointAtomicWrite(action.target, action.original, action.origMode)
-		} else {
-			_ = os.Remove(action.target)
-		}
-	}
-}
-
-func readManifestStrict(workDir string) (ckptManifest, checkpointPaths, bool, error) {
-	paths, err := checkpointPathsFor(workDir)
+	paths, err := checkpointPathsFor(canonicalWork, sessionID)
 	if err != nil {
 		return ckptManifest{}, checkpointPaths{}, false, err
 	}
@@ -315,7 +436,7 @@ func readManifestStrict(workDir string) (ckptManifest, checkpointPaths, bool, er
 	if !info.Mode().IsRegular() {
 		return ckptManifest{}, paths, false, errors.New("checkpoint manifest is not a regular file")
 	}
-	paths, err = validateCheckpointControlTree(workDir)
+	paths, err = validateCheckpointControlTree(canonicalWork, sessionID)
 	if err != nil {
 		return ckptManifest{}, paths, false, err
 	}
@@ -336,13 +457,13 @@ func readManifestStrict(workDir string) (ckptManifest, checkpointPaths, bool, er
 	if err := requireJSONEOF(decoder); err != nil {
 		return ckptManifest{}, paths, false, fmt.Errorf("decode checkpoint manifest: %w", err)
 	}
-	if err := validateCheckpointManifestHeader(m, workDir); err != nil {
+	if err := validateCheckpointManifestHeader(m, canonicalWork, paths); err != nil {
 		return ckptManifest{}, paths, false, err
 	}
 	return m, paths, true, nil
 }
 
-func validateCheckpointManifestHeader(m ckptManifest, workDir string) error {
+func validateCheckpointManifestHeader(m ckptManifest, workDir string, paths checkpointPaths) error {
 	if m.Version != checkpointManifestVersion {
 		return fmt.Errorf("unsupported checkpoint manifest version %d", m.Version)
 	}
@@ -359,26 +480,37 @@ func validateCheckpointManifestHeader(m ckptManifest, workDir string) error {
 	if !sameCheckpointPath(m.WorkDir, manifestWork) || !sameCheckpointPath(manifestWork, workDir) {
 		return errors.New("checkpoint manifest is bound to a different workspace")
 	}
+	if m.SessionDigest != paths.sessionDigest || !isSHA256Revision(m.SessionDigest) {
+		return errors.New("checkpoint manifest is bound to a different session")
+	}
+	if strings.TrimSpace(m.RunID) == "" || strings.TrimSpace(m.Generation) == "" {
+		return errors.New("checkpoint manifest run identity is incomplete")
+	}
+	if !isSHA256Revision(m.CheckpointKey) || m.CheckpointKey != checkpointManifestKey(workDir, m.SessionDigest, m.RunID, m.Generation) {
+		return errors.New("checkpoint manifest identity key is invalid")
+	}
 	return nil
 }
 
-func checkpointPathsFor(canonicalWork string) (checkpointPaths, error) {
+func checkpointPathsFor(canonicalWork, sessionID string) (checkpointPaths, error) {
 	stateDir, err := filepath.Abs(config.BaseDir())
 	if err != nil {
 		return checkpointPaths{}, fmt.Errorf("resolve agent state directory: %w", err)
 	}
-	sum := sha1.Sum([]byte(checkpointPathKey(canonicalWork)))
+	sessionDigest := checkpointSessionDigest(sessionID)
+	sum := sha1.Sum([]byte(checkpointPathKey(canonicalWork) + "\x00" + sessionDigest))
 	dir := filepath.Join(stateDir, "undo", hex.EncodeToString(sum[:10]))
 	return checkpointPaths{
-		stateDir: stateDir,
-		undoDir:  filepath.Join(stateDir, "undo"),
-		dir:      dir,
-		manifest: filepath.Join(dir, "manifest.json"),
+		stateDir:      stateDir,
+		undoDir:       filepath.Join(stateDir, "undo"),
+		dir:           dir,
+		manifest:      filepath.Join(dir, "manifest.json"),
+		sessionDigest: sessionDigest,
 	}, nil
 }
 
-func prepareCheckpointDirectory(canonicalWork string, clear bool) (checkpointPaths, error) {
-	paths, err := checkpointPathsFor(canonicalWork)
+func prepareCheckpointDirectory(canonicalWork, sessionID string, clear bool) (checkpointPaths, error) {
+	paths, err := checkpointPathsFor(canonicalWork, sessionID)
 	if err != nil {
 		return paths, err
 	}
@@ -409,7 +541,7 @@ func prepareCheckpointDirectory(canonicalWork string, clear bool) (checkpointPat
 			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 				return paths, errors.New("checkpoint directory is not a regular directory")
 			}
-			if _, err := validateCheckpointControlTree(canonicalWork); err != nil {
+			if _, err := validateCheckpointControlTree(canonicalWork, sessionID); err != nil {
 				return paths, err
 			}
 			if err := os.RemoveAll(paths.dir); err != nil {
@@ -422,11 +554,11 @@ func prepareCheckpointDirectory(canonicalWork string, clear bool) (checkpointPat
 	if err := os.Mkdir(paths.dir, 0o755); err != nil && !os.IsExist(err) {
 		return paths, fmt.Errorf("create checkpoint directory: %w", err)
 	}
-	return validateCheckpointControlTree(canonicalWork)
+	return validateCheckpointControlTree(canonicalWork, sessionID)
 }
 
-func validateCheckpointControlTree(canonicalWork string) (checkpointPaths, error) {
-	paths, err := checkpointPathsFor(canonicalWork)
+func validateCheckpointControlTree(canonicalWork, sessionID string) (checkpointPaths, error) {
+	paths, err := checkpointPathsFor(canonicalWork, sessionID)
 	if err != nil {
 		return paths, err
 	}
@@ -491,6 +623,9 @@ func resolveCheckpointTarget(workDir, rel string) (string, bool, os.FileInfo, er
 	if err != nil {
 		return "", false, nil, err
 	}
+	if !sameCheckpointPath(lexical, canonical) {
+		return "", false, nil, errors.New("checkpoint target changed through a symlink")
+	}
 	if !pathWithin(canonical, workDir) {
 		return "", false, nil, errors.New("target escaped workspace through a symlink")
 	}
@@ -500,6 +635,98 @@ func resolveCheckpointTarget(workDir, rel string) (string, bool, os.FileInfo, er
 			return "", false, nil, err
 		}
 		return canonical, true, resolvedInfo, nil
+	}
+	return canonical, false, nil, nil
+}
+
+const externalCheckpointKeyPrefix = "@external:"
+
+func checkpointTargetKey(workDir, target string) (string, error) {
+	canonical, err := canonicalizeTarget(target)
+	if err != nil {
+		return "", err
+	}
+	if pathWithin(canonical, workDir) {
+		rel, err := filepath.Rel(workDir, canonical)
+		if err != nil {
+			return "", err
+		}
+		cleanRel, err := cleanCheckpointRelative(rel)
+		if err != nil {
+			return "", err
+		}
+		return cleanRel, nil
+	}
+	digest := strings.TrimPrefix(artifactBytesRevision([]byte(checkpointPathKey(canonical))), "sha256:")
+	return externalCheckpointKeyPrefix + digest, nil
+}
+
+func isExternalCheckpointKey(key string) bool {
+	if !strings.HasPrefix(key, externalCheckpointKeyPrefix) {
+		return false
+	}
+	digest := strings.TrimPrefix(key, externalCheckpointKeyPrefix)
+	if len(digest) != 64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(digest)
+	return err == nil && len(decoded) == 32 && digest == strings.ToLower(digest)
+}
+
+func resolveCheckpointEntryTarget(workDir, key string, entry ckptFile) (string, bool, os.FileInfo, error) {
+	if entry.TargetPath == "" {
+		if strings.HasPrefix(key, externalCheckpointKeyPrefix) {
+			return "", false, nil, errors.New("external checkpoint target path is missing")
+		}
+		return resolveCheckpointTarget(workDir, key)
+	}
+	if !isExternalCheckpointKey(key) {
+		return "", false, nil, errors.New("external checkpoint key is invalid")
+	}
+	target, exists, info, err := resolveCheckpointExternalTarget(workDir, entry.TargetPath)
+	if err != nil {
+		return "", false, nil, err
+	}
+	derivedKey, err := checkpointTargetKey(workDir, target)
+	if err != nil || derivedKey != key {
+		if err != nil {
+			return "", false, nil, err
+		}
+		return "", false, nil, errors.New("external checkpoint target does not match its key")
+	}
+	return target, exists, info, nil
+}
+
+func resolveCheckpointExternalTarget(workDir, supplied string) (string, bool, os.FileInfo, error) {
+	if strings.TrimSpace(supplied) == "" || !filepath.IsAbs(supplied) || filepath.Clean(supplied) != supplied {
+		return "", false, nil, errors.New("external checkpoint target is not a clean absolute path")
+	}
+	if err := validatePathSyntax(supplied); err != nil {
+		return "", false, nil, err
+	}
+	_, statErr := os.Lstat(supplied)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return "", false, nil, statErr
+	}
+	canonical, err := canonicalizeTarget(supplied)
+	if err != nil {
+		return "", false, nil, err
+	}
+	if !sameCheckpointPath(supplied, canonical) {
+		return "", false, nil, errors.New("external checkpoint target changed through a symlink")
+	}
+	if pathWithin(canonical, workDir) {
+		return "", false, nil, errors.New("external checkpoint target resolves inside the workspace")
+	}
+	if statErr == nil {
+		info, err := os.Stat(canonical)
+		if err != nil {
+			return "", false, nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return "", false, nil, errors.New("external checkpoint target is not a regular file")
+		}
+		return canonical, true, info, nil
 	}
 	return canonical, false, nil, nil
 }
@@ -526,9 +753,6 @@ func resolveCheckpointCaptureTarget(workDir, supplied string) (string, bool, os.
 	canonical, err := canonicalizeTarget(absPath)
 	if err != nil {
 		return "", false, nil, err
-	}
-	if !pathWithin(canonical, workDir) {
-		return "", false, nil, errors.New("checkpoint target escaped workspace")
 	}
 	if statErr == nil {
 		info, err := os.Stat(canonical)
@@ -623,15 +847,16 @@ func rejectProtectedCheckpointTarget(target, workDir, stateDir string) error {
 	if err == nil && pathWithin(target, stateCanonical) {
 		return errors.New("target is inside agent state")
 	}
-	rel, err := filepath.Rel(workDir, target)
-	if err != nil {
-		return err
-	}
-	portable := filepath.ToSlash(rel)
-	first := strings.ToLower(strings.SplitN(portable, "/", 2)[0])
-	switch first {
-	case ".corelay", ".aniclew", ".claude-proxy", ".git", ".hg", ".svn":
-		return fmt.Errorf("target uses protected control directory %q", first)
+	for current := filepath.Clean(target); ; current = filepath.Dir(current) {
+		component := strings.ToLower(filepath.Base(current))
+		switch component {
+		case ".corelay", ".aniclew", ".claude-proxy", ".git", ".hg", ".svn":
+			return fmt.Errorf("target uses protected control directory %q", component)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
 	}
 	return nil
 }

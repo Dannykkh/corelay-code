@@ -15,12 +15,11 @@ import (
 	"github.com/Dannykkh/corelay-code/internal/acp"
 	"github.com/Dannykkh/corelay-code/internal/acpbridge"
 	"github.com/Dannykkh/corelay-code/internal/agent"
+	"github.com/Dannykkh/corelay-code/internal/buildinfo"
 	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/providers"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
-
-var version = "dev"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -52,7 +51,11 @@ func run(
 		return 2
 	}
 
-	cfg := config.Load()
+	cfg, _, err := config.LoadChecked()
+	if err != nil {
+		fmt.Fprintln(stderr, "corelaycode-acp: invalid configuration:", err)
+		return 2
+	}
 	registerCustomProviders(cfg)
 	if strings.TrimSpace(*providerName) == "" {
 		*providerName = cfg.DefaultProvider
@@ -104,7 +107,7 @@ func run(
 		DefaultModel: strings.TrimSpace(*model),
 		Store:        agent.NewSessionStore(stateDir),
 		ResponseLang: strings.TrimSpace(*responseLang),
-		Version:      version,
+		Version:      buildinfo.Version,
 		// The bridge owns each session's MCP runtime and immutable catalog, so
 		// the backend's ordinary bounded concurrency applies across sessions.
 	})

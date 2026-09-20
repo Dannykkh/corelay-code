@@ -51,9 +51,28 @@ func DefaultSandboxExecution(workDir string) (sandbox.Runner, sandbox.Policy) {
 	return runner, policy
 }
 
+// SandboxExecutionForMode binds explicit full mode to the current OS user's
+// host execution rights. It never elevates credentials. The disabled policy
+// and UnconfinedRunner name make the absence of OS isolation visible.
+func SandboxExecutionForMode(workDir string, mode ExecutionMode) (sandbox.Runner, sandbox.Policy) {
+	if mode != ExecutionModeFull {
+		return DefaultSandboxExecution(workDir)
+	}
+	runner := sandbox.NewUnconfinedRunner()
+	capabilities := runner.Capabilities()
+	return runner, sandbox.Policy{
+		Enforcement: sandbox.EnforcementDisabled,
+		Required: sandbox.Capabilities{
+			ProcessTreeKill:      capabilities.ProcessTreeKill,
+			EnvironmentFiltering: capabilities.EnvironmentFiltering,
+			Timeouts:             capabilities.Timeouts,
+		},
+	}
+}
+
 func resolveRunSandboxExecution(opts RunOptions, workDir string) (sandbox.Runner, sandbox.Policy, error) {
 	if opts.SandboxRunner == nil && opts.SandboxPolicy.Enforcement == "" {
-		runner, policy := DefaultSandboxExecution(workDir)
+		runner, policy := SandboxExecutionForMode(workDir, opts.ExecutionPolicy.Mode)
 		return runner, policy, nil
 	}
 	if opts.SandboxRunner == nil {
@@ -61,6 +80,13 @@ func resolveRunSandboxExecution(opts RunOptions, workDir string) (sandbox.Runner
 	}
 	if opts.SandboxPolicy.Enforcement == "" {
 		return nil, sandbox.Policy{}, fmt.Errorf("sandbox runner is configured without an enforcement policy")
+	}
+	if opts.ExecutionPolicy != nil && opts.ExecutionPolicy.Mode == ExecutionModeFull {
+		if opts.SandboxPolicy.Enforcement != sandbox.EnforcementDisabled || opts.SandboxRunner.Name() != "unconfined" {
+			return nil, sandbox.Policy{}, fmt.Errorf("full execution mode requires the explicit unconfined host runner")
+		}
+	} else if opts.SandboxPolicy.Enforcement == sandbox.EnforcementDisabled {
+		return nil, sandbox.Policy{}, fmt.Errorf("disabled host execution requires explicit full mode")
 	}
 	return opts.SandboxRunner, opts.SandboxPolicy, nil
 }
@@ -73,7 +99,15 @@ func configuredSandboxExecution(
 	runner sandbox.Runner,
 	policy sandbox.Policy,
 	component string,
+	fullMode ...bool,
 ) (sandbox.Runner, sandbox.Policy) {
+	explicitFull := len(fullMode) > 0 && fullMode[0]
+	if explicitFull && runner != nil && runner.Name() == "unconfined" && policy.Enforcement == sandbox.EnforcementDisabled {
+		return runner, policy
+	}
+	if explicitFull && runner == nil && policy.Enforcement == "" {
+		return SandboxExecutionForMode("", ExecutionModeFull)
+	}
 	if runner != nil && policy.Enforcement != "" && policy.Enforcement != sandbox.EnforcementDisabled {
 		return runner, policy
 	}

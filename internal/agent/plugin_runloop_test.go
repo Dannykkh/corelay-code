@@ -27,18 +27,22 @@ func (requester *pluginDecisionRequester) Open(draft approval.Draft) (approval.P
 	index := len(requester.drafts)
 	requester.mu.Unlock()
 	return approval.Pending{
-		ID:              "plugin-approval-" + string(rune('a'+index-1)),
-		SessionID:       draft.SessionID,
-		SessionRevision: draft.SessionRevision,
-		RunID:           draft.RunID,
-		ToolCallID:      draft.ToolCallID,
-		ToolName:        draft.ToolName,
-		RedactedInput:   draft.RedactedInput,
-		InputDigest:     draft.InputDigest,
-		DangerLevel:     draft.DangerLevel,
-		Scope:           draft.Scope,
-		RememberAllowed: draft.RememberAllowed,
-		ExpiresAt:       time.Now().Add(time.Minute),
+		ID:                      "plugin-approval-" + string(rune('a'+index-1)),
+		SessionID:               draft.SessionID,
+		SessionRevision:         draft.SessionRevision,
+		RunID:                   draft.RunID,
+		ToolCallID:              draft.ToolCallID,
+		ToolName:                draft.ToolName,
+		ExecutorID:              draft.ExecutorID,
+		RedactedInput:           draft.RedactedInput,
+		InputDigest:             draft.InputDigest,
+		ExecutionPolicyRevision: draft.ExecutionPolicyRevision,
+		FullSelectionRevision:   draft.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		DangerLevel:             draft.DangerLevel,
+		Scope:                   draft.Scope,
+		RememberAllowed:         draft.RememberAllowed,
+		ExpiresAt:               time.Now().Add(time.Minute),
 	}, nil
 }
 
@@ -102,7 +106,10 @@ func TestPluginDispatchAlwaysRequiresPerCallApproval(t *testing.T) {
 				caps:   securePluginCapabilities(),
 				result: sandbox.Result{Started: true, ExitCode: 0, Stdout: []byte("approved")},
 			}
-			definitions, err := manager.ExecutableToolDefs(PluginExecutionOptions{Runner: runner, Workspace: workspace})
+			executionPolicy := pluginTestExecutionPolicy(t, runner)
+			definitions, err := manager.ExecutableToolDefs(PluginExecutionOptions{
+				Runner: runner, Workspace: workspace, ExecutionPolicy: executionPolicy,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,6 +118,7 @@ func TestPluginDispatchAlwaysRequiresPerCallApproval(t *testing.T) {
 				[]toolUseBlock{dispatchTestCall("plugin-call", "plugin_dispatch", map[string]any{"value": "sensitive-value"})},
 				toolDispatchOptions{
 					Context:           context.Background(),
+					ExecutionPolicy:   &executionPolicy,
 					WorkDir:           workspace,
 					AllowedTools:      toolCatalogNames(definitions),
 					PermissionConfig:  PermissionConfig{AutoApprove: "all"},
@@ -122,6 +130,8 @@ func TestPluginDispatchAlwaysRequiresPerCallApproval(t *testing.T) {
 						executorCalls++
 						return ExecuteToolWithOptions(call.Name, call.Input, workspace, ToolExecutionOptions{
 							Context:           context.Background(),
+							ExecutionPolicy:   &executionPolicy,
+							ToolCallID:        call.ID,
 							ExpectedSessionID: "plugin-session",
 							ExpectedRunID:     "plugin-run",
 						})
@@ -158,7 +168,10 @@ func TestPluginDispatchRejectsTamperAfterApprovalBeforeExecutor(t *testing.T) {
 		caps:   securePluginCapabilities(),
 		result: sandbox.Result{Started: true, ExitCode: 0},
 	}
-	definitions, err := manager.ExecutableToolDefs(PluginExecutionOptions{Runner: runner, Workspace: workspace})
+	executionPolicy := pluginTestExecutionPolicy(t, runner)
+	definitions, err := manager.ExecutableToolDefs(PluginExecutionOptions{
+		Runner: runner, Workspace: workspace, ExecutionPolicy: executionPolicy,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +188,7 @@ func TestPluginDispatchRejectsTamperAfterApprovalBeforeExecutor(t *testing.T) {
 		[]toolUseBlock{dispatchTestCall("plugin-tamper", "plugin_tamper", map[string]any{"value": "x"})},
 		toolDispatchOptions{
 			Context:           context.Background(),
+			ExecutionPolicy:   &executionPolicy,
 			WorkDir:           workspace,
 			AllowedTools:      toolCatalogNames(definitions),
 			PermissionConfig:  PermissionConfig{AutoApprove: "all"},
@@ -227,8 +241,25 @@ func TestPluginApprovalProofIsOneShot(t *testing.T) {
 		"one-shot-session",
 		"one-shot-run",
 	)
-	options := ToolExecutionOptions{
-		Context: context.Background(), ExpectedSessionID: "one-shot-session", ExpectedRunID: "one-shot-run",
+	options := pluginApprovalTestExecutionOptions(t, identity, "one-shot-session", "one-shot-run")
+	wrongCall := options
+	wrongCall.ToolCallID = "different-call"
+	if result, isError := ExecuteToolWithOptions(definition.Name, approved, workspace, wrongCall); !isError || !strings.Contains(result, "tool call") {
+		t.Fatalf("cross-call proof result=%q error=%v", result, isError)
+	}
+	wrongPolicy := *options.ExecutionPolicy
+	wrongPolicy.Revision++
+	wrongPolicyOptions := options
+	wrongPolicyOptions.ExecutionPolicy = &wrongPolicy
+	if result, isError := ExecuteToolWithOptions(definition.Name, approved, workspace, wrongPolicyOptions); !isError || !strings.Contains(result, "policy") {
+		t.Fatalf("cross-policy proof result=%q error=%v", result, isError)
+	}
+	wrongRuntime := *options.ExecutionPolicy
+	wrongRuntime.RuntimeCapabilities.ProcessTreeKill = !wrongRuntime.RuntimeCapabilities.ProcessTreeKill
+	wrongRuntimeOptions := options
+	wrongRuntimeOptions.ExecutionPolicy = &wrongRuntime
+	if result, isError := ExecuteToolWithOptions(definition.Name, approved, workspace, wrongRuntimeOptions); !isError || !strings.Contains(result, "policy") {
+		t.Fatalf("changed-policy-snapshot proof result=%q error=%v", result, isError)
 	}
 	if result, isError := ExecuteToolWithOptions(definition.Name, approved, workspace, options); isError {
 		t.Fatalf("first execution failed: %s", result)

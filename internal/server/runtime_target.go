@@ -1,9 +1,11 @@
 package server
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/providers"
 	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
@@ -93,6 +95,35 @@ func createRuntimeProvider(cfg config.Config, name string) (types.Provider, erro
 		APIKey:  settings.APIKey,
 		BaseURL: settings.BaseURL,
 	})
+}
+
+func resolveDurableSessionProviderTarget(
+	session agent.Session,
+	activeProvider types.Provider,
+	activeModel string,
+) (types.Provider, string, error) {
+	providerName := strings.TrimSpace(session.Provider)
+	model := strings.TrimSpace(session.Model)
+	if providerName == "" && model == "" {
+		if activeProvider == nil || strings.TrimSpace(activeModel) == "" {
+			return nil, "", fmt.Errorf("legacy session has no provider/model target and no active default is available")
+		}
+		return activeProvider, strings.TrimSpace(activeModel), nil
+	}
+	if providerName == "" || model == "" {
+		return nil, "", fmt.Errorf("session provider and model must both be configured")
+	}
+	if activeProvider != nil && activeProvider.Name() == providerName {
+		return activeProvider, model, nil
+	}
+	provider, err := createRuntimeProvider(config.Load(), providerName)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := provider.Validate(); err != nil {
+		return nil, "", err
+	}
+	return provider, model, nil
 }
 
 func runtimeSessionIDFromHeaders(headers map[string]string) string {

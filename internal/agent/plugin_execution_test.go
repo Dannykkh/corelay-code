@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/approval"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
@@ -124,10 +125,12 @@ func pluginDefinitionAndIdentity(
 	observe func(PluginExecutionReport),
 ) (types.ToolDef, toolExecutorIdentity) {
 	t.Helper()
+	executionPolicy := pluginTestExecutionPolicy(t, runner)
 	definitions, err := manager.ExecutableToolDefs(PluginExecutionOptions{
-		Runner:        runner,
-		Workspace:     workspace,
-		ObserveReport: observe,
+		Runner:          runner,
+		Workspace:       workspace,
+		ExecutionPolicy: executionPolicy,
+		ObserveReport:   observe,
 	})
 	if err != nil {
 		t.Fatalf("ExecutableToolDefs: %v", err)
@@ -143,6 +146,19 @@ func pluginDefinitionAndIdentity(
 	return definitions[0], identity
 }
 
+func pluginTestExecutionPolicy(t *testing.T, runner sandbox.Runner) ExecutionPolicySnapshot {
+	t.Helper()
+	policy, err := ResolveExecutionPolicy(
+		ExecutionPolicyRequest{Mode: ExecutionModeWorkspace, Revision: 13},
+		"",
+		runner.Capabilities(),
+	)
+	if err != nil {
+		t.Fatalf("plugin execution policy: %v", err)
+	}
+	return policy
+}
+
 func approvedPluginExecutionInput(
 	t *testing.T,
 	input json.RawMessage,
@@ -151,19 +167,30 @@ func approvedPluginExecutionInput(
 	runID string,
 ) json.RawMessage {
 	t.Helper()
+	binding, err := pluginBindingForIdentity(identity)
+	if err != nil {
+		t.Fatalf("plugin binding: %v", err)
+	}
 	bound, err := bindToolExecutionInput(input, identity)
 	if err != nil {
 		t.Fatalf("bindToolExecutionInput: %v", err)
 	}
-	proof, err := mintPluginApproval(
-		"approval-"+strings.ReplaceAll(t.Name(), "/", "-"),
-		sessionID,
-		runID,
-		identity.ToolName,
-		identity.ExecutorID,
-		input,
-		time.Now().Add(time.Minute),
-	)
+	policy := binding.executionPolicy
+	callID := pluginApprovalTestCallID(identity)
+	pending := approval.Pending{
+		ID:                      "approval-" + strings.ReplaceAll(t.Name(), "/", "-"),
+		SessionID:               sessionID,
+		RunID:                   runID,
+		ToolCallID:              callID,
+		ToolName:                identity.ToolName,
+		ExecutorID:              identity.ExecutorID,
+		InputDigest:             approvalToolInputDigest(identity.ToolName, input),
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		ApprovalSource:          approval.ApprovalSourceUser,
+		ExpiresAt:               time.Now().Add(time.Minute),
+	}
+	proof, err := mintPluginApproval(pending, callID, input, policy)
 	if err != nil {
 		t.Fatalf("mintPluginApproval: %v", err)
 	}
@@ -172,6 +199,31 @@ func approvedPluginExecutionInput(
 		t.Fatalf("bindPluginApprovalExecutionInput: %v", err)
 	}
 	return approved
+}
+
+func pluginApprovalTestCallID(identity toolExecutorIdentity) string {
+	return "plugin-call:" + identity.ToolName
+}
+
+func pluginApprovalTestExecutionOptions(
+	t *testing.T,
+	identity toolExecutorIdentity,
+	sessionID string,
+	runID string,
+) ToolExecutionOptions {
+	t.Helper()
+	binding, err := pluginBindingForIdentity(identity)
+	if err != nil {
+		t.Fatalf("plugin binding: %v", err)
+	}
+	policy := binding.executionPolicy
+	return ToolExecutionOptions{
+		Context:           context.Background(),
+		ExecutionPolicy:   &policy,
+		ToolCallID:        pluginApprovalTestCallID(identity),
+		ExpectedSessionID: sessionID,
+		ExpectedRunID:     runID,
+	}
 }
 
 func TestExecutablePluginHappyPathUsesBoundExecFormAndJSONStdin(t *testing.T) {
@@ -202,9 +254,12 @@ func TestExecutablePluginHappyPathUsesBoundExecFormAndJSONStdin(t *testing.T) {
 
 	input := json.RawMessage(`{"value":"hello"}`)
 	bound := approvedPluginExecutionInput(t, input, identity, "session-happy", "run-happy")
-	result, isError := ExecuteToolWithOptions(definition.Name, bound, workspace, ToolExecutionOptions{
-		Context: context.Background(), ExpectedSessionID: "session-happy", ExpectedRunID: "run-happy",
-	})
+	result, isError := ExecuteToolWithOptions(
+		definition.Name,
+		bound,
+		workspace,
+		pluginApprovalTestExecutionOptions(t, identity, "session-happy", "run-happy"),
+	)
 	if isError || !strings.Contains(result, `"status":"ok"`) || !strings.Contains(result, "answer") {
 		t.Fatalf("plugin result = %s, error=%v", result, isError)
 	}
@@ -367,9 +422,12 @@ func TestExecutablePluginMapsTimeoutNonzeroAndOutputLimit(t *testing.T) {
 			runner := &recordingPluginRunner{caps: securePluginCapabilities(), result: test.result, report: test.report}
 			definition, identity := pluginDefinitionAndIdentity(t, manager, workspace, runner, nil)
 			bound := approvedPluginExecutionInput(t, json.RawMessage(`{"value":"x"}`), identity, "session-outcome", "run-outcome")
-			result, isError := ExecuteToolWithOptions(definition.Name, bound, workspace, ToolExecutionOptions{
-				Context: context.Background(), ExpectedSessionID: "session-outcome", ExpectedRunID: "run-outcome",
-			})
+			result, isError := ExecuteToolWithOptions(
+				definition.Name,
+				bound,
+				workspace,
+				pluginApprovalTestExecutionOptions(t, identity, "session-outcome", "run-outcome"),
+			)
 			if !isError || !strings.Contains(result, test.want) || !strings.Contains(result, `"status":"failed"`) {
 				t.Fatalf("mapped result = %s error=%v", result, isError)
 			}
@@ -389,9 +447,12 @@ func TestExecutablePluginIdentitySwapAndForgeryFailBeforeRunner(t *testing.T) {
 		if err := os.WriteFile(executable, []byte("replacement executable"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		result, isError := ExecuteToolWithOptions(definition.Name, bound, workspace, ToolExecutionOptions{
-			Context: context.Background(), ExpectedSessionID: "session-swap", ExpectedRunID: "run-swap",
-		})
+		result, isError := ExecuteToolWithOptions(
+			definition.Name,
+			bound,
+			workspace,
+			pluginApprovalTestExecutionOptions(t, identity, "session-swap", "run-swap"),
+		)
 		if !isError || !strings.Contains(result, "PLUGIN BLOCKED") || !strings.Contains(result, "changed") {
 			t.Fatalf("swap result = %q error=%v", result, isError)
 		}
@@ -429,9 +490,12 @@ func TestExecutablePluginIdentitySwapAndForgeryFailBeforeRunner(t *testing.T) {
 		runner := &recordingPluginRunner{caps: securePluginCapabilities(), result: sandbox.Result{Started: true, ExitCode: 0}}
 		definition, identity := pluginDefinitionAndIdentity(t, manager, workspace, runner, nil)
 		bound := approvedPluginExecutionInput(t, json.RawMessage(`{"value":7}`), identity, "session-invalid", "run-invalid")
-		result, isError := ExecuteToolWithOptions(definition.Name, bound, workspace, ToolExecutionOptions{
-			Context: context.Background(), ExpectedSessionID: "session-invalid", ExpectedRunID: "run-invalid",
-		})
+		result, isError := ExecuteToolWithOptions(
+			definition.Name,
+			bound,
+			workspace,
+			pluginApprovalTestExecutionOptions(t, identity, "session-invalid", "run-invalid"),
+		)
 		if !isError || !strings.Contains(result, "schema mismatch") {
 			t.Fatalf("schema result = %q error=%v", result, isError)
 		}

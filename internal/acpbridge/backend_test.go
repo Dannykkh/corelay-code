@@ -12,6 +12,7 @@ import (
 	"github.com/Dannykkh/corelay-code/internal/acp"
 	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -867,15 +868,24 @@ func TestApprovalRequesterMapsAllowDenyWithoutRawInput(t *testing.T) {
 			}}
 			requester := newApprovalRequester(client, "runtime-1", "session-1", 7, time.Minute)
 			pending, err := requester.Open(approval.Draft{
-				SessionID:     "runtime-1",
-				RunID:         "run-1",
-				ToolCallID:    "call-1",
-				ToolName:      "Bash",
-				RedactedInput: `{"password":"raw-secret-value"}`,
-				InputDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				SessionID:               "runtime-1",
+				SessionRevision:         7,
+				RunID:                   "run-1",
+				ToolCallID:              "call-1",
+				ToolName:                "Bash",
+				ExecutorID:              "executor-1",
+				RedactedInput:           `{"password":"raw-secret-value"}`,
+				InputDigest:             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				ExecutionPolicyRevision: 9,
+				DangerLevel:             "dangerous",
+				Scope:                   "process",
 			})
 			if err != nil {
 				t.Fatal(err)
+			}
+			if pending.ApprovalSource != approval.ApprovalSourceUser || pending.ExecutorID != "executor-1" ||
+				pending.ExecutionPolicyRevision != 9 || pending.SessionRevision != 7 {
+				t.Fatalf("approval metadata was not preserved: %#v", pending)
 			}
 			resolution, err := requester.Await(context.Background(), "runtime-1", pending.ID)
 			if err != nil || resolution.Allowed() != test.wantAllow {
@@ -891,6 +901,41 @@ func TestApprovalRequesterMapsAllowDenyWithoutRawInput(t *testing.T) {
 				t.Fatalf("permission request = %#v", permissions)
 			}
 		})
+	}
+}
+
+func TestApprovalRequesterFullModeGrantIsBoundAndConsumedOnce(t *testing.T) {
+	policy, err := agent.ResolveExecutionPolicy(
+		agent.ExecutionPolicyRequest{Mode: agent.ExecutionModeFull}, "", sandbox.Capabilities{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingClient{}
+	requester := newApprovalRequester(client, "runtime-1", "session-1", 7, time.Minute)
+	defer requester.Shutdown()
+	draft := approval.Draft{
+		SessionID: "runtime-1", SessionRevision: 7, RunID: "run-1", ToolCallID: "call-1",
+		ToolName: "host_interaction", ExecutorID: "executor-1", RedactedInput: `{"input":"omitted"}`,
+		InputDigest:             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ExecutionPolicyRevision: policy.Revision, FullSelectionRevision: policy.FullSelectionRevision,
+		DangerLevel: "dangerous", Scope: "host",
+	}
+	grant, err := requester.IssueFullModeGrant(draft, policy)
+	if err != nil {
+		t.Fatalf("IssueFullModeGrant() error = %v", err)
+	}
+	if grant.ApprovalSource != approval.ApprovalSourceUserSelectedFull || grant.FullSelectionRevision != policy.Revision {
+		t.Fatalf("full-mode grant = %#v", grant)
+	}
+	if _, permissions := client.snapshot(); len(permissions) != 0 {
+		t.Fatalf("full-mode grant unexpectedly prompted the ACP client: %#v", permissions)
+	}
+	if err := requester.ConsumeFullModeGrant(grant, draft, policy); err != nil {
+		t.Fatalf("ConsumeFullModeGrant() error = %v", err)
+	}
+	if err := requester.ConsumeFullModeGrant(grant, draft, policy); err == nil {
+		t.Fatal("replayed full-mode grant was accepted")
 	}
 }
 

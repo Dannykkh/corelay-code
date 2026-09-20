@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
 func TestSessionStoreForkCreatesIndependentImmutableSnapshot(t *testing.T) {
@@ -16,10 +18,23 @@ func TestSessionStoreForkCreatesIndependentImmutableSnapshot(t *testing.T) {
 	workspace := filepath.Join(base, "workspace")
 	store := NewSessionStore(base)
 	parent := &Session{
-		Workspace: workspace,
-		Title:     "parent title",
-		Provider:  "ollama",
-		Model:     "qwen",
+		Workspace:    workspace,
+		WorkstreamID: "ws-roadmap",
+		PlanID:       "plan-01",
+		StageID:      "stage-02",
+		Title:        "parent title",
+		Provider:     "ollama",
+		Model:        "qwen",
+		ExecutionPolicy: func() *ExecutionPolicySnapshot {
+			policy, policyErr := ResolveExecutionPolicy(ExecutionPolicyRequest{Mode: ExecutionModeFull}, "", sandbox.Capabilities{
+				FilesystemIsolation: true,
+				NetworkIsolation:    true,
+			})
+			if policyErr != nil {
+				t.Fatalf("ResolveExecutionPolicy(parent) = %v", policyErr)
+			}
+			return &policy
+		}(),
 		Messages: []SessionMessage{{
 			Role:    "tool",
 			Content: "tool call",
@@ -58,8 +73,16 @@ func TestSessionStoreForkCreatesIndependentImmutableSnapshot(t *testing.T) {
 		if fork.LifecycleStatus != SessionLifecycleActive || fork.ReconcileRequired || fork.Interruption != nil {
 			t.Fatalf("fork lifecycle = %+v", sessionResumeState(*fork))
 		}
-		if fork.Workspace != parent.Workspace || fork.Provider != parent.Provider || fork.Model != parent.Model {
+		if fork.Workspace != parent.Workspace || fork.WorkstreamID != parent.WorkstreamID ||
+			fork.PlanID != parent.PlanID || fork.StageID != parent.StageID ||
+			fork.Provider != parent.Provider || fork.Model != parent.Model {
 			t.Fatalf("fork identity snapshot = %+v", fork)
+		}
+		if fork.ExecutionPolicy == nil || fork.ExecutionPolicy.Mode != ExecutionModeFull ||
+			fork.ExecutionPolicy.Source != "inherited" || fork.ExecutionPolicy.ParentRevision != parent.ExecutionPolicy.Revision ||
+			fork.ExecutionPolicy.FullSelectionRevision != parent.ExecutionPolicy.FullSelectionRevision ||
+			!fork.ExecutionPolicy.RuntimeCapabilities.IsZero() {
+			t.Fatalf("fork execution policy inherited runtime facts or lost authority lineage: %#v", fork.ExecutionPolicy)
 		}
 	}
 
@@ -85,6 +108,70 @@ func TestSessionStoreForkCreatesIndependentImmutableSnapshot(t *testing.T) {
 	secondNested := secondAfter.Messages[0].ToolInput.(map[string]any)["nested"].(map[string]any)["value"]
 	if parentNested != "original" || secondNested != "original" {
 		t.Fatalf("fork snapshots share nested tool input: parent=%v second=%v", parentNested, secondNested)
+	}
+}
+
+func TestSessionStoreForkMigratesVersionOneParent(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	store := NewSessionStore(base)
+	dir, err := store.workspaceDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := Session{
+		Version: legacyVersionedSession, Revision: 3,
+		ID: opaqueTestSessionID("g"), Workspace: workspace,
+		Title: "version one", Provider: "openai", Model: "model-v1",
+		LifecycleStatus: SessionLifecycleActive, LastCommittedRevision: 3,
+		Messages: []SessionMessage{{Role: "user", Content: "parent transcript"}},
+	}
+	writeLegacySession(t, dir, parent)
+
+	child, err := store.Fork(parent.ID, parent.Revision)
+	if err != nil {
+		t.Fatalf("Fork(v1 parent) = %v", err)
+	}
+	if child.Version != currentSessionVersion || child.Revision != 1 ||
+		child.ParentSessionID != parent.ID || child.ParentRevision != parent.Revision ||
+		child.Provider != parent.Provider || child.Model != parent.Model {
+		t.Fatalf("fork from v1 parent = %#v", child)
+	}
+	reloaded, err := store.Get(parent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Version != legacyVersionedSession || reloaded.Revision != parent.Revision {
+		t.Fatalf("Fork mutated v1 parent: v%d/r%d", reloaded.Version, reloaded.Revision)
+	}
+}
+
+func TestSessionStoreLifecycleUpdateMigratesVersionOneSession(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	store := NewSessionStore(base)
+	dir, err := store.workspaceDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := Session{
+		Version: legacyVersionedSession, Revision: 4,
+		ID: opaqueTestSessionID("h"), Workspace: workspace,
+		Title: "version one", Provider: "anthropic", Model: "model-v1",
+		LifecycleStatus: SessionLifecycleActive, LastCommittedRevision: 4,
+		Messages: []SessionMessage{{Role: "user", Content: "keep this transcript"}},
+	}
+	writeLegacySession(t, dir, session)
+
+	closed, err := store.Close(session.ID, session.Revision)
+	if err != nil {
+		t.Fatalf("Close(v1 session) = %v", err)
+	}
+	if closed.Version != currentSessionVersion || closed.Revision != session.Revision+1 ||
+		closed.LifecycleStatus != SessionLifecycleClosed || closed.Provider != session.Provider ||
+		closed.Model != session.Model || len(closed.Messages) != 1 ||
+		closed.Messages[0].Content != session.Messages[0].Content {
+		t.Fatalf("closed v1 session = %#v", closed)
 	}
 }
 
@@ -256,6 +343,12 @@ func TestSessionStoreForkAndParentSaveAreLinearizable(t *testing.T) {
 func TestSessionStoreInterruptionRequiresExplicitReconciliation(t *testing.T) {
 	base := t.TempDir()
 	workspace := filepath.Join(base, "workspace")
+	stateDir := filepath.Join(base, "state")
+	t.Setenv("CORELAY_CONFIG_DIR", stateDir)
+	t.Setenv("ANICLEW_CONFIG_DIR", "")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	store := NewSessionStore(base)
 	sess := &Session{Workspace: workspace, Title: "active"}
 	if err := store.Save(sess); err != nil {
@@ -265,11 +358,39 @@ func TestSessionStoreInterruptionRequiresExplicitReconciliation(t *testing.T) {
 		t.Fatalf("new lifecycle = %+v", sessionResumeState(*sess))
 	}
 
+	runID := "run-store-reconcile"
+	owner := newCheckpointOwner(sess.ID, 1, runID)
+	trackedPath := filepath.Join(workspace, "tracked.txt")
+	if err := os.WriteFile(trackedPath, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := startCheckpoint(workspace, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpointFile(workspace, "tracked.txt", trackedPath, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("agent result"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	postimage, err := readLedgerFileRevision(trackedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordCheckpointPostimages(workspace, owner, []committedFileMutation{{
+		Snapshot: fileMutationSnapshot{Path: trackedPath}, PostRevision: postimage,
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	marker := SessionInterruption{
-		At:         time.Date(2026, 8, 12, 3, 4, 5, 0, time.FixedZone("test", 9*60*60)),
-		Reason:     "client disconnected after dispatch",
-		ToolName:   "bash_exec",
-		ToolCallID: "tool-1",
+		At:              time.Date(2026, 8, 12, 3, 4, 5, 0, time.FixedZone("test", 9*60*60)),
+		Reason:          "client disconnected after dispatch",
+		RunID:           runID,
+		ToolName:        "Write",
+		ToolCallID:      "tool-1",
+		InputDigest:     artifactBytesRevision([]byte("redacted input")),
+		SideEffectState: SessionSideEffectStarted,
+		Summary:         "write started before client disconnect",
 	}
 	interrupted, err := store.MarkInterrupted(sess.ID, 1, marker)
 	if err != nil {
@@ -297,17 +418,53 @@ func TestSessionStoreInterruptionRequiresExplicitReconciliation(t *testing.T) {
 	if !state.ReconcileRequired || state.LastCommittedRevision != 1 || state.Interruption == nil {
 		t.Fatalf("ResumeState = %+v", state)
 	}
-	if _, err := store.MarkReconciled(sess.ID, 1); !errors.Is(err, ErrSessionRevisionConflict) {
-		t.Fatalf("MarkReconciled(stale) = %v", err)
+	if _, err := store.MarkReconciled(sess.ID, 2); !errors.Is(err, ErrSessionReconcileRequired) {
+		t.Fatalf("MarkReconciled(without evidence) = %v", err)
 	}
-
-	reconciled, err := store.MarkReconciled(sess.ID, 2)
+	assessment, err := AssessSessionReconciliation(interrupted)
 	if err != nil {
-		t.Fatalf("MarkReconciled = %v", err)
+		t.Fatalf("AssessSessionReconciliation() = %v", err)
+	}
+	if assessment.MatchesPostimage != 1 || assessment.ManualConfirmationRequired {
+		t.Fatalf("initial reconciliation evidence = %+v", assessment)
+	}
+	receipt, err := NewSessionReconciliationReceipt(assessment, false, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("NewSessionReconciliationReceipt() = %v", err)
+	}
+	if _, err := store.MarkReconciledWithReceipt(sess.ID, 1, assessment.RunID, receipt); !errors.Is(err, ErrSessionRevisionConflict) {
+		t.Fatalf("MarkReconciledWithReceipt(stale) = %v", err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("user edit after preview"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkReconciledWithReceipt(sess.ID, 2, assessment.RunID, receipt); !errors.Is(err, ErrSessionReconcileRequired) {
+		t.Fatalf("MarkReconciledWithReceipt(stale evidence) = %v", err)
+	}
+	stillBlocked, err := store.Get(sess.ID)
+	if err != nil || !stillBlocked.ReconcileRequired {
+		t.Fatalf("stale evidence cleared marker: session=%+v err=%v", stillBlocked, err)
+	}
+	assessment, err = AssessSessionReconciliation(stillBlocked)
+	if err != nil || assessment.Diverged != 1 || !assessment.ManualConfirmationRequired {
+		t.Fatalf("updated conflict evidence = %+v, err=%v", assessment, err)
+	}
+	receipt, err = NewSessionReconciliationReceipt(assessment, true, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("manual reconciliation receipt = %v", err)
+	}
+	reconciled, err := store.MarkReconciledWithReceipt(sess.ID, 2, assessment.RunID, receipt)
+	if err != nil {
+		t.Fatalf("MarkReconciledWithReceipt = %v", err)
 	}
 	if reconciled.Revision != 3 || reconciled.LastCommittedRevision != 3 ||
-		reconciled.LifecycleStatus != SessionLifecycleActive || reconciled.ReconcileRequired || reconciled.Interruption != nil {
+		reconciled.LifecycleStatus != SessionLifecycleActive || reconciled.ReconcileRequired || reconciled.Interruption != nil ||
+		reconciled.LastReconciliation == nil || reconciled.LastReconciliation.EvidenceDigest != assessment.EvidenceDigest ||
+		!reconciled.LastReconciliation.ManualConfirmationAcknowledged {
 		t.Fatalf("reconciled lifecycle = %+v", reconciled)
+	}
+	if content, err := os.ReadFile(trackedPath); err != nil || string(content) != "user edit after preview" {
+		t.Fatalf("reconciliation changed the user's file: %q, err=%v", content, err)
 	}
 	closed, err := store.Close(sess.ID, 3)
 	if err != nil {

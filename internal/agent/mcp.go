@@ -3,23 +3,37 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/processsupervisor"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 )
 
+const (
+	maxMCPConfigPaths     = 64
+	maxMCPConfigFileBytes = 256 * 1024
+)
+
+var errMCPConfigMissingServers = errors.New("missing mcpServers")
+
 // MCPServerConfig represents an MCP server from .mcp.json
 type MCPServerConfig struct {
+	Type    string            `json:"type,omitempty"`
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // MCPConfig represents the .mcp.json file structure
@@ -60,9 +74,15 @@ func ParseMCPConfig(configJSON string) (*MCPConfig, error) {
 		if strings.TrimSpace(name) == "" {
 			return nil, fmt.Errorf("parse .mcp.json: server name is empty")
 		}
-		if strings.TrimSpace(server.Command) == "" {
+		kind := strings.ToLower(strings.TrimSpace(server.Type))
+		if kind == "http" {
+			if strings.TrimSpace(server.URL) == "" {
+				return nil, fmt.Errorf("parse .mcp.json: server %q URL is empty", name)
+			}
+		} else if strings.TrimSpace(server.Command) == "" {
 			return nil, fmt.Errorf("parse .mcp.json: server %q command is empty", name)
 		}
+		server.Type = kind
 		server.Args = append([]string(nil), server.Args...)
 		server.Env = cloneMCPEnvironment(server.Env)
 		cfg.MCPServers[name] = server
@@ -70,9 +90,172 @@ func ParseMCPConfig(configJSON string) (*MCPConfig, error) {
 	return &cfg, nil
 }
 
+// configuredMCPConfigPaths returns only the operator-configured supplemental
+// paths. A malformed application config produces no paths here; the caller's
+// normal configuration validation reports that failure separately.
+func configuredMCPConfigPaths() []string {
+	cfg, _, err := config.LoadChecked()
+	if err != nil {
+		return nil
+	}
+	return append([]string(nil), cfg.MCPConfigPaths...)
+}
+
+// LoadMCPConfigWithPaths merges the workspace and supplemental MCP sources in
+// increasing precedence order. The later source replaces a server with the
+// same name, while unrelated servers are retained:
+// user settings < configured paths (listed order) < workspace settings <
+// workspace mcp.json < workspace .mcp.json.
+//
+// Supplemental paths are resolved relative to workDir unless absolute. They
+// are explicit operator configuration, so a missing or malformed file fails
+// closed. The boolean reports whether at least one source was present.
+func LoadMCPConfigWithPaths(workDir string, supplementalPaths []string) (string, bool, error) {
+	workspace := strings.TrimSpace(workDir)
+	if workspace == "" {
+		return "", false, errors.New("MCP workspace is empty")
+	}
+	workspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", false, errors.New("MCP workspace is invalid")
+	}
+
+	merged := MCPConfig{MCPServers: make(map[string]MCPServerConfig)}
+	present := false
+	seenPaths := make(map[string]struct{})
+	mergePath := func(path string, required bool) error {
+		canonical, resolveErr := resolveMCPConfigPath(workspace, path)
+		if resolveErr != nil {
+			if required {
+				return resolveErr
+			}
+			return nil
+		}
+		key := canonical
+		if _, duplicate := seenPaths[key]; duplicate {
+			return nil
+		}
+		seenPaths[key] = struct{}{}
+		file, readErr := os.Open(canonical)
+		if errors.Is(readErr, os.ErrNotExist) {
+			if required {
+				return fmt.Errorf("MCP config %q was not found", path)
+			}
+			return nil
+		}
+		if readErr != nil {
+			return fmt.Errorf("read MCP config %q: %w", path, readErr)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, maxMCPConfigFileBytes+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return fmt.Errorf("read MCP config %q: %w", path, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("read MCP config %q: %w", path, closeErr)
+		}
+		if len(data) > maxMCPConfigFileBytes {
+			return fmt.Errorf("MCP config %q exceeds %d bytes", path, maxMCPConfigFileBytes)
+		}
+		cfg, parseErr := parseMCPConfigSource(data)
+		if parseErr != nil {
+			if errors.Is(parseErr, errMCPConfigMissingServers) && !required {
+				return nil
+			}
+			return fmt.Errorf("parse MCP config %q: %w", path, parseErr)
+		}
+		present = true
+		for name, server := range cfg.MCPServers {
+			merged.MCPServers[name] = cloneMCPServerConfig(server)
+		}
+		return nil
+	}
+
+	// The user-level settings file remains the lowest-precedence default.
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
+		if err := mergePath(filepath.Join(home, ".claude", "settings.json"), false); err != nil {
+			return "", false, err
+		}
+	}
+	if len(supplementalPaths) > maxMCPConfigPaths {
+		return "", false, fmt.Errorf("MCP config path count exceeds %d", maxMCPConfigPaths)
+	}
+	for _, path := range supplementalPaths {
+		if strings.TrimSpace(path) == "" {
+			return "", false, errors.New("MCP config path is empty")
+		}
+		if err := mergePath(path, true); err != nil {
+			return "", false, err
+		}
+	}
+	if err := mergePath(filepath.Join(workspace, ".claude", "settings.json"), false); err != nil {
+		return "", false, err
+	}
+	if err := mergePath(filepath.Join(workspace, "mcp.json"), false); err != nil {
+		return "", false, err
+	}
+	if err := mergePath(filepath.Join(workspace, ".mcp.json"), false); err != nil {
+		return "", false, err
+	}
+	if !present {
+		return "", false, nil
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return "", false, fmt.Errorf("encode merged MCP config: %w", err)
+	}
+	return string(encoded), true, nil
+}
+
+func resolveMCPConfigPath(workspace, path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" || len(path) > 4096 || strings.IndexByte(path, 0) >= 0 {
+		return "", errors.New("MCP config path is invalid")
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil || strings.TrimSpace(home) == "" {
+			return "", errors.New("MCP config home path is unavailable")
+		}
+		path = filepath.Join(home, strings.TrimLeft(path[1:], "/\\"))
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(workspace, path)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", errors.New("MCP config path is invalid")
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func parseMCPConfigSource(data []byte) (*MCPConfig, error) {
+	if cfg, err := ParseMCPConfig(string(data)); err == nil {
+		return cfg, nil
+	}
+	var settings struct {
+		MCPServers map[string]MCPServerConfig `json:"mcpServers"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	if err := decoder.Decode(&settings); err != nil {
+		return nil, err
+	}
+	if settings.MCPServers == nil {
+		return nil, errMCPConfigMissingServers
+	}
+	encoded, err := json.Marshal(MCPConfig{MCPServers: settings.MCPServers})
+	if err != nil {
+		return nil, err
+	}
+	return ParseMCPConfig(string(encoded))
+}
+
 // ListMCPServers returns available MCP server names and their commands.
 func ListMCPServers(workDir string) []map[string]string {
-	configJSON := LoadMCPConfig(workDir)
+	configJSON, _, err := LoadMCPConfigWithPaths(workDir, configuredMCPConfigPaths())
+	if err != nil {
+		return nil
+	}
 	if configJSON == "" {
 		return nil
 	}
@@ -94,6 +277,12 @@ func ListMCPServers(workDir string) []map[string]string {
 		status := "stopped"
 		if conn, ok := mcpConnections[name]; ok && conn.Running {
 			status = "running"
+		} else {
+			mcpClientsMu.RLock()
+			if client, connected := mcpClients[name]; connected && client.isRunning() {
+				status = "running"
+			}
+			mcpClientsMu.RUnlock()
 		}
 		servers = append(servers, map[string]string{
 			"name":    name,
@@ -112,7 +301,10 @@ func StartMCPServer(name string, workDir string) (string, error) {
 // StartMCPServerWithOptions starts one configured server through the explicit
 // long-lived process contract. A zero options value fails before process start.
 func StartMCPServerWithOptions(name string, workDir string, opts MCPExecutionOptions) (string, error) {
-	configJSON := LoadMCPConfig(workDir)
+	configJSON, _, err := LoadMCPConfigWithPaths(workDir, configuredMCPConfigPaths())
+	if err != nil {
+		return "", err
+	}
 	cfg, err := ParseMCPConfig(configJSON)
 	if err != nil {
 		return "", err
@@ -121,6 +313,9 @@ func StartMCPServerWithOptions(name string, workDir string, opts MCPExecutionOpt
 	srv, ok := cfg.MCPServers[name]
 	if !ok {
 		return "", fmt.Errorf("MCP server '%s' not found in config", name)
+	}
+	if strings.EqualFold(strings.TrimSpace(srv.Type), "http") {
+		return "", errors.New("HTTP MCP servers are connected by a run-owned runtime; start is not applicable")
 	}
 
 	process, _, err := startMCPProcess(opts, srv.Command, srv.Args, workDir, srv.Env)
@@ -176,9 +371,10 @@ func StopMCPServer(name string) string {
 
 func cloneMCPServerConfig(config MCPServerConfig) MCPServerConfig {
 	return MCPServerConfig{
-		Command: config.Command,
-		Args:    append([]string(nil), config.Args...),
-		Env:     cloneMCPEnvironment(config.Env),
+		Type: config.Type, Command: config.Command,
+		Args: append([]string(nil), config.Args...),
+		Env:  cloneMCPEnvironment(config.Env),
+		URL:  config.URL, Headers: cloneMCPEnvironment(config.Headers),
 	}
 }
 

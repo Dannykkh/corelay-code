@@ -25,7 +25,9 @@ func TestIsConcurrencySafe(t *testing.T) {
 		{"Bash", map[string]interface{}{"command": "git status"}, true},
 		{"Bash", map[string]interface{}{"command": "git log --oneline"}, true},
 		{"Bash", map[string]interface{}{"command": "grep -r foo src/"}, true},
-		{"Bash", map[string]interface{}{"command": "find . -name '*.go'"}, true},
+		{"Bash", map[string]interface{}{"command": "find . -name *.go"}, true},
+		{"Git", map[string]interface{}{"command": "status", "args": "--short"}, true},
+		{"Git", map[string]interface{}{"command": "branch", "args": "--list feature/*"}, true},
 
 		// Bash: unsafe
 		{"Bash", map[string]interface{}{"command": "cd src && ls"}, false},
@@ -38,6 +40,15 @@ func TestIsConcurrencySafe(t *testing.T) {
 		{"Bash", map[string]interface{}{"command": "sudo apt install"}, false},
 		{"Bash", map[string]interface{}{"command": "mv a.txt b.txt"}, false},
 		{"Bash", map[string]interface{}{"command": "kill -9 1234"}, false},
+		{"Bash", map[string]interface{}{"command": "find . -delete"}, false},
+		{"Bash", map[string]interface{}{"command": "python -c \"open('x','w').write('x')\""}, false},
+		{"Bash", map[string]interface{}{"command": "git branch feature/new"}, false},
+		{"Bash", map[string]interface{}{"command": "echo x > output.txt"}, false},
+		{"Bash", map[string]interface{}{"command": "ls && python -c open"}, false},
+		{"Bash", map[string]interface{}{"command": "echo 'a;b'"}, false},
+		{"Bash", map[string]interface{}{"command": "unknown-tool --version"}, false},
+		{"Git", map[string]interface{}{"command": "branch", "args": "feature/new"}, false},
+		{"Git", map[string]interface{}{"command": "unknown-subcommand", "args": ""}, false},
 
 		// Unknown tool
 		{"CustomTool", nil, false},

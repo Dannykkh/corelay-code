@@ -45,9 +45,15 @@ func runTeamRun(args []string) {
 	providerName := fs.String("provider", "", "Provider name (default: plan, saved config, or ollama)")
 	model := fs.String("model", "", "Model ID (default: plan, saved config, or qwen3:8b)")
 	workDir := fs.String("workdir", "", "Workspace directory (default: saved config or cwd)")
+	modeFlag := fs.String("mode", "", "Per-run execution mode: read-only, workspace, or full (default: workspace)")
 	baseDir := fs.String("base-dir", "", "State directory (default: ~/.corelay)")
 	verifyCommand := fs.String("verify", "", "Override or set plan verification command")
 	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "team: %v\n", err)
+		os.Exit(2)
+	}
+	mode, err := parseExecutionModeFlag(*modeFlag)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "team: %v\n", err)
 		os.Exit(2)
 	}
@@ -65,7 +71,11 @@ func runTeamRun(args []string) {
 		os.Exit(2)
 	}
 
-	cfg := config.Load()
+	cfg, _, err := config.LoadChecked()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "team: invalid configuration: %v\n", err)
+		os.Exit(2)
+	}
 	registerWorkerCustomProviders(cfg)
 
 	if *providerName == "" {
@@ -109,7 +119,11 @@ func runTeamRun(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	sandboxRunner, sandboxPolicy := agent.DefaultSandboxExecution(*workDir)
+	sandboxRunner, sandboxPolicy, executionPolicy, err := resolveCLIExecutionPolicy(*workDir, mode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "team: invalid execution mode: %v\n", err)
+		os.Exit(2)
+	}
 	runner := agent.NewTeam(provider, *model, *workDir, *baseDir, agent.TeamConfig{
 		Name:            plan.Name,
 		VerifyCommand:   plan.VerifyCommand,
@@ -117,6 +131,7 @@ func runTeamRun(args []string) {
 		ProviderFactory: createProviderByName,
 		SandboxRunner:   sandboxRunner,
 		SandboxPolicy:   sandboxPolicy,
+		ExecutionPolicy: &executionPolicy,
 	})
 	for _, task := range plan.ToTeamTasks() {
 		runner.AddTask(task)
@@ -126,6 +141,7 @@ func runTeamRun(args []string) {
 	go func() {
 		defer close(eventCh)
 		verification := agent.ReceiptVerification{Status: "not-run", Source: "none"}
+		eventCh <- agent.Event{Type: "status", Data: fmt.Sprintf("Execution mode: %s (revision %d)", executionPolicy.Mode, executionPolicy.Revision)}
 		eventCh <- agent.Event{Type: "status", Data: fmt.Sprintf("TeamPlan %q: %d task(s)", plan.Name, len(plan.Tasks))}
 		if err := runner.ExecuteWaves(ctx, eventCh); err != nil {
 			eventCh <- agent.Event{Type: "error", Data: err.Error()}

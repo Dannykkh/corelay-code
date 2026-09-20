@@ -120,8 +120,8 @@ func TestDefaultWebProvidersIgnoreOllamaAPIKey(t *testing.T) {
 	if got := webSearchDefaultProvider(); got != "duckduckgo" {
 		t.Fatalf("webSearchDefaultProvider() = %q, want duckduckgo", got)
 	}
-	if got := webFetchDefaultProvider(); got != "direct" {
-		t.Fatalf("webFetchDefaultProvider() = %q, want direct", got)
+	if got := webFetchDefaultProvider(); got != "auto" {
+		t.Fatalf("webFetchDefaultProvider() = %q, want auto", got)
 	}
 }
 
@@ -336,17 +336,17 @@ func TestRunSearchProvidersKeepsFastResultsWhenAnotherProviderTimesOut(t *testin
 }
 
 func TestResearchFetchProviderSeparatesSearchAndFetch(t *testing.T) {
-	if got := researchFetchProvider(webResearchArgs{Provider: "google"}); got != "direct" {
-		t.Fatalf("google search should fetch direct, got %q", got)
+	if got := researchFetchProvider(webResearchArgs{Provider: "google"}); got != "auto" {
+		t.Fatalf("google search should fetch automatically, got %q", got)
 	}
-	if got := researchFetchProvider(webResearchArgs{Provider: "multi"}); got != "direct" {
-		t.Fatalf("multi search should fetch direct, got %q", got)
+	if got := researchFetchProvider(webResearchArgs{Provider: "multi"}); got != "auto" {
+		t.Fatalf("multi search should fetch automatically, got %q", got)
 	}
 	if got := researchFetchProvider(webResearchArgs{Provider: "ollama"}); got != "ollama" {
 		t.Fatalf("explicit ollama should fetch with ollama, got %q", got)
 	}
-	if got := researchFetchProvider(webResearchArgs{Providers: []string{"ollama", "duckduckgo"}}); got != "direct" {
-		t.Fatalf("mixed search providers should fetch direct, got %q", got)
+	if got := researchFetchProvider(webResearchArgs{Providers: []string{"ollama", "duckduckgo"}}); got != "auto" {
+		t.Fatalf("mixed search providers should fetch automatically, got %q", got)
 	}
 }
 

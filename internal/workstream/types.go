@@ -30,6 +30,7 @@ type Workstream struct {
 	Status           Status             `json:"status"`
 	Summary          string             `json:"summary,omitempty"`
 	NextAction       string             `json:"nextAction,omitempty"`
+	Decisions        []string           `json:"decisions,omitempty"`
 	OpenQuestions    []string           `json:"openQuestions,omitempty"`
 	Tags             []string           `json:"tags,omitempty"`
 	Goal             Goal               `json:"goal"`
@@ -73,6 +74,7 @@ type CreateRequest struct {
 	Title      string
 	Summary    string
 	NextAction string
+	Decisions  []string
 	Tags       []string
 	Goal       Goal
 }
@@ -81,15 +83,18 @@ type Patch struct {
 	Status           *Status
 	Summary          *string
 	NextAction       *string
+	Decisions        []string
 	OpenQuestions    []string
 	Tags             []string
 	Goal             *Goal
 	LastVerification *VerificationResult
+	HasDecisions     bool
 }
 
 type HandoffOptions struct {
 	IncludeReceipts    bool
 	IncludeMemoryIndex bool
+	PlanID             string
 }
 
 type HandoffSnapshot struct {

@@ -29,6 +29,8 @@ const (
 	maxCompactionInteractions     = 32
 	maxCompactionFiles            = 64
 	maxCompactionEvidence         = 16
+	maxCompactionUserInstructions = 8
+	maxCompactionContextItems     = 12
 	maxCompactionNarrativeBytes   = 4 * 1024
 	maxCompactionPromptBytes      = 12 * 1024
 	compactionProviderTimeout     = 30 * time.Second
@@ -157,10 +159,9 @@ func deterministicToolResultReference(toolName, content, digest string) string {
 	}
 	preview = sanitizeReceiptString(preview)
 	return fmt.Sprintf(
-		"[Historical tool result reference]\ntool=%s\nbytes=%d\ndigest=%s\nreference=tool-result://%s\npreview:\n%s",
+		"[Historical tool result preview; full result was not stored]\ntool=%s\nbytes=%d\ncontent-digest=sha256:%s\nreload=unavailable\npreview:\n%s",
 		sanitizeSnapshotText(toolName, 128),
 		len(content),
-		digest,
 		strings.TrimPrefix(digest, "sha256:"),
 		preview,
 	)
@@ -175,14 +176,20 @@ type CompactionState struct {
 	Evidence         *EvidenceLedger
 	Decisions        []string
 	PendingApprovals []string
+	UserInstructions []string
+	Context          CompactionContext
 }
 
 type CompactionPlanState struct {
+	WorkstreamID   string   `json:"workstreamId,omitempty"`
+	ID             string   `json:"id,omitempty"`
 	Objective      string   `json:"objective"`
 	CurrentStep    string   `json:"currentStep,omitempty"`
 	RemainingSteps []string `json:"remainingSteps,omitempty"`
 	Acceptance     []string `json:"acceptance,omitempty"`
-	Revision       int      `json:"revision"`
+	Revision       uint64   `json:"revision"`
+	StateRevision  uint64   `json:"stateRevision,omitempty"`
+	StageID        string   `json:"stageId,omitempty"`
 }
 
 type CompactionFileState struct {
@@ -212,28 +219,40 @@ type CompactionEvidenceState struct {
 	SummaryDigest string `json:"summaryDigest,omitempty"`
 }
 
+type CompactionVerificationState struct {
+	Status        string `json:"status,omitempty"`
+	Source        string `json:"source,omitempty"`
+	SummaryDigest string `json:"summaryDigest,omitempty"`
+}
+
 // CompactionSnapshot is deterministic for the same transcript and durable run
 // state. It contains digests and redacted bounded fields, never raw tool input,
 // result payload, command, credential, or full prompt.
 type CompactionSnapshot struct {
-	Version                int                         `json:"version"`
-	Digest                 string                      `json:"digest"`
-	Strategy               string                      `json:"strategy"`
-	BeforeMessages         int                         `json:"beforeMessages"`
-	AfterMessages          int                         `json:"afterMessages"`
-	Objective              string                      `json:"objective"`
-	Plan                   CompactionPlanState         `json:"plan"`
-	Decisions              []string                    `json:"decisions,omitempty"`
-	Files                  []CompactionFileState       `json:"files,omitempty"`
-	ToolInteractions       []CompactionToolInteraction `json:"toolInteractions,omitempty"`
-	FailedActions          []CompactionFailureState    `json:"failedActions,omitempty"`
-	EvidenceDecision       string                      `json:"evidenceDecision,omitempty"`
-	EvidenceMode           string                      `json:"evidenceMode,omitempty"`
-	Evidence               []CompactionEvidenceState   `json:"evidence,omitempty"`
-	PendingApprovalDigests []string                    `json:"pendingApprovalDigests,omitempty"`
-	DurableReferences      []string                    `json:"durableReferences,omitempty"`
-	UnresolvedPairDigests  []string                    `json:"unresolvedPairDigests,omitempty"`
-	LLMFallbackReason      string                      `json:"llmFallbackReason,omitempty"`
+	Version                int                          `json:"version"`
+	Digest                 string                       `json:"digest"`
+	Strategy               string                       `json:"strategy"`
+	BeforeMessages         int                          `json:"beforeMessages"`
+	AfterMessages          int                          `json:"afterMessages"`
+	Objective              string                       `json:"objective"`
+	UserInstructions       []string                     `json:"userInstructions,omitempty"`
+	WorkstreamID           string                       `json:"workstreamId,omitempty"`
+	WorkstreamObjective    string                       `json:"workstreamObjective,omitempty"`
+	Constraints            []string                     `json:"constraints,omitempty"`
+	Plan                   CompactionPlanState          `json:"plan"`
+	Decisions              []string                     `json:"decisions,omitempty"`
+	PlanEvidence           []CompactionPlanEvidence     `json:"planEvidence,omitempty"`
+	LastVerification       *CompactionVerificationState `json:"lastVerification,omitempty"`
+	Files                  []CompactionFileState        `json:"files,omitempty"`
+	ToolInteractions       []CompactionToolInteraction  `json:"toolInteractions,omitempty"`
+	FailedActions          []CompactionFailureState     `json:"failedActions,omitempty"`
+	EvidenceDecision       string                       `json:"evidenceDecision,omitempty"`
+	EvidenceMode           string                       `json:"evidenceMode,omitempty"`
+	Evidence               []CompactionEvidenceState    `json:"evidence,omitempty"`
+	PendingApprovalDigests []string                     `json:"pendingApprovalDigests,omitempty"`
+	DurableReferences      []string                     `json:"durableReferences,omitempty"`
+	UnresolvedPairDigests  []string                     `json:"unresolvedPairDigests,omitempty"`
+	LLMFallbackReason      string                       `json:"llmFallbackReason,omitempty"`
 }
 
 type CompactionResult struct {
@@ -520,29 +539,59 @@ func withCompactionHooks(
 
 func buildCompactionSnapshot(messages []types.Message, state CompactionState) CompactionSnapshot {
 	objective := strings.TrimSpace(state.Objective)
-	if state.PlanAnchor != nil && state.PlanAnchor.Valid() {
-		objective = state.PlanAnchor.Objective()
-	}
 	if objective == "" {
-		objective = firstObjectiveText(messages)
+		objective = latestObjectiveText(messages)
+	}
+	userInstructions := state.UserInstructions
+	if len(userInstructions) == 0 {
+		userInstructions = userInstructionTexts(messages)
 	}
 
 	snapshot := CompactionSnapshot{
-		Version:        1,
-		BeforeMessages: len(messages),
-		Objective:      sanitizeSnapshotText(objective, 1200),
-		Decisions:      sanitizeSnapshotList(state.Decisions, 16, 400),
+		Version:             1,
+		BeforeMessages:      len(messages),
+		Objective:           sanitizeSnapshotText(objective, 1200),
+		UserInstructions:    sanitizeUserInstructionList(userInstructions),
+		WorkstreamID:        sanitizeSnapshotText(state.Context.WorkstreamID, 256),
+		WorkstreamObjective: sanitizeSnapshotText(state.Context.WorkstreamObjective, 1200),
+		Constraints:         sanitizeRecentSnapshotList(state.Context.Constraints, maxCompactionContextItems, 300),
+		Decisions:           sanitizeRecentSnapshotList(append(append([]string(nil), state.Context.Decisions...), state.Decisions...), maxCompactionContextItems, 300),
+		PlanEvidence:        sanitizeCompactionPlanEvidence(state.Context.PlanEvidence),
+	}
+	verification := CompactionVerificationState{
+		Status: sanitizeSnapshotText(state.Context.LastVerificationStatus, 64),
+		Source: sanitizeSnapshotText(state.Context.LastVerificationSource, 128),
+	}
+	if summary := sanitizeSnapshotText(state.Context.LastVerificationSummary, 600); summary != "" {
+		verification.SummaryDigest = sha256String(summary)
+	}
+	if verification.Status != "" || verification.Source != "" || verification.SummaryDigest != "" {
+		snapshot.LastVerification = &verification
 	}
 	if state.PlanAnchor != nil && state.PlanAnchor.Valid() {
 		snapshot.Plan = CompactionPlanState{
+			WorkstreamID:   sanitizeSnapshotText(state.Context.WorkstreamID, 256),
+			ID:             sanitizeSnapshotText(state.Context.PlanID, 256),
 			Objective:      sanitizeSnapshotText(state.PlanAnchor.Objective(), 1200),
 			CurrentStep:    sanitizeSnapshotText(state.PlanAnchor.CurrentStep(), 400),
 			RemainingSteps: sanitizeSnapshotList(state.PlanAnchor.RemainingSteps(), 32, 400),
 			Acceptance:     sanitizeSnapshotList(state.PlanAnchor.DefinitionOfDone(), 32, 400),
-			Revision:       state.PlanAnchor.Revision(),
+			Revision:       uint64(state.PlanAnchor.Revision()),
+			StateRevision:  state.Context.PlanStateRevision,
+			StageID:        sanitizeSnapshotText(state.Context.StageID, 256),
+		}
+		if state.Context.PlanRevision != 0 {
+			snapshot.Plan.Revision = state.Context.PlanRevision
 		}
 	} else {
-		snapshot.Plan.Objective = snapshot.Objective
+		snapshot.Plan = CompactionPlanState{
+			WorkstreamID:  sanitizeSnapshotText(state.Context.WorkstreamID, 256),
+			ID:            sanitizeSnapshotText(state.Context.PlanID, 256),
+			Objective:     snapshot.Objective,
+			Revision:      state.Context.PlanRevision,
+			StateRevision: state.Context.PlanStateRevision,
+			StageID:       sanitizeSnapshotText(state.Context.StageID, 256),
+		}
 	}
 
 	pairs := collectToolPairs(messages)
@@ -619,7 +668,7 @@ func buildCompactionSnapshot(messages []types.Message, state CompactionState) Co
 			})
 		}
 	}
-	for _, approval := range state.PendingApprovals {
+	for _, approval := range tailStrings(state.PendingApprovals, maxCompactionContextItems) {
 		if approval = strings.TrimSpace(approval); approval != "" {
 			snapshot.PendingApprovalDigests = append(snapshot.PendingApprovalDigests, sha256String(approval))
 		}
@@ -654,7 +703,7 @@ func buildCompactedMessages(
 	})
 
 	for index := recentStart; index < len(messages); index++ {
-		if index == objectiveIndex {
+		if index == objectiveIndex && objectiveIndex < recentStart {
 			continue
 		}
 		result = appendAlternatingMessage(result, messages[index])
@@ -758,21 +807,38 @@ func requestCompactionNarrative(
 }
 
 func compactionNarrativeSource(messages []types.Message) string {
-	var builder strings.Builder
-	for _, message := range messages {
-		text := messageTextForCompaction(message)
-		if text == "" {
+	units := historyUnits(messages)
+	selected := make([][]string, 0, len(units))
+	selectedBytes := 0
+	limit := maxCompactionPromptBytes / 2
+	for unitIndex := len(units) - 1; unitIndex >= 0; unitIndex-- {
+		unit := units[unitIndex]
+		lines := make([]string, 0, unit.end-unit.start)
+		unitBytes := 0
+		for index := unit.start; index < unit.end; index++ {
+			message := messages[index]
+			text := sanitizeSnapshotText(messageTextForCompaction(message), 400)
+			if text == "" {
+				continue
+			}
+			line := fmt.Sprintf("[%s] %s\n", message.Role, text)
+			lines = append(lines, line)
+			unitBytes += len(line)
+		}
+		if len(lines) == 0 {
 			continue
 		}
-		text = sanitizeSnapshotText(text, 400)
-		if text == "" {
-			continue
-		}
-		line := fmt.Sprintf("[%s] %s\n", message.Role, text)
-		if builder.Len()+len(line) > maxCompactionPromptBytes/2 {
+		if selectedBytes+unitBytes > limit {
 			break
 		}
-		builder.WriteString(line)
+		selected = append(selected, lines)
+		selectedBytes += unitBytes
+	}
+	var builder strings.Builder
+	for unitIndex := len(selected) - 1; unitIndex >= 0; unitIndex-- {
+		for _, line := range selected[unitIndex] {
+			builder.WriteString(line)
+		}
 	}
 	return builder.String()
 }
@@ -1008,22 +1074,126 @@ func toolNamesByUseID(messages []types.Message) map[string]string {
 }
 
 func firstObjectiveIndex(messages []types.Message) int {
-	for index, message := range messages {
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
 		if message.Role != "user" || len(toolResultIDs(message.Content)) > 0 {
 			continue
 		}
-		if strings.TrimSpace(messageTextForCompaction(message)) != "" {
+		if strings.TrimSpace(userInstructionText(message)) != "" {
 			return index
 		}
 	}
 	return -1
 }
 
-func firstObjectiveText(messages []types.Message) string {
+func latestObjectiveText(messages []types.Message) string {
 	if index := firstObjectiveIndex(messages); index >= 0 {
-		return messageTextForCompaction(messages[index])
+		return userInstructionText(messages[index])
 	}
 	return ""
+}
+
+func userInstructionTexts(messages []types.Message) []string {
+	var instructions []string
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			if previous, ok := priorCompactionUserInstructions(message); ok {
+				instructions = append([]string(nil), previous...)
+				continue
+			}
+		}
+		if message.Role != "user" || len(toolResultIDs(message.Content)) > 0 {
+			continue
+		}
+		if text := strings.TrimSpace(userInstructionText(message)); text != "" {
+			instructions = appendRecentInstruction(instructions, text)
+		}
+	}
+	return boundUserInstructionCount(instructions)
+}
+
+func priorCompactionUserInstructions(message types.Message) ([]string, bool) {
+	text := messageTextForCompaction(message)
+	const prefix = "[Structured Conversation State]\n"
+	if !strings.HasPrefix(text, prefix) {
+		return nil, false
+	}
+	payload := strings.TrimPrefix(text, prefix)
+	if structured, _, found := strings.Cut(payload, "\n\nNarrative:\n"); found {
+		payload = structured
+	}
+	var snapshot CompactionSnapshot
+	if json.Unmarshal([]byte(payload), &snapshot) != nil ||
+		snapshot.Version != 1 || snapshot.Digest == "" || compactionSnapshotDigest(snapshot) != snapshot.Digest {
+		return nil, false
+	}
+	return append([]string(nil), snapshot.UserInstructions...), true
+}
+
+func appendRecentInstruction(instructions []string, text string) []string {
+	for index, previous := range instructions {
+		if previous == text {
+			copy(instructions[index:], instructions[index+1:])
+			instructions = instructions[:len(instructions)-1]
+			break
+		}
+	}
+	return append(instructions, text)
+}
+
+func renderRecentUserInstructions(messages []types.Message, latestOverride string) string {
+	instructions := userInstructionTexts(messages)
+	if latestOverride = strings.TrimSpace(latestOverride); latestOverride != "" {
+		if len(instructions) == 0 {
+			instructions = append(instructions, latestOverride)
+		} else {
+			instructions[len(instructions)-1] = latestOverride
+		}
+	}
+	instructions = sanitizeUserInstructionList(instructions)
+	if len(instructions) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("## User instructions in conversation order\n")
+	builder.WriteString("Apply later corrections when earlier user instructions conflict.\n")
+	for _, instruction := range instructions {
+		builder.WriteString("- ")
+		builder.WriteString(instruction)
+		builder.WriteByte('\n')
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func userInstructionText(message types.Message) string {
+	var text string
+	if json.Unmarshal(message.Content, &text) == nil {
+		return meaningfulInstructionText(text)
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(message.Content, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, block := range blocks {
+		var blockType string
+		if json.Unmarshal(block["type"], &blockType) != nil || blockType != "text" {
+			continue
+		}
+		var value string
+		if json.Unmarshal(block["text"], &value) == nil && strings.TrimSpace(value) != "" {
+			parts = append(parts, strings.TrimSpace(value))
+		}
+	}
+	return meaningfulInstructionText(strings.Join(parts, "\n"))
+}
+
+func meaningfulInstructionText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "(preserved context continues)" {
+		return ""
+	}
+	return value
 }
 
 func compactEditPath(input json.RawMessage) string {
@@ -1040,7 +1210,7 @@ func compactEditPath(input json.RawMessage) string {
 	return ""
 }
 
-var toolResultReferencePattern = regexp.MustCompile(`(?i)(?:digest=|tool-result://)(?:sha256:)?([a-f0-9]{64})`)
+var toolResultReferencePattern = regexp.MustCompile(`(?i)tool-result://sha256:([a-f0-9]{64})`)
 
 func embeddedToolResultReference(content string) string {
 	match := toolResultReferencePattern.FindStringSubmatch(content)
@@ -1083,6 +1253,93 @@ func sanitizeSnapshotList(values []string, maxItems, maxBytes int) []string {
 		}
 	}
 	return result
+}
+
+func sanitizeRecentSnapshotList(values []string, maxItems, maxBytes int) []string {
+	values = tailStrings(values, maxItems)
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if sanitized := sanitizeRecentSnapshotText(value, maxBytes); sanitized != "" {
+			result = append(result, sanitized)
+		}
+	}
+	return result
+}
+
+// boundUserInstructionCount keeps the original request and the most recent
+// corrections within a fixed-size envelope. The middle is intentionally
+// bounded when a conversation contains more than the snapshot limit.
+func boundUserInstructionCount(values []string) []string {
+	if len(values) <= maxCompactionUserInstructions {
+		return append([]string(nil), values...)
+	}
+	result := make([]string, 0, maxCompactionUserInstructions)
+	result = append(result, values[0])
+	result = append(result, values[len(values)-(maxCompactionUserInstructions-1):]...)
+	return result
+}
+
+func sanitizeUserInstructionList(values []string) []string {
+	return sanitizeRecentSnapshotList(boundUserInstructionCount(values), maxCompactionUserInstructions, 600)
+}
+
+func sanitizeRecentSnapshotText(value string, maxBytes int) string {
+	value = sanitizeReceiptString(strings.TrimSpace(value))
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	const marker = "\n...[middle omitted]...\n"
+	if maxBytes <= len(marker) {
+		return contextUTF8Suffix(value, maxBytes)
+	}
+	available := maxBytes - len(marker)
+	headBytes := available * 2 / 3
+	tailBytes := available - headBytes
+	return contextUTF8Prefix(value, headBytes) + marker + contextUTF8Suffix(value, tailBytes)
+}
+
+func sanitizeCompactionPlanEvidence(values []CompactionPlanEvidence) []CompactionPlanEvidence {
+	if len(values) > maxCompactionContextItems {
+		values = values[len(values)-maxCompactionContextItems:]
+	}
+	result := make([]CompactionPlanEvidence, 0, len(values))
+	for _, value := range values {
+		result = append(result, CompactionPlanEvidence{
+			StageID:             sanitizeSnapshotText(value.StageID, 256),
+			StageStatus:         sanitizeSnapshotText(value.StageStatus, 64),
+			AttemptStatus:       sanitizeSnapshotText(value.AttemptStatus, 64),
+			AttemptPlanRevision: value.AttemptPlanRevision,
+			ReceiptDigest:       sanitizePlanEvidenceDigest(value.ReceiptDigest),
+			CriteriaDigest:      sanitizePlanEvidenceDigest(value.CriteriaDigest),
+			VerificationStatus:  sanitizeSnapshotText(value.VerificationStatus, 64),
+			CompletionStatus:    sanitizeSnapshotText(value.CompletionStatus, 64),
+		})
+	}
+	return result
+}
+
+func sanitizePlanEvidenceDigest(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	hexDigest := strings.TrimPrefix(value, "sha256:")
+	if len(hexDigest) != 64 {
+		return ""
+	}
+	for _, char := range hexDigest {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return ""
+		}
+	}
+	return "sha256:" + hexDigest
+}
+
+func tailStrings(values []string, limit int) []string {
+	if len(values) == 0 || limit <= 0 {
+		return nil
+	}
+	if len(values) > limit {
+		values = values[len(values)-limit:]
+	}
+	return append([]string(nil), values...)
 }
 
 func compactionSnapshotDigest(snapshot CompactionSnapshot) string {

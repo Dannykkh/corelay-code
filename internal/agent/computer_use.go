@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
 
@@ -145,23 +147,32 @@ type HostInteractionReport struct {
 }
 
 type HostInteractionExecutionOptions struct {
-	Context           context.Context
-	Driver            HostInteractionDriver
-	Policy            HostInteractionPolicy
-	ExpectedSessionID string
-	ExpectedRunID     string
-	ObserveReport     func(HostInteractionReport)
-	approval          hostInteractionApprovalProof
+	Context            context.Context
+	Driver             HostInteractionDriver
+	Policy             HostInteractionPolicy
+	ExpectedSessionID  string
+	ExpectedRunID      string
+	ExpectedToolCallID string
+	ExpectedExecutorID string
+	ExecutionPolicy    *ExecutionPolicySnapshot
+	ObserveReport      func(HostInteractionReport)
+	approval           hostInteractionApprovalProof
 }
 
 type hostInteractionApprovalProof struct {
-	ApprovalID  string `json:"approval_id"`
-	SessionID   string `json:"session_id"`
-	RunID       string `json:"run_id"`
-	ToolName    string `json:"tool_name"`
-	InputDigest string `json:"input_digest"`
-	ExpiresAt   int64  `json:"expires_at"`
-	Signature   string `json:"signature"`
+	ApprovalID              string                   `json:"approval_id"`
+	SessionID               string                   `json:"session_id"`
+	RunID                   string                   `json:"run_id"`
+	ToolCallID              string                   `json:"tool_call_id"`
+	ToolName                string                   `json:"tool_name"`
+	ExecutorID              string                   `json:"executor_id"`
+	ApprovalSource          approval.ApprovalSource  `json:"approval_source"`
+	ExecutionPolicy         executionpolicy.Snapshot `json:"execution_policy"`
+	ExecutionPolicyRevision uint64                   `json:"execution_policy_revision"`
+	FullSelectionRevision   uint64                   `json:"full_selection_revision"`
+	InputDigest             string                   `json:"input_digest"`
+	ExpiresAt               int64                    `json:"expires_at"`
+	Signature               string                   `json:"signature"`
 }
 
 type hostInteractionExecutionEnvelope struct {
@@ -377,7 +388,9 @@ func ExecuteComputerUseToolWithOptions(
 	if action == HostActionFileManager {
 		return finish(HostInteractionResponse{}, HostFailureCapabilityUnavailable, "FileManager host execution is disabled; use workspace-scoped file tools")
 	}
-	if strings.TrimSpace(opts.ExpectedSessionID) == "" || strings.TrimSpace(opts.ExpectedRunID) == "" {
+	if strings.TrimSpace(opts.ExpectedSessionID) == "" || strings.TrimSpace(opts.ExpectedRunID) == "" ||
+		strings.TrimSpace(opts.ExpectedToolCallID) == "" || strings.TrimSpace(opts.ExpectedExecutorID) == "" ||
+		opts.ExecutionPolicy == nil {
 		return finish(HostInteractionResponse{}, HostFailureConfigurationInvalid, "host approval execution binding is not configured")
 	}
 	if strings.TrimSpace(opts.approval.ApprovalID) == "" {
@@ -389,6 +402,9 @@ func ExecuteComputerUseToolWithOptions(
 		input,
 		opts.ExpectedSessionID,
 		opts.ExpectedRunID,
+		opts.ExpectedToolCallID,
+		opts.ExpectedExecutorID,
+		opts.ExecutionPolicy,
 	); err != nil {
 		return finish(HostInteractionResponse{}, HostFailureApprovalInvalid, "operator approval proof is invalid")
 	}
@@ -631,8 +647,7 @@ func maxHostInteractionOutput(action HostActionKind) int {
 }
 
 func hostInteractionInputDigest(name string, input json.RawMessage) string {
-	digest := sha256.Sum256(append([]byte(name+"\x00"), input...))
-	return "sha256:" + hex.EncodeToString(digest[:])
+	return approvalToolInputDigest(name, input)
 }
 
 func ensureHostInteractionProofKey() ([]byte, error) {
@@ -654,24 +669,40 @@ func ensureHostInteractionProofKey() ([]byte, error) {
 }
 
 func mintHostInteractionApproval(
-	approvalID string,
-	sessionID string,
-	runID string,
-	toolName string,
+	pending approval.Pending,
+	toolCallID string,
 	input json.RawMessage,
-	expiresAt time.Time,
+	policy ExecutionPolicySnapshot,
 ) (hostInteractionApprovalProof, error) {
-	proof := hostInteractionApprovalProof{
-		ApprovalID:  strings.TrimSpace(approvalID),
-		SessionID:   strings.TrimSpace(sessionID),
-		RunID:       strings.TrimSpace(runID),
-		ToolName:    toolName,
-		InputDigest: hostInteractionInputDigest(toolName, input),
-		ExpiresAt:   expiresAt.UnixNano(),
+	if err := validateApprovalProofMetadata(
+		pending,
+		toolCallID,
+		pending.ToolName,
+		pending.ExecutorID,
+		input,
+		policy,
+	); err != nil {
+		return hostInteractionApprovalProof{}, err
 	}
-	if proof.ApprovalID == "" || proof.SessionID == "" || proof.RunID == "" ||
-		!isHostInteractionTool(toolName) || expiresAt.IsZero() || !expiresAt.After(time.Now()) {
-		return hostInteractionApprovalProof{}, errors.New("host approval metadata is incomplete")
+	if pending.ExecutorID != "builtin:"+pending.ToolName {
+		return hostInteractionApprovalProof{}, errors.New("host approval executor identity is invalid")
+	}
+	if !isHostInteractionTool(pending.ToolName) {
+		return hostInteractionApprovalProof{}, errors.New("host approval tool identity is invalid")
+	}
+	proof := hostInteractionApprovalProof{
+		ApprovalID:              strings.TrimSpace(pending.ID),
+		SessionID:               strings.TrimSpace(pending.SessionID),
+		RunID:                   strings.TrimSpace(pending.RunID),
+		ToolCallID:              strings.TrimSpace(toolCallID),
+		ToolName:                strings.TrimSpace(pending.ToolName),
+		ExecutorID:              strings.TrimSpace(pending.ExecutorID),
+		ApprovalSource:          pending.ApprovalSource,
+		ExecutionPolicy:         policy,
+		ExecutionPolicyRevision: policy.Revision,
+		FullSelectionRevision:   policy.FullSelectionRevision,
+		InputDigest:             pending.InputDigest,
+		ExpiresAt:               pending.ExpiresAt.UnixNano(),
 	}
 	signature, err := signHostInteractionApproval(proof)
 	if err != nil {
@@ -702,12 +733,34 @@ func validateHostInteractionApproval(
 	input json.RawMessage,
 	expectedSessionID string,
 	expectedRunID string,
+	expectedToolCallID string,
+	expectedExecutorID string,
+	policy *ExecutionPolicySnapshot,
 ) error {
-	if proof.SessionID != expectedSessionID || proof.RunID != expectedRunID {
-		return errors.New("host approval is not bound to the active session and run")
+	if policy == nil {
+		return errors.New("host approval execution policy is not configured")
 	}
-	if proof.ToolName != name || proof.InputDigest != hostInteractionInputDigest(name, input) {
+	if err := executionpolicy.ValidateSnapshot(*policy); err != nil {
+		return fmt.Errorf("host approval execution policy is invalid: %w", err)
+	}
+	if strings.TrimSpace(expectedSessionID) == "" || strings.TrimSpace(expectedRunID) == "" ||
+		strings.TrimSpace(expectedToolCallID) == "" || strings.TrimSpace(expectedExecutorID) == "" {
+		return errors.New("host approval execution binding is not configured")
+	}
+	if proof.SessionID != expectedSessionID || proof.RunID != expectedRunID || proof.ToolCallID != expectedToolCallID {
+		return errors.New("host approval is not bound to the active session, run, and tool call")
+	}
+	if proof.ToolName != name || proof.ExecutorID != expectedExecutorID ||
+		proof.ExecutorID != "builtin:"+name || proof.InputDigest != approvalToolInputDigest(name, input) {
 		return errors.New("host approval is not bound to this action")
+	}
+	if proof.ExecutionPolicy != *policy ||
+		proof.ExecutionPolicyRevision != policy.Revision ||
+		proof.FullSelectionRevision != policy.FullSelectionRevision {
+		return errors.New("host approval is not bound to the active execution policy")
+	}
+	if err := validateApprovalProofSource(proof.ApprovalSource, *policy); err != nil {
+		return err
 	}
 	if proof.ApprovalID == "" || proof.SessionID == "" || proof.RunID == "" || proof.Signature == "" {
 		return errors.New("host approval metadata is incomplete")

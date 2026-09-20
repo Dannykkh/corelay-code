@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -40,7 +39,7 @@ func TestStreamTurnApprovalDecisions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			decisions := make(chan capturedApprovalDecision, 1)
 			resolved := make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/api/agent":
 					w.Header().Set("Content-Type", "text/event-stream")
@@ -124,7 +123,7 @@ func TestStreamTurnApprovalDecisions(t *testing.T) {
 }
 
 func TestApprovalConflictCancelsTurnFailClosed(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/agent":
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -187,7 +186,7 @@ func TestPlainStreamRejectsOversizedSSE(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				tt.write(w)
 			}))
@@ -208,7 +207,7 @@ func TestPlainStreamRejectsOversizedSSE(t *testing.T) {
 
 func TestPlainStreamReturnsBoundedSanitizedHTTPError(t *testing.T) {
 	const token = "plain-stream-secret"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("\x1b[31mdenied\x1b[0m\x00\xff token=" + token + " " + strings.Repeat("z", 6000)))
 	}))
@@ -242,7 +241,7 @@ func TestPlainStreamReturnsBoundedSanitizedHTTPError(t *testing.T) {
 }
 
 func TestPlainStreamSanitizesTextEvents(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeChatTestEvent(t, w, "text", "한글\x1b]52;c;secret\x07 안전\x00")
 		writeChatTestEvent(t, w, "done", map[string]bool{"ok": true})
@@ -267,7 +266,7 @@ func TestPlainStreamSanitizesTextEvents(t *testing.T) {
 }
 
 func TestPlainStreamTextOnlyEOFIsUnknownTerminal(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeChatTestEvent(t, w, "text", "partial answer")
 	}))
@@ -291,7 +290,7 @@ func TestPlainStreamTextOnlyEOFIsUnknownTerminal(t *testing.T) {
 }
 
 func TestPlainStreamDoneReturnsSuccess(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeChatTestEvent(t, w, "text", "complete answer")
 		writeChatTestEvent(t, w, "done", map[string]any{
@@ -342,7 +341,7 @@ func TestPlainOneShotUnknownTerminalExitsNonzero(t *testing.T) {
 		return
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/config":
 			w.Header().Set("Content-Type", "application/json")
@@ -387,7 +386,7 @@ func TestApprovalRequiresFutureExpiry(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var resolveCalls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/api/agent":
 					w.Header().Set("Content-Type", "text/event-stream")
@@ -447,7 +446,7 @@ func TestApprovalResolutionDeadlineUsesEarlierBound(t *testing.T) {
 }
 
 func TestStreamTurnReturnsBlockedCompletionError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newDurableChatStubServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/agent" {
 			http.NotFound(w, r)
 			return

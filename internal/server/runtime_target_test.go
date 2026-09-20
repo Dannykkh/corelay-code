@@ -9,12 +9,65 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/agent"
 	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/providers"
 	"github.com/Dannykkh/corelay-code/internal/router"
 	"github.com/Dannykkh/corelay-code/internal/runtimeplane"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
+
+func TestResolveDurableSessionProviderTargetUsesPersistedProviderAndModel(t *testing.T) {
+	isolateConfigHome(t)
+	cfg := config.DefaultConfig()
+	cfg.Providers = map[string]config.ProviderSettings{
+		"openai": {APIKey: "configured-session-openai-key"},
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	provider, model, err := resolveDurableSessionProviderTarget(
+		agent.Session{Provider: "openai", Model: "session-custom-model"},
+		runtimeStatusTestProvider{name: "anthropic", displayName: "Anthropic"},
+		"server-default-model",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider == nil || provider.Name() != "openai" || model != "session-custom-model" {
+		t.Fatalf("resolved target = provider %v model %q", provider, model)
+	}
+	openAI, ok := provider.(*providers.OpenAICompat)
+	if !ok {
+		t.Fatalf("provider type = %T, want OpenAI-compatible", provider)
+	}
+	_, auth := openAI.AuthHeader()
+	if auth != "Bearer configured-session-openai-key" {
+		t.Fatalf("session provider did not use configured credentials: %q", auth)
+	}
+}
+
+func TestResolveDurableSessionProviderTargetUsesLegacyDefaultsAndRejectsIncompleteTargets(t *testing.T) {
+	active := runtimeStatusTestProvider{name: "anthropic", displayName: "Anthropic"}
+	provider, model, err := resolveDurableSessionProviderTarget(agent.Session{}, active, "server-model")
+	if err != nil || provider == nil || provider.Name() != active.Name() || model != "server-model" {
+		t.Fatalf("legacy empty target = (%v, %q, %v)", provider, model, err)
+	}
+	for _, session := range []agent.Session{
+		{Provider: "openai"},
+		{Model: "session-model"},
+	} {
+		if _, _, err := resolveDurableSessionProviderTarget(session, active, "server-model"); err == nil {
+			t.Fatalf("incomplete target %#v unexpectedly resolved", session)
+		}
+	}
+	if _, _, err := resolveDurableSessionProviderTarget(
+		agent.Session{Provider: "session-provider-does-not-exist", Model: "session-model"}, active, "server-model",
+	); err == nil {
+		t.Fatal("unknown session provider unexpectedly fell back to active provider")
+	}
+}
 
 func TestResolveDirectRuntimeProviderSwitchesByRequestedModel(t *testing.T) {
 	isolateConfigHome(t)

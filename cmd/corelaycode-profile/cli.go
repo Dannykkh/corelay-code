@@ -10,9 +10,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/Dannykkh/corelay-code/internal/buildinfo"
 	"github.com/Dannykkh/corelay-code/internal/capabilityprofile"
 	"github.com/Dannykkh/corelay-code/internal/config"
 	"github.com/Dannykkh/corelay-code/internal/providers"
@@ -106,6 +108,9 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 		printUsage(stderr)
 		return 2
 	}
+	if args[0] == "version" {
+		return runProfileVersion(stdout)
+	}
 	if dependencies.loadConfig == nil || dependencies.createProvider == nil || dependencies.createTarget == nil ||
 		dependencies.createIsolation == nil || dependencies.clock == nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: runtime composition is unavailable")
@@ -120,6 +125,8 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 		return runStatus(args[1:], stdout, stderr, dependencies)
 	case "run":
 		return runProfile(ctx, args[1:], stdout, stderr, dependencies)
+	case "improve":
+		return runProfileMode(ctx, args[1:], stdout, stderr, dependencies, true)
 	case "compare":
 		return runCompare(args[1:], stdout, stderr, dependencies)
 	case "help", "-h", "--help":
@@ -130,6 +137,21 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 		printUsage(stderr)
 		return 2
 	}
+}
+
+func runProfileVersion(stdout io.Writer) int {
+	fmt.Fprintf(stdout, "Corelay Code profiler version: %s\n", safeProfileMetadata(buildinfo.Version))
+	fmt.Fprintf(stdout, "Build commit: %s\n", safeProfileMetadata(buildinfo.Commit))
+	fmt.Fprintf(stdout, "Go runtime: %s\n", runtime.Version())
+	return 0
+}
+
+func safeProfileMetadata(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n\x00") {
+		return "unknown"
+	}
+	return value
 }
 
 func runDryRun(args []string, stdout, stderr io.Writer, dependencies cliDependencies) int {
@@ -251,6 +273,10 @@ func loadProfileInventory(
 }
 
 func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, dependencies cliDependencies) int {
+	return runProfileMode(ctx, args, stdout, stderr, dependencies, false)
+}
+
+func runProfileMode(ctx context.Context, args []string, stdout, stderr io.Writer, dependencies cliDependencies, improve bool) int {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	cfg := dependencies.loadConfig()
@@ -260,11 +286,17 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 	measurementOnly := flags.Bool("measurement-only", false, "return success after publishing a quarantined comparison input; never makes it selectable")
 	timeout := flags.Duration("timeout", defaultProfileRunTimeout, "total profiling timeout")
 	probeTimeout := flags.Duration("probe-timeout", 5*time.Minute, "timeout for each probe attempt")
+	baselineID := flags.String("baseline", "", "immutable baseline profile ID for improve")
+	learn := flags.Bool("learn", false, "derive bounded lessons from calibration failures and evaluate control plus candidate")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return 2
 	}
 	if !*confirm {
 		fmt.Fprintln(stderr, "corelaycode-profile: run requires --confirm; inspect dry-run first")
+		return 2
+	}
+	if (improve && (strings.TrimSpace(*baselineID) == "" || *measurementOnly)) || (!improve && (*baselineID != "" || *learn)) {
+		fmt.Fprintln(stderr, "corelaycode-profile: improve requires --baseline and cannot use --measurement-only")
 		return 2
 	}
 	if *timeout <= 0 || *timeout > 24*time.Hour || *probeTimeout <= 0 || *probeTimeout > time.Hour {
@@ -330,6 +362,25 @@ func runProfile(ctx context.Context, args []string, stdout, stderr io.Writer, de
 	previousLogWriter := log.Writer()
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(previousLogWriter)
+	if improve {
+		var result capabilityprofile.ImprovementResult
+		if *learn {
+			result, err = runner.Learn(runCtx, resolved.identity, strings.TrimSpace(*baselineID))
+		} else {
+			result, err = runner.Improve(runCtx, resolved.identity, strings.TrimSpace(*baselineID))
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "corelaycode-profile: improvement failed; inspect baseline compatibility, target lock and isolation")
+			return 1
+		}
+		if code := writeJSON(stdout, result); code != 0 {
+			return code
+		}
+		if result.Published == nil {
+			return 3
+		}
+		return 0
+	}
 	result, err := runner.Run(runCtx, resolved.identity)
 	if err != nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: profiling did not publish a profile")
@@ -508,6 +559,8 @@ func writeJSON(writer io.Writer, value any) int {
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: corelaycode-profile <dry-run|list|status|run|compare> [options]")
+	fmt.Fprintln(writer, "usage: corelaycode-profile <version|dry-run|list|status|run|improve|compare> [options]")
 	fmt.Fprintln(writer, "run requires --confirm and a target-bound provider transport")
+	fmt.Fprintln(writer, "improve requires --confirm --baseline <profile-id>; exit 3 means candidate rejected")
+	fmt.Fprintln(writer, "improve --learn evaluates calibration-derived lessons against a fresh control (up to two full plans)")
 }

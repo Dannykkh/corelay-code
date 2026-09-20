@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,10 @@ func decodeSessionAPIError(t *testing.T, rec *httptest.ResponseRecorder) session
 
 func createSessionThroughAPI(t *testing.T, s *Server, workspace string, messages []agent.SessionMessage) *agent.Session {
 	t.Helper()
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.SetWorkDir(workspace)
 	body, err := json.Marshal(map[string]any{
 		"workspace": workspace,
 		"messages":  messages,
@@ -72,14 +77,31 @@ func createSessionThroughAPI(t *testing.T, s *Server, workspace string, messages
 		t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	response := decodeSessionMutation(t, rec)
-	if response.Version != 1 || response.Revision != 1 || response.ID == "" {
-		t.Fatalf("create response=%+v, want v1/r1", response)
+	if response.Version != 4 || response.Revision != 1 || response.ID == "" {
+		t.Fatalf("create response=%+v, want v4/r1", response)
 	}
 	created, err := s.sessions.Get(response.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return created
+}
+
+func reconcileSessionWithReceiptForTest(t *testing.T, store *agent.SessionStore, id string, expectedRevision uint64) (*agent.Session, error) {
+	t.Helper()
+	session, err := store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	assessment, err := agent.AssessSessionReconciliation(session)
+	if err != nil {
+		return nil, err
+	}
+	receipt, err := agent.NewSessionReconciliationReceipt(assessment, true, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	return store.MarkReconciledWithReceipt(id, expectedRevision, assessment.RunID, receipt)
 }
 
 func TestSessionAPICreateUpdateAndRenameRequireExpectedRevision(t *testing.T) {
@@ -222,17 +244,42 @@ func TestSessionAPIInterruptResumeReconcileAndClose(t *testing.T) {
 	s := newSessionAPITestServer(t)
 	created := createSessionThroughAPI(t, s, t.TempDir(), nil)
 	digest := "sha256:" + strings.Repeat("a", 64)
+	rawSummary := "raw-command-value-must-not-persist"
+	rawRunID := "rm -rf /secret-path"
+	rawToolName := "echo private command"
+	rawToolCallID := "private argument value"
 	interruptBody := fmt.Sprintf(
-		`{"expectedRevision":1,"runId":"run-1","toolName":"bash_exec","toolCallId":"tool-1","inputDigest":%q,"sideEffectState":"may_have_applied","summary":"process dispatched; completion unknown"}`,
-		digest,
+		`{"expectedRevision":1,"runId":"run-1","toolName":"bash_exec","toolCallId":"tool-1","inputDigest":%q,"sideEffectState":"may_have_applied","summary":%q}`,
+		digest, rawSummary,
 	)
+	interruptBody = strings.Replace(interruptBody, `"runId":"run-1"`, fmt.Sprintf(`"runId":%q`, rawRunID), 1)
+	interruptBody = strings.Replace(interruptBody, `"toolName":"bash_exec"`, fmt.Sprintf(`"toolName":%q`, rawToolName), 1)
+	interruptBody = strings.Replace(interruptBody, `"toolCallId":"tool-1"`, fmt.Sprintf(`"toolCallId":%q`, rawToolCallID), 1)
 	req, rec := sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/interrupt", created.ID, interruptBody)
 	s.handleSessionInterrupt(rec, req)
 	response := decodeSessionMutation(t, rec)
+	manualDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(nil))
 	if rec.Code != http.StatusOK || response.Revision != 2 || response.Session == nil ||
 		!response.Session.ReconcileRequired || response.Session.Interruption == nil ||
-		response.Session.Interruption.InputDigest != digest {
+		response.Session.Interruption.RunID != "manual-interrupt" ||
+		response.Session.Interruption.ToolName != "unknown" ||
+		response.Session.Interruption.ToolCallID != "" ||
+		response.Session.Interruption.InputDigest != manualDigest ||
+		response.Session.Interruption.SideEffectState != agent.SessionSideEffectUnknown ||
+		response.Session.Interruption.Summary != "interrupted execution requires reconciliation" ||
+		strings.Contains(rec.Body.String(), rawSummary) || strings.Contains(rec.Body.String(), rawRunID) ||
+		strings.Contains(rec.Body.String(), rawToolName) || strings.Contains(rec.Body.String(), rawToolCallID) {
 		t.Fatalf("interrupt status=%d response=%+v body=%s", rec.Code, response, rec.Body.String())
+	}
+	persistedMarker, err := s.sessions.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedJSON, err := json.Marshal(persistedMarker)
+	if err != nil || strings.Contains(string(persistedJSON), rawSummary) ||
+		strings.Contains(string(persistedJSON), rawRunID) || strings.Contains(string(persistedJSON), rawToolName) ||
+		strings.Contains(string(persistedJSON), rawToolCallID) {
+		t.Fatalf("interruption persisted caller metadata: json=%s err=%v", persistedJSON, err)
 	}
 
 	req, rec = sessionRequest(t, http.MethodGet, "/api/sessions/"+created.ID+"/resume-state", created.ID, "")
@@ -242,7 +289,7 @@ func TestSessionAPIInterruptResumeReconcileAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rec.Code != http.StatusOK || state.Revision != 2 || state.LastCommittedRevision != 1 ||
-		!state.ReconcileRequired || state.Interruption == nil || state.Interruption.RunID != "run-1" {
+		!state.ReconcileRequired || state.Interruption == nil || state.Interruption.RunID != "manual-interrupt" {
 		t.Fatalf("resume state=%+v status=%d", state, rec.Code)
 	}
 
@@ -253,10 +300,39 @@ func TestSessionAPIInterruptResumeReconcileAndClose(t *testing.T) {
 		t.Fatalf("blocked save status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	req, rec = sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/reconcile", created.ID, `{"expectedRevision":2}`)
+	req, rec = sessionRequest(t, http.MethodGet, "/api/sessions/"+created.ID+"/reconcile-preview?expectedRevision=2", created.ID, "")
+	s.handleSessionReconcilePreview(rec, req)
+	var assessment agent.SessionReconciliationAssessment
+	if err := json.Unmarshal(rec.Body.Bytes(), &assessment); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || assessment.Revision != 2 || assessment.RunID != "manual-interrupt" ||
+		assessment.SideEffectJudgment != agent.ReconciliationJudgmentUnknown || !assessment.ManualConfirmationRequired {
+		t.Fatalf("reconcile preview status=%d assessment=%+v body=%s", rec.Code, assessment, rec.Body.String())
+	}
+	staleBody := `{"expectedRevision":2,"evidenceDigest":"sha256:` + strings.Repeat("b", 64) + `","manualConfirmationAcknowledged":true}`
+	req, rec = sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/reconcile", created.ID, staleBody)
+	s.handleSessionReconcile(rec, req)
+	if rec.Code != http.StatusConflict || decodeSessionAPIError(t, rec).Error.Code != "reconciliation_evidence_stale" {
+		t.Fatalf("stale reconciliation evidence status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	stillBlocked, err := s.sessions.Get(created.ID)
+	if err != nil || !stillBlocked.ReconcileRequired {
+		t.Fatalf("stale evidence cleared the interruption guard: session=%+v err=%v", stillBlocked, err)
+	}
+	missingAckBody := fmt.Sprintf(`{"expectedRevision":2,"evidenceDigest":%q}`, assessment.EvidenceDigest)
+	req, rec = sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/reconcile", created.ID, missingAckBody)
+	s.handleSessionReconcile(rec, req)
+	if rec.Code != http.StatusConflict || decodeSessionAPIError(t, rec).Error.Code != "manual_confirmation_required" {
+		t.Fatalf("missing manual acknowledgement status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	postBody := fmt.Sprintf(`{"expectedRevision":2,"evidenceDigest":%q,"manualConfirmationAcknowledged":true}`, assessment.EvidenceDigest)
+	req, rec = sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/reconcile", created.ID, postBody)
 	s.handleSessionReconcile(rec, req)
 	response = decodeSessionMutation(t, rec)
-	if rec.Code != http.StatusOK || response.Revision != 3 || response.Session == nil || response.Session.ReconcileRequired {
+	if rec.Code != http.StatusOK || response.Revision != 3 || response.Session == nil || response.Session.ReconcileRequired ||
+		response.Session.LastReconciliation == nil || response.Session.LastReconciliation.EvidenceDigest != assessment.EvidenceDigest ||
+		!response.Session.LastReconciliation.ManualConfirmationAcknowledged {
 		t.Fatalf("reconcile status=%d response=%+v", rec.Code, response)
 	}
 
@@ -276,7 +352,7 @@ func TestSessionAPIInterruptResumeReconcileAndClose(t *testing.T) {
 	}
 }
 
-func TestSessionAPIInterruptRejectsRawOrInvalidMetadata(t *testing.T) {
+func TestSessionAPIInterruptRejectsUnknownFieldsAndDiscardsCallerMetadata(t *testing.T) {
 	s := newSessionAPITestServer(t)
 	created := createSessionThroughAPI(t, s, t.TempDir(), nil)
 	digest := "sha256:" + strings.Repeat("b", 64)
@@ -293,8 +369,8 @@ func TestSessionAPIInterruptRejectsRawOrInvalidMetadata(t *testing.T) {
 	invalidDigest := `{"expectedRevision":1,"runId":"run","toolName":"bash_exec","inputDigest":"sha256:not-a-digest","sideEffectState":"unknown","summary":"redacted"}`
 	req, rec = sessionRequest(t, http.MethodPost, "/api/sessions/"+created.ID+"/interrupt", created.ID, invalidDigest)
 	s.handleSessionInterrupt(rec, req)
-	if rec.Code != http.StatusBadRequest || decodeSessionAPIError(t, rec).Error.Code != "invalid_interruption" {
-		t.Fatalf("invalid digest status=%d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "not-a-digest") {
+		t.Fatalf("caller-supplied digest was persisted: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -344,7 +420,7 @@ func TestSessionAPILegacyMigrationAndRecoveryNoLeak(t *testing.T) {
 	update := fmt.Sprintf(`{"id":%q,"expectedRevision":0,"title":"migrated","messages":[]}`, created.ID)
 	req, rec := sessionRequest(t, http.MethodPost, "/api/sessions", "", update)
 	s.handleSessionSave(rec, req)
-	if response := decodeSessionMutation(t, rec); rec.Code != http.StatusOK || response.Version != 1 || response.Revision != 1 {
+	if response := decodeSessionMutation(t, rec); rec.Code != http.StatusOK || response.Version != 4 || response.Revision != 1 {
 		t.Fatalf("legacy migration status=%d response=%+v body=%s", rec.Code, response, rec.Body.String())
 	}
 

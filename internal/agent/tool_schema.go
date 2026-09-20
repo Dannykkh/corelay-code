@@ -326,6 +326,9 @@ func currentBuiltInToolDefinitions() map[string]types.ToolDef {
 		// remains a first-class built-in identity when present in that immutable
 		// run catalog.
 		definitions = append(definitions, loadToolResultDefinition())
+		// LoadSkill is advertised only when a run owns a bounded candidate list,
+		// but it remains a reserved built-in identity when present in that catalog.
+		definitions = append(definitions, skillLoadToolDefinition())
 		// ReportCompletion is appended only by strict-run composition, but its
 		// fixed identity is always reserved against MCP/plugin replacement.
 		definitions = append(definitions, ReportCompletionToolDef())

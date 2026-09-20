@@ -12,6 +12,7 @@ const (
 	proxyStateDirName  = ".claude-proxy"
 	workstreamsDir     = "workstreams"
 	workstreamJSONName = "workstream.json"
+	plansDirName       = "plans"
 	timelineName       = "timeline.jsonl"
 	handoffsDir        = "handoffs"
 )
@@ -45,6 +46,14 @@ func StatePath(workspace, id string) string {
 
 func TimelinePath(workspace, id string) string {
 	return filepath.Join(Dir(workspace, id), timelineName)
+}
+
+func PlansDir(workspace, workstreamID string) string {
+	return filepath.Join(Dir(workspace, workstreamID), plansDirName)
+}
+
+func PlanPath(workspace, workstreamID, planID string) string {
+	return filepath.Join(PlansDir(workspace, workstreamID), sanitizeID(planID)+".json")
 }
 
 func HandoffsDir(workspace, id string) string {

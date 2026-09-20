@@ -1,13 +1,17 @@
 .PHONY: build web deploy run test clean
 
+VERSION ?= dev
+BUILD_COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+CORELAY_LDFLAGS = -s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=$(VERSION) -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=$(BUILD_COMMIT)
+
 # Build everything
 build: web deploy go
 
 # Build Go binary
 go:
-	go build -o corelaycode ./cmd/proxy
-	go build -o corelaycode-acp ./cmd/corelaycode-acp
-	go build -o corelaycode-profile ./cmd/corelaycode-profile
+	go build -ldflags "$(CORELAY_LDFLAGS)" -o corelaycode ./cmd/proxy
+	go build -ldflags "$(CORELAY_LDFLAGS)" -o corelaycode-acp ./cmd/corelaycode-acp
+	go build -ldflags "$(CORELAY_LDFLAGS)" -o corelaycode-profile ./cmd/corelaycode-profile
 
 # Build frontend
 web:

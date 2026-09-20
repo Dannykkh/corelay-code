@@ -7,14 +7,16 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build Go binary
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26.8-alpine AS builder
 WORKDIR /app
+ARG CORELAY_VERSION=dev
+ARG CORELAY_BUILD_COMMIT=unknown
 COPY go.mod ./
 COPY . .
 COPY --from=frontend /app/web/dist ./internal/server/webdist/
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /corelaycode ./cmd/proxy/
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /corelaycode-acp ./cmd/corelaycode-acp/
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /corelaycode-profile ./cmd/corelaycode-profile/
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${CORELAY_VERSION} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${CORELAY_BUILD_COMMIT}" -o /corelaycode ./cmd/proxy/
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${CORELAY_VERSION} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${CORELAY_BUILD_COMMIT}" -o /corelaycode-acp ./cmd/corelaycode-acp/
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/Dannykkh/corelay-code/internal/buildinfo.Version=${CORELAY_VERSION} -X github.com/Dannykkh/corelay-code/internal/buildinfo.Commit=${CORELAY_BUILD_COMMIT}" -o /corelaycode-profile ./cmd/corelaycode-profile/
 
 # Stage 3: Final image
 FROM alpine:3.20

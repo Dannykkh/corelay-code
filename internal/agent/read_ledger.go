@@ -38,12 +38,13 @@ type ReadLedgerDecision struct {
 // contents. A content digest is enough to reject writes after an external
 // change and to refresh evidence after an agent-owned mutation.
 type ReadLedger struct {
-	workDir string
-	mu      sync.RWMutex
-	reads   map[string]string
+	workDir          string
+	allowExternal    bool
+	mu               sync.RWMutex
+	reads            map[string]string
 }
 
-func NewReadLedger(workDir string) *ReadLedger {
+func NewReadLedger(workDir string, allowExternal ...bool) *ReadLedger {
 	if strings.TrimSpace(workDir) == "" {
 		workDir = "."
 	}
@@ -51,8 +52,9 @@ func NewReadLedger(workDir string) *ReadLedger {
 		workDir = filepath.Clean(absolute)
 	}
 	return &ReadLedger{
-		workDir: workDir,
-		reads:   make(map[string]string),
+		workDir:       workDir,
+		allowExternal: len(allowExternal) > 0 && allowExternal[0],
+		reads:         make(map[string]string),
 	}
 }
 
@@ -179,7 +181,7 @@ func (l *ReadLedger) canonicalPath(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve read ledger target: %w", err)
 	}
-	if !pathWithin(canonical, workspace) {
+	if !l.allowExternal && !pathWithin(canonical, workspace) {
 		return "", fmt.Errorf("read ledger target is outside the workspace")
 	}
 	return filepath.Clean(canonical), nil

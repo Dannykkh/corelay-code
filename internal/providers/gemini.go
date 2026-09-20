@@ -42,12 +42,14 @@ func NewGeminiWithOptions(cfg *types.ProviderConfig, opts CreateOptions) types.P
 func (p *GeminiProvider) Name() string        { return "gemini" }
 func (p *GeminiProvider) DisplayName() string { return "Google Gemini" }
 func (p *GeminiProvider) Models() []types.ModelInfo {
+	// The upstream Gemini API supports image input, but this Corelay adapter
+	// still rejects canonical image blocks until its Part mapping is implemented.
 	return []types.ModelInfo{
-		{ID: "gemini-3-pro-preview", DisplayName: "Gemini 3 Pro (최신 플래그십)", ContextWindow: 1048576},
-		{ID: "gemini-3-flash-preview", DisplayName: "Gemini 3 Flash (최신 빠름)", ContextWindow: 1048576},
-		{ID: "gemini-2.5-pro", DisplayName: "Gemini 2.5 Pro", ContextWindow: 1048576},
-		{ID: "gemini-2.5-flash", DisplayName: "Gemini 2.5 Flash", ContextWindow: 1048576},
-		{ID: "gemini-2.5-flash-lite", DisplayName: "Gemini 2.5 Flash Lite (최저가)", ContextWindow: 1048576},
+		{ID: "gemini-3-pro-preview", DisplayName: "Gemini 3 Pro (최신 플래그십)", ContextWindow: 1048576, ImageInput: types.ImageInputUnsupported},
+		{ID: "gemini-3-flash-preview", DisplayName: "Gemini 3 Flash (최신 빠름)", ContextWindow: 1048576, ImageInput: types.ImageInputUnsupported},
+		{ID: "gemini-2.5-pro", DisplayName: "Gemini 2.5 Pro", ContextWindow: 1048576, ImageInput: types.ImageInputUnsupported},
+		{ID: "gemini-2.5-flash", DisplayName: "Gemini 2.5 Flash", ContextWindow: 1048576, ImageInput: types.ImageInputUnsupported},
+		{ID: "gemini-2.5-flash-lite", DisplayName: "Gemini 2.5 Flash Lite (최저가)", ContextWindow: 1048576, ImageInput: types.ImageInputUnsupported},
 	}
 }
 func (p *GeminiProvider) Validate() error {
