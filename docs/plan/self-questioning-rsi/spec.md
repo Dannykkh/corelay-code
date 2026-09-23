@@ -1,7 +1,7 @@
 # 자체질문 기반 실행 정책 실험
 
 작성: 2026-09-22 / source: codex
-상태: P1 관찰 기반과 P2 영속 기록/오프라인 평가 구현·로컬 검증 완료. 실제 모델 실험은 미완료.
+상태: P1 관찰 기반과 P2 영속 기록/오프라인 평가 완료. P3 로컬 합성 모델 smoke 완료; 실제 reviewed/Jev 실험은 미완료.
 읽는 순서: 이 계약 → [구현 순서](plan.md) → [검증 계약](validation.md).
 
 ## 목적과 첫 실험
@@ -11,7 +11,7 @@
 실사용 성능과 자기개선으로 얻는 추가 효과는 별도로 기록한다.
 
 첫 실험은 반복 도구 실패의 관찰(shadow)에 한정한다. 추천을 프롬프트에 넣거나 도구 실행·재시도 한도·중단·권한을 바꾸지 않는다.
-판단 모델은 코드 생성 모델과 분리한다. Jev는 후보 어댑터이며 필수 의존성이 아니다. 일반 소형 모델의 구조화 출력도 동일 계약으로 비교한다.
+판단 모델은 코드 생성 모델과 분리한다. Jev는 선택적 오프라인 평가 어댑터이며 필수 의존성이 아니다. 일반 소형 모델의 구조화 출력도 동일 계약으로 비교한다.
 전체 대화마다 질문하지 않는다. 사용자 질문은 사용자만 정할 목표·우선순위·권한에 필요한 경우로 제한한다.
 
 ## 확인한 재사용 지점
@@ -63,7 +63,7 @@ snapshot에는 절단·누락 플래그를 둔다. 근거 부족, 잘못된 enum
 - 초기 실험값: run당 최대 3회, 동시 판단 1회, 대기 슬롯 1개, 요청당 timeout 2초, UTF-8 입력 8 KiB/출력 2 KiB 상한. 보장된 최적값이 아니라 측정 후 조정할 가설이다.
 - 실행 스레드는 불변 snapshot을 비차단 제출한다. queue 포화는 dropped로 기록. run 취소/종료 시 판단 context도 취소하며 무제한 goroutine·종료 대기를 만들지 않는다.
 - 종료 후 늦은 결과는 closed sink에서 폐기한다. 종료 시 미완료는 canceled/pending으로 집계한다. 실행 terminal 상태를 나중에 변경하지 않는다.
-- 이벤트에는 enum·상태·지연·usage·digest·근거 ID만 저장. 원문은 자동 trace 저장 대상이 아니다. 별도 평가 corpus의 정제된 근거는 명시 수집 시에만 보존한다.
+- P1/P2 trace 이벤트에는 enum·상태·지연·digest·근거 ID만 저장한다. P3 오프라인 응답 파일에는 별도 토큰 usage를 기록한다. 원문은 자동 trace 저장 대상이 아니다. 별도 평가 corpus의 정제된 근거는 명시 수집 시에만 보존한다.
 - 기존 span 배열을 직접 동시 수정하지 않고 recorder가 소유한 동기화 경계로 전달한다. 기록 실패는 기존 실행을 실패시키지 않되 evaluation에서 missing으로 센다.
 - observer opt-in은 coder와 다른 외부 provider로 프로젝트 내용을 전송하는 허가가 아니다. judge provider와 전송 범위를 명시한다.
 - 요청·토큰·시간 예산을 모두 기록하고, 요율이 없으면 금액은 unknown으로 표시한다. 요율이 있는 실험은 금액 상한도 설정한다.
@@ -74,8 +74,7 @@ snapshot에는 절단·누락 플래그를 둔다. 근거 부족, 잘못된 enum
 P1 구현은 `RunOptions.ShadowJudgment`의 trusted Prepare/Judge 콜백 주입이다. Prepare는
 run-owned 근거 ID를 해석하고 정제해야 하며, 원시 결과 자동 수집/정제 기능은 아직 없다.
 `RunShadowJudgmentRecorder`는 run 종료 전에 최대 3개 bounded 레코드를 받는다.
-기존 server recorder의 영속 저장 연결과 offline shadow-eval은 P2에 구현했다. [사용 계약](../../shadow-evaluation.md)을 따른다. 실제 호출 usage/요율/토큰 예산은 P3 어댑터에서
-추가해야 하며 P1의 요청 수·직렬화 byte·timeout 상한을 토큰/금액 계측 완료로 표현하지 않는다.
+기존 server recorder의 영속 저장 연결과 offline shadow-eval은 P2에 구현했다. [사용 계약](../../shadow-evaluation.md)을 따른다. P3 명시 CLI는 로컬 Ollama/Jev 호출과 provider 토큰·지연을 기록한다. 정상 agent의 observer 호출에는 아직 이 adapter가 연결되지 않았고 실제 요율·금액·전력은 계측하지 않았다. P1의 요청 수·직렬화 byte·timeout 상한을 토큰/금액 계측 완료로 표현하지 않는다.
 두 콜백은 context 취소를 준수해야 한다. 관찰기는 종료 시 기다리지 않고 늦은 결과를 폐기하지만,
 취소를 무시하는 외부 함수 자체를 Go에서 강제 종료하지는 못한다. 호출마다 goroutine을 추가하지 않고 단일 worker만 사용한다.
 
@@ -93,4 +92,4 @@ run-owned 근거 ID를 해석하고 정제해야 하며, 원시 결과 자동 �
 
 - [기존 RSI 계약](../../rsi.md)
 - [Dream-RSI](https://dream-rsi.com/): 탐색 기록 재생과 실제 실행의 순환. Corelay 적용 효과는 미검증.
-- [jev-code 스킬](https://github.com/FrancoisChastel/jev-code/blob/main/skills/jev/SKILL.md): 좁은 typed judgment의 참고. 설치·API 호출은 수행하지 않음.
+- [jev-code 스킬](https://github.com/FrancoisChastel/jev-code/blob/main/skills/jev/SKILL.md): 좁은 typed judgment의 참고. 스킬 설치·Jev 실호출은 수행하지 않음.

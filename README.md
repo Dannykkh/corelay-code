@@ -53,6 +53,7 @@ one fully automatic pipeline.
 | Evaluate behavior before adoption | Profiler with isolated calibration, holdout and safety probes; immutable profiles | Fixed-suite measurements do not establish general or statistically reliable improvement |
 | Learn bounded workflow reminders | `improve --learn` proposes reminders from repeated calibration failures, runs control/candidate evaluations, and publishes only accepted candidates | Four code-owned reminder types; no arbitrary skill generation, source-code rewriting, or model training |
 | Use accepted lessons in later work | Exact-target automatic profile selection injects evaluated reminders into subsequent matching native runs | Requires compatible, current evidence and the configured runtime profile store |
+| Study self-questioning without changing a run | An opt-in shadow observer records bounded judgments; `shadow-eval` compares them with curated labels and a fixed rule; `shadow-judge` calls local Ollama or TypeSafe Jev for an offline comparison | The normal agent path has no judge; model advice does not change tools, permissions, completion, or published profiles |
 | Work with existing tools and models | Local/hosted providers, MCP, native tools, and a compatibility gateway for external coding CLIs | The gateway does not own or evaluate an external CLI's complete agent loop |
 
 The native tools include file reading/search/editing, shell and test execution,
@@ -94,14 +95,27 @@ conversion, richer candidate generation, automatic rollback and scheduling
 remain follow-up work. Existing coding agents may help author improvements;
 Corelay must still evaluate whether those improvements are worth adopting.
 
-For the self-questioning experiment, a harness-injected shadow observer can now
-record bounded judgments and subsequent error observations in run traces.
-  `corelaycode-profile shadow-eval` compares recorded responses against curated
-  labels and a fixed rule without calling a model or changing execution policy.
-  `shadow-judge` explicitly calls local Ollama or TypeSafe Jev and saves bounded,
-  metered responses for that offline comparison.
-The bundled cases are synthetic protocol fixtures; see
-[shadow evaluation](docs/shadow-evaluation.md) for the command and evidence limits.
+### Self-questioning experiment
+
+An explicitly injected shadow observer records bounded judgments after repeated
+tool failures or a run-guard denial. It observes later errors but cannot change
+the ongoing run. The default agent path has no judge. For an offline comparison,
+the profiler can evaluate recorded answers against independently curated labels
+and a fixed rule, or call a model on a selected corpus split:
+
+```sh
+corelaycode-profile shadow-eval --corpus cmd/corelaycode-profile/testdata/shadow/corpus.json --responses cmd/corelaycode-profile/testdata/shadow/responses.json --split development
+corelaycode-profile shadow-judge --corpus cmd/corelaycode-profile/testdata/shadow/corpus.json --split development --provider ollama --model qwen3:0.6b --out responses.json
+corelaycode-profile shadow-eval --corpus cmd/corelaycode-profile/testdata/shadow/corpus.json --responses responses.json --split development
+```
+
+The model command is opt-in and saves bounded answers, reported tokens, and
+measured latency. Jev is an optional provider requiring `TYPESAFE_API_KEY`; it
+has not been called live in this experiment. The bundled corpus is synthetic:
+the local model calls validate the measurement path, not an improvement in real
+coding tasks. Real reviewed cases and a separate evaluation split are still
+needed before considering intervention. See the [shadow evaluation guide](docs/shadow-evaluation.md)
+and [P3 results and limits](docs/plan/self-questioning-rsi/plan.md).
 
 ## Two paths, one runtime plane
 

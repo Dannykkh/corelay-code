@@ -101,8 +101,10 @@ failures, preserving the current coding path and guard behavior. Deterministic
 kernel tests and a Linux race check cover this seam. Server traces now persist
 bounded judgments and subsequent error observations. The offline
 [`shadow-eval` command](shadow-evaluation.md) compares recorded responses with
-curated labels and a fixed rule. Live judge adapters, discovery-tree replay, and
-measured live-model improvement remain unimplemented or untested.
+curated labels and a fixed rule. The explicit `shadow-judge` command can call
+local Ollama or TypeSafe Jev for that offline comparison, but it does not enable
+a judge in normal agent runs. Jev live calls, reviewed-case accuracy,
+discovery-tree replay, and measured live-model improvement remain untested.
 
 Plain refresh derives recommendations from new measurements. Learning executes
 different lesson instructions in control/candidate runs, but this sequential,
