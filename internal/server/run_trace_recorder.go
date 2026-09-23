@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -57,10 +58,50 @@ func (r compositeRunRecorder) RunSpanCompleted(id string, status string, data ma
 }
 
 type observabilityRunRecorder struct {
-	mu          sync.Mutex
-	tracker     *observability.Tracker
-	trace       observability.RunTrace
-	spanIndexes map[string]int
+	mu              sync.Mutex
+	tracker         *observability.Tracker
+	trace           observability.RunTrace
+	spanIndexes     map[string]int
+	shadowRunID     string
+	shadowSequences map[int]bool
+}
+
+func (r compositeRunRecorder) ShadowJudgmentRecorded(record agent.ShadowJudgmentRecord) {
+	for _, recorder := range r.recorders {
+		if sink, ok := recorder.(agent.RunShadowJudgmentRecorder); ok {
+			sink.ShadowJudgmentRecorded(record)
+		}
+	}
+}
+
+func (r *observabilityRunRecorder) ShadowJudgmentRecorded(record agent.ShadowJudgmentRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.trace.EndedAt.IsZero() {
+		return
+	}
+	if r.trace.Metadata == nil {
+		r.trace.Metadata = map[string]string{}
+	}
+	if agent.ValidateShadowRecord(record) != nil || (r.shadowRunID != "" && r.shadowRunID != record.RunID) {
+		r.trace.Metadata["shadowRejected"] = "true"
+		return
+	}
+	if r.shadowSequences == nil {
+		r.shadowSequences = map[int]bool{}
+	}
+	if r.shadowSequences[record.Sequence] || len(r.shadowSequences) >= 3 {
+		return
+	}
+	r.shadowSequences[record.Sequence] = true
+	r.shadowRunID = record.RunID
+	encoded, _ := json.Marshal(record)
+	now := time.Now().UTC()
+	r.trace.Spans = append(r.trace.Spans, observability.RunSpan{
+		ID: fmt.Sprintf("shadow_%d", record.Sequence), Name: "agent.shadow_judgment", StartedAt: now, EndedAt: now,
+		DurationMs: record.DurationMS, Status: record.Status, Data: map[string]string{"record": string(encoded)},
+	})
+	r.trace.Metadata["shadowKernelRunId"] = record.RunID
 }
 
 func newObservabilityRunRecorder(tracker *observability.Tracker, trace observability.RunTrace) *observabilityRunRecorder {

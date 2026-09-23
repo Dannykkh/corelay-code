@@ -950,6 +950,19 @@ func RunLoopWithOptions(
 		return
 	}
 	activeRunID := newActiveRunID()
+	shadow := newShadowObserver(ctx, opts.ShadowJudgment, ShadowPoint{
+		RunID: activeRunID, SessionDigest: shadowDigest(checkpointSession),
+		SessionRevision: opts.SessionRevision, WorkspaceDigest: shadowDigest(workDir),
+		CoderDigest: shadowDigest(provider.Name() + "\n" + model),
+	})
+	defer func() {
+		records := shadow.close()
+		if recorder, ok := opts.Recorder.(RunShadowJudgmentRecorder); ok {
+			for _, record := range records {
+				recorder.ShadowJudgmentRecorded(record)
+			}
+		}
+	}()
 	checkpointScope := opts.CheckpointScope
 	if checkpointScope == nil {
 		checkpointScope = newCheckpointScope(newCheckpointOwner(checkpointSession, opts.SessionRevision, activeRunID))
@@ -2695,6 +2708,9 @@ func RunLoopWithOptions(
 			consecutiveErrorRounds++
 		} else {
 			consecutiveErrorRounds = 0
+		}
+		if shadow != nil {
+			shadow.observe(i+1, consecutiveErrorRounds, runGuard.Snapshot(), dispatchResults)
 		}
 		if consecutiveErrorRounds >= maxErrorRounds {
 			msg := fmt.Sprintf(

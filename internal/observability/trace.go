@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -140,6 +141,12 @@ func (t *Tracker) Record(trace RequestTrace) {
 
 // RecordRun adds a completed run trace.
 func (t *Tracker) RecordRun(trace RunTrace) {
+	_ = t.RecordRunChecked(trace)
+}
+
+// RecordRunChecked keeps the in-memory diagnostic even if persistence fails.
+// Callers can distinguish it from a durably recorded evaluation result.
+func (t *Tracker) RecordRunChecked(trace RunTrace) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if trace.ID == "" {
@@ -157,9 +164,16 @@ func (t *Tracker) RecordRun(trace RunTrace) {
 	if trace.Status == "" {
 		trace.Status = "ok"
 	}
+	err := t.appendRunToFile(trace)
+	if err != nil {
+		if trace.Metadata == nil {
+			trace.Metadata = map[string]string{}
+		}
+		trace.Metadata["persistence"] = "failed"
+	}
 	t.runTraces = append(t.runTraces, trace)
 	t.runTraces = trimRunTraces(t.runTraces)
-	t.appendRunToFile(trace)
+	return err
 }
 
 // Recent returns the last N traces.
@@ -278,15 +292,26 @@ func (t *Tracker) appendToFile(trace RequestTrace) {
 	f.Write([]byte("\n"))
 }
 
-func (t *Tracker) appendRunToFile(trace RunTrace) {
+func (t *Tracker) appendRunToFile(trace RunTrace) error {
 	f, err := os.OpenFile(t.runTodayFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return
+		return errors.New("run trace persistence failed")
 	}
 	defer f.Close()
-	data, _ := json.Marshal(trace)
-	f.Write(data)
-	f.Write([]byte("\n"))
+	data, err := json.Marshal(trace)
+	if err == nil {
+		_, err = f.Write(append(data, '\n'))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return errors.New("run trace persistence failed")
+	}
+	return nil
 }
 
 func (t *Tracker) loadToday() {

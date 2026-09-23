@@ -111,6 +111,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, depend
 	if args[0] == "version" {
 		return runProfileVersion(stdout)
 	}
+	if args[0] == "shadow-eval" {
+		return runShadowEval(ctx, args[1:], stdout, stderr)
+	}
+	if args[0] == "shadow-judge" {
+		return runShadowJudge(ctx, args[1:], stdout, stderr)
+	}
 	if dependencies.loadConfig == nil || dependencies.createProvider == nil || dependencies.createTarget == nil ||
 		dependencies.createIsolation == nil || dependencies.clock == nil {
 		fmt.Fprintln(stderr, "corelaycode-profile: runtime composition is unavailable")
@@ -559,7 +565,9 @@ func writeJSON(writer io.Writer, value any) int {
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: corelaycode-profile <version|dry-run|list|status|run|improve|compare> [options]")
+	fmt.Fprintln(writer, "usage: corelaycode-profile <version|dry-run|list|status|run|improve|compare|shadow-eval|shadow-judge> [options]")
+	fmt.Fprintln(writer, "shadow-eval --corpus <json> --split <development|selection|evaluation> [--responses <json>] evaluates recorded responses offline; exit 3 means missing/invalid results")
+	fmt.Fprintln(writer, "shadow-judge --corpus <json> --split <development|selection|evaluation> --provider <ollama|jev> --model <id> --out <json> calls a model and saves bounded responses; Jev requires TYPESAFE_API_KEY")
 	fmt.Fprintln(writer, "run requires --confirm and a target-bound provider transport")
 	fmt.Fprintln(writer, "improve requires --confirm --baseline <profile-id>; exit 3 means candidate rejected")
 	fmt.Fprintln(writer, "improve --learn evaluates calibration-derived lessons against a fresh control (up to two full plans)")

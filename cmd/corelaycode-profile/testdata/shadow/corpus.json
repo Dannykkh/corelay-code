@@ -1,0 +1,389 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "repeat",
+      "group": "task-repeat",
+      "split": "development",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_25e2b6b106523880e27763084ffa6a07",
+        "sequence": 2,
+        "consecutiveErrors": 2,
+        "sessionDigest": "dd070f608eb65d467c3ed75c03afaa116821b62f67a621741b02d0be1db2e4fc",
+        "sessionRevision": 1,
+        "workspaceDigest": "e3b49d8104a8ee1873a0792790973f784c2bb6116d7af15a421ebe9166d1ec76",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "cb352562aa5b7e1108bd824a0cc42387122a31f2fe617db6bebd11463a14a4c9",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "29695faae0b8179098739c254dcfbdcd59d1bf4516c629a6c9386ed11450f71e",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture repeat",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture repeat: missing config key on first attempt.",
+          "r2-t0": "Same missing key; fixture documentation identifies the alternate config file."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "yes",
+        "newEvidence": "no",
+        "alternativeSupported": "yes"
+      },
+      "expectedAdvisory": "consider_alternative",
+      "outcome": {
+        "task": "unknown",
+        "intervention": "unknown"
+      }
+    },
+    {
+      "id": "progress",
+      "group": "task-progress",
+      "split": "development",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_b5f90a96e680140d51e2ba945461716e",
+        "sequence": 2,
+        "consecutiveErrors": 0,
+        "sessionDigest": "0960c7e0b4c8c13a29c605a740f550fca08a2d87580de36d4856c0ede2b80ca0",
+        "sessionRevision": 1,
+        "workspaceDigest": "ca4f11c5a1120be993f2c03c12d10663f3e615dae4f8976d49ea820d834c3625",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "6dc4462e00f699ff178e63365ec59736fb6b2fb80abd9452e13c1e11e23db268",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "20478db4523a75ea0d1ddbd4561571beeff307326ee56a6848f621b5d97ae3ab",
+              "error": false,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture progress",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture progress: missing config key on first attempt.",
+          "r2-t0": "The missing key was found in fixture settings; the current read succeeded."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "no",
+        "newEvidence": "yes",
+        "alternativeSupported": "no"
+      },
+      "expectedAdvisory": "continue",
+      "outcome": {
+        "task": "passed",
+        "intervention": "unknown"
+      }
+    },
+    {
+      "id": "uncertain",
+      "group": "task-uncertain",
+      "split": "development",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_96642b36a83c4c78c5dc7a3019ab2c4c",
+        "sequence": 2,
+        "consecutiveErrors": 0,
+        "sessionDigest": "dfa4e8d2830db1322e4a6f63a3b48a5f81ee6e4218a2cfb62c1e8005c570a30d",
+        "sessionRevision": 1,
+        "workspaceDigest": "93517feb85bb290e92ccc8985a49a540f2326485782cab6375d44ed4f932b05e",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "f831d507acadbea69f8401560424137ebbdaf4a27a4e995e5ca72375163c5e28",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "acd0831b5943565bea93bc3fcc69c386794fa89407385e357356c3aac758d753",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture uncertain",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture uncertain: missing config key on first attempt.",
+          "r2-t0": "Diagnostic details unavailable; cannot compare failure types."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "unknown",
+        "newEvidence": "unknown",
+        "alternativeSupported": "unknown"
+      },
+      "expectedAdvisory": "abstain",
+      "outcome": {
+        "task": "unknown",
+        "intervention": "unknown"
+      }
+    },
+    {
+      "id": "selection-progress",
+      "group": "task-selection-progress",
+      "split": "selection",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_d0c1fb7d4027dd40bd5069ac62c1f613",
+        "sequence": 2,
+        "consecutiveErrors": 0,
+        "sessionDigest": "57f7240ae089238b010bedabbdca207853bff6417ef3301209deb7e4376adc87",
+        "sessionRevision": 1,
+        "workspaceDigest": "d347c928ef1fb4e5613aa1d594a82aa0ee1aa8a7d04c5059ef7f43e47df23bdb",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "4d7c42f5eeabd64b3c61f1d0bb27370204424070b9a584521cc9372ec769d159",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "a1dfe3299ce90eb6e86449a9df1212a78680bcc28fa5cc431fd0b61cfd40d104",
+              "error": false,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture selection-progress",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture selection-progress: missing config key on first attempt.",
+          "r2-t0": "The missing key was found in fixture settings; the current read succeeded."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "no",
+        "newEvidence": "yes",
+        "alternativeSupported": "no"
+      },
+      "expectedAdvisory": "continue",
+      "outcome": {
+        "task": "passed",
+        "intervention": "unknown"
+      }
+    },
+    {
+      "id": "holdout-repeat",
+      "group": "task-holdout-repeat",
+      "split": "evaluation",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_c2714619622ae8509de760a38ef2631f",
+        "sequence": 2,
+        "consecutiveErrors": 2,
+        "sessionDigest": "380962d16ba3ef27e9e2a1eff6f212f03aff96619ee2cf943fac05d7bfc4301c",
+        "sessionRevision": 1,
+        "workspaceDigest": "b027eaf164fa3d3b8d7e661b3e29ead0cafdd5a1e232af6d35506bca868b3921",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "9dd6bdf956709a216bba2eec882c10b586c8df31584347c218c2d0d246afe93c",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "31919fa3dfbbd4481781bfc58f95bc6c84eeb13c44a1cf65a7acd8634e983179",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture holdout-repeat",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture holdout-repeat: missing config key on first attempt.",
+          "r2-t0": "Same missing key; fixture documentation identifies the alternate config file."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "yes",
+        "newEvidence": "no",
+        "alternativeSupported": "yes"
+      },
+      "expectedAdvisory": "consider_alternative",
+      "outcome": {
+        "task": "unknown",
+        "intervention": "unknown"
+      }
+    },
+    {
+      "id": "holdout-uncertain",
+      "group": "task-holdout-uncertain",
+      "split": "evaluation",
+      "origin": "synthetic",
+      "point": {
+        "runId": "run_9f3103e22c7b6f79c4b61f4649083fac",
+        "sequence": 2,
+        "consecutiveErrors": 0,
+        "sessionDigest": "13aee2a97cc24363c9e06c03722745830442df753f36319f13c4b75aa1449947",
+        "sessionRevision": 1,
+        "workspaceDigest": "905c901ab5ba66e8e9b87c51d1d336a62d74a4e546db64f403669ad5a0c0498a",
+        "coderDigest": "ca716a410dbdf3c6549e0416980982d23a9042bfc282a483e94d19369372ce74",
+        "judgeDigest": "32ca27c364290f54fbbc26d500a2a01d4ee42bf12156a3d2bf29d3a0d9b1f592",
+        "contractDigest": "",
+        "guardDenied": false,
+        "previous": {
+          "sequence": 1,
+          "tools": [
+            {
+              "id": "r1-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "ce6657895a33f6514ecf8baf30a82fdbc96e4bfc70011cfd83389823514cebfa",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        },
+        "current": {
+          "sequence": 2,
+          "tools": [
+            {
+              "id": "r2-t0",
+              "toolDigest": "9b9a8d05a7ec353bda84f9c1bb3178c299de3001b5e970508ddc889c487f92ca",
+              "resultDigest": "21ee93ed9117d7e9fa9a27ea12abfaef975d33d22b041b240430a5318b086a4e",
+              "error": true,
+              "executed": true
+            }
+          ],
+          "truncated": false
+        }
+      },
+      "evidence": {
+        "objective": "Repair synthetic fixture holdout-uncertain",
+        "acceptance": "The fixture test passes.",
+        "excerpts": {
+          "r1-t0": "Fixture holdout-uncertain: missing config key on first attempt.",
+          "r2-t0": "Diagnostic details unavailable; cannot compare failure types."
+        },
+        "missing": false,
+        "truncated": false
+      },
+      "labels": {
+        "sameFailure": "unknown",
+        "newEvidence": "unknown",
+        "alternativeSupported": "unknown"
+      },
+      "expectedAdvisory": "abstain",
+      "outcome": {
+        "task": "unknown",
+        "intervention": "unknown"
+      }
+    }
+  ]
+}

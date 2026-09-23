@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "responses": [
+    {
+      "caseId": "repeat",
+      "requestDigest": "843f0a51aefb8193d7be40cd1e716b06f061d3cd207d938bb3a9755eef697591",
+      "response": {
+        "alternativeSupported": {
+          "evidenceIds": [],
+          "value": "unknown"
+        },
+        "newEvidence": {
+          "evidenceIds": [
+            "r2-t0"
+          ],
+          "value": "yes"
+        },
+        "sameFailure": {
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ],
+          "value": "yes"
+        }
+      },
+      "usage": {
+        "provider": "ollama",
+        "model": "gemma4:12b-it-qat",
+        "durationMs": 44089,
+        "inputTokens": 470,
+        "outputTokens": 112
+      }
+    },
+    {
+      "caseId": "progress",
+      "requestDigest": "e634cddbef135d8279fe4f6490e5d35a5cc812b499d2987f9f6b973e48ea554e",
+      "response": {
+        "alternativeSupported": {
+          "evidenceIds": [],
+          "value": "unknown"
+        },
+        "newEvidence": {
+          "evidenceIds": [
+            "r2-t0"
+          ],
+          "value": "yes"
+        },
+        "sameFailure": {
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ],
+          "value": "no"
+        }
+      },
+      "usage": {
+        "provider": "ollama",
+        "model": "gemma4:12b-it-qat",
+        "durationMs": 3940,
+        "inputTokens": 469,
+        "outputTokens": 115
+      }
+    },
+    {
+      "caseId": "uncertain",
+      "requestDigest": "9c2a52d27816d596e6fc39e379057c1169c334715cad8f7aa844d2439d84be48",
+      "response": {
+        "alternativeSupported": {
+          "evidenceIds": [],
+          "value": "unknown"
+        },
+        "newEvidence": {
+          "evidenceIds": [
+            "r2-t0"
+          ],
+          "value": "no"
+        },
+        "sameFailure": {
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ],
+          "value": "unknown"
+        }
+      },
+      "usage": {
+        "provider": "ollama",
+        "model": "gemma4:12b-it-qat",
+        "durationMs": 3766,
+        "inputTokens": 463,
+        "outputTokens": 112
+      }
+    }
+  ]
+}

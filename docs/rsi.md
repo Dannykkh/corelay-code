@@ -95,6 +95,15 @@ the lock protects the profiler CLI/Runner, not arbitrary filesystem writers.
 
 ## What remains
 
+The next experiment is specified in the [self-questioning execution-policy plan](plan/self-questioning-rsi/spec.md).
+Its first implemented step is a harness-injected shadow observer around repeated
+failures, preserving the current coding path and guard behavior. Deterministic
+kernel tests and a Linux race check cover this seam. Server traces now persist
+bounded judgments and subsequent error observations. The offline
+[`shadow-eval` command](shadow-evaluation.md) compares recorded responses with
+curated labels and a fixed rule. Live judge adapters, discovery-tree replay, and
+measured live-model improvement remain unimplemented or untested.
+
 Plain refresh derives recommendations from new measurements. Learning executes
 different lesson instructions in control/candidate runs, but this sequential,
 fixed-suite comparison does not establish statistically reliable live-model

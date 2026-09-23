@@ -86,6 +86,9 @@ type ToolExecutionJournalEntry struct {
 type ToolExecutionJournal func(ToolExecutionJournalEntry) error
 
 type RunOptions struct {
+	// ShadowJudgment observes repeated failures without changing execution.
+	// Nil keeps the current path; only trusted harnesses may inject a judge.
+	ShadowJudgment *ShadowJudgmentConfig
 	// ExecutionPolicyRequest is the root run's user-selected mode. RunLoop
 	// resolves it once against the compatibility default and runtime facts.
 	// Child loops must receive a derived ExecutionPolicy snapshot instead.

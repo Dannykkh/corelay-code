@@ -94,6 +94,15 @@ conversion, richer candidate generation, automatic rollback and scheduling
 remain follow-up work. Existing coding agents may help author improvements;
 Corelay must still evaluate whether those improvements are worth adopting.
 
+For the self-questioning experiment, a harness-injected shadow observer can now
+record bounded judgments and subsequent error observations in run traces.
+  `corelaycode-profile shadow-eval` compares recorded responses against curated
+  labels and a fixed rule without calling a model or changing execution policy.
+  `shadow-judge` explicitly calls local Ollama or TypeSafe Jev and saves bounded,
+  metered responses for that offline comparison.
+The bundled cases are synthetic protocol fixtures; see
+[shadow evaluation](docs/shadow-evaluation.md) for the command and evidence limits.
+
 ## Two paths, one runtime plane
 
 ```mermaid
