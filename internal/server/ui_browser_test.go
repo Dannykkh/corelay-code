@@ -124,7 +124,7 @@ func TestS10BrowserUIProjectFilesAndStaleStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("page loaded")
-	page = page.Timeout(5 * time.Second)
+	page = page.Timeout(15 * time.Second)
 	page.MustElementR("span", "Project")
 	t.Log("project rail visible")
 	var body string

@@ -333,12 +333,22 @@ func TestProjectInstructionsCanonicalizeWorkspaceSymlinkAndCase(t *testing.T) {
 	}
 
 	caseVariant := filepath.Join(root, "pROJECT")
-	if runtime.GOOS == "windows" {
+	workspaceInfo, err := os.Stat(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caseInfo, err := os.Stat(caseVariant)
+	if err == nil && os.SameFile(workspaceInfo, caseInfo) {
 		if got, want := LoadProjectContext(caseVariant), LoadProjectContext(workspace); got != want {
-			t.Fatalf("Windows case variant changed instruction resolution\ncase variant: %s\ncanonical: %s", got, want)
+			t.Fatalf("case-insensitive filesystem changed instruction resolution\ncase variant: %s\ncanonical: %s", got, want)
 		}
-	} else if got := LoadProjectContext(caseVariant); strings.Contains(got, "canonical workspace marker") {
-		t.Fatalf("case-sensitive filesystem treated different casing as the workspace: %s", got)
+	} else {
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if got := LoadProjectContext(caseVariant); strings.Contains(got, "canonical workspace marker") {
+			t.Fatalf("case-sensitive filesystem treated different casing as the workspace: %s", got)
+		}
 	}
 }
 

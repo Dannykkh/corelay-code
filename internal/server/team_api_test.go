@@ -189,6 +189,7 @@ func TestHandleTeamExecuteUsesApprovedWorkstreamPlanStageAndEvidence(t *testing.
 	requestBody, err := json.Marshal(map[string]any{
 		"workDir": workDir, "workstreamId": ws.ID, "planId": plan.ID,
 		"planRevision": plan.Revision, "stageId": "execute",
+		"executionPolicy": map[string]string{"mode": "full"},
 	})
 	if err != nil {
 		t.Fatal(err)
