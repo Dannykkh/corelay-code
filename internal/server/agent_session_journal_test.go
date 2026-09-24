@@ -157,6 +157,10 @@ func TestDurableExecutionJournalSuccessfulTerminalClearsFirstRunMarkerAtomically
 	if err != nil {
 		t.Fatal(err)
 	}
+	run.requestReceipt = &agent.AgentRequestReceipt{
+		ID: "journal_turn", Digest: "sha256:" + strings.Repeat("c", 64),
+		ExpectedRevision: 1, MessageCount: 1,
+	}
 	entries := []agent.ToolExecutionJournalEntry{
 		{ID: "call_a", Name: "Read", RunID: "run_two", InputDigest: "sha256:" + strings.Repeat("a", 64)},
 		{ID: "call_b", Name: "Read", RunID: "run_two", InputDigest: "sha256:" + strings.Repeat("b", 64)},
@@ -180,7 +184,8 @@ func TestDurableExecutionJournalSuccessfulTerminalClearsFirstRunMarkerAtomically
 		t.Fatal(err)
 	}
 	if committed.Revision != 4 || committed.ReconcileRequired || committed.Interruption != nil ||
-		committed.LastRunTerminal == nil || len(committed.Messages) != 3 {
+		committed.LastRunTerminal == nil || committed.LastAgentRequest == nil ||
+		committed.LastAgentRequest.CommittedRevision != 4 || len(committed.Messages) != 3 {
 		t.Fatalf("successful atomic clear = %#v", committed)
 	}
 }

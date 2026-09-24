@@ -3476,6 +3476,7 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		ExecutionPolicy  *agent.ExecutionPolicyRequest `json:"executionPolicy"`
 		DurableSessionID string                        `json:"durableSessionId"`
 		ExpectedRevision *uint64                       `json:"expectedRevision"`
+		RequestID        string                        `json:"requestId"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, protocol.MaxRequestBytes)
 	decoder := json.NewDecoder(r.Body)
@@ -3503,13 +3504,30 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	durableSessionID := strings.TrimSpace(body.DurableSessionID)
+	requestID := body.RequestID
+	if requestID != "" && agent.ValidateAgentRequestID(requestID) != nil {
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_agent_request_id", "requestId must be 1-128 URL-safe characters", nil, nil)
+		return
+	}
 	switch {
+	case requestID != "" && durableSessionID == "":
+		writeSessionAPIError(w, http.StatusBadRequest, "invalid_session_binding", "requestId requires durableSessionId", nil, nil)
+		return
 	case durableSessionID == "" && body.ExpectedRevision != nil:
 		writeSessionAPIError(w, http.StatusBadRequest, "invalid_session_binding", "expectedRevision requires durableSessionId", nil, nil)
 		return
 	case durableSessionID != "" && body.ExpectedRevision == nil:
 		writeSessionAPIError(w, http.StatusPreconditionRequired, "expected_revision_required", "expectedRevision is required for a durable agent run", nil, nil)
 		return
+	}
+	requestDigest := ""
+	if requestID != "" {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			writeSessionAPIError(w, http.StatusBadRequest, "invalid_agent_request", "request body cannot be encoded", nil, nil)
+			return
+		}
+		requestDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(encoded))
 	}
 
 	s.mu.RLock()
@@ -3541,6 +3559,19 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 		targetSession, err = sessionStore.Get(durableSessionID)
 		if err != nil {
 			writeSessionError(w, err)
+			return
+		}
+		if requestID != "" && targetSession.LastAgentRequest != nil && targetSession.LastAgentRequest.ID == requestID {
+			receipt := targetSession.LastAgentRequest
+			if receipt.Digest != requestDigest || receipt.ExpectedRevision != *body.ExpectedRevision {
+				writeSessionAPIError(w, http.StatusConflict, "agent_request_conflict", "requestId was already used for different input", nil, nil)
+				return
+			}
+			if targetSession.Revision != receipt.CommittedRevision {
+				writeSessionAPIError(w, http.StatusConflict, "agent_request_superseded", "session advanced after this request completed", nil, nil)
+				return
+			}
+			writeAgentRequestReplay(w, targetSession)
 			return
 		}
 		if err := validateDurableAgentSession(targetSession, *body.ExpectedRevision, body.WorkDir, body.Messages); err != nil {
@@ -3662,6 +3693,13 @@ func (s *Server) handleAgentLoop(w http.ResponseWriter, r *http.Request) {
 			}
 			writeSessionError(w, err)
 			return
+		}
+		if requestID != "" {
+			durableRun.requestReceipt = &agent.AgentRequestReceipt{
+				ID: requestID, Digest: requestDigest,
+				ExpectedRevision: *body.ExpectedRevision,
+				MessageCount:     len(durableRun.session.Messages),
+			}
 		}
 		durableRun.quarantine = func(sessionID string) {
 			s.durableQuarantine.Store(sessionID, struct{}{})
@@ -3978,6 +4016,32 @@ func writeAgentSSE(w http.ResponseWriter, event agent.Event) bool {
 		f.Flush()
 	}
 	return true
+}
+
+func writeAgentRequestReplay(w http.ResponseWriter, session *agent.Session) {
+	receipt := session.LastAgentRequest
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if !writeAgentSSE(w, durableSessionCommittedEvent(session)) {
+		return
+	}
+	for _, message := range session.Messages[receipt.MessageCount:] {
+		if message.Role == "assistant" && message.Content != "" && !writeAgentSSE(w, agent.Event{Type: "text", Data: message.Content}) {
+			return
+		}
+	}
+	done := map[string]any{"kind": receipt.Kind}
+	if receipt.Terminal != nil {
+		encoded, _ := json.Marshal(receipt.Terminal)
+		_ = json.Unmarshal(encoded, &done)
+		done["kind"] = receipt.Kind
+	}
+	if !writeAgentSSE(w, agent.Event{Type: "done", Data: done}) {
+		return
+	}
+	_ = writeAgentSSE(w, agent.Event{Type: "stream_end"})
 }
 
 type workstreamRunRecorder struct {

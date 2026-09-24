@@ -28,6 +28,7 @@ type durableSessionStore interface {
 	Get(string) (*agent.Session, error)
 	SaveExpected(*agent.Session, uint64) error
 	CommitInterruptedRun(*agent.Session, uint64, agent.SessionInterruption) error
+	CommitAgentRun(*agent.Session, uint64, *agent.SessionInterruption, agent.AgentRequestReceipt) error
 	MarkInterrupted(string, uint64, agent.SessionInterruption) (*agent.Session, error)
 	UpdateInterruptedRun(string, uint64, agent.SessionInterruption, agent.SessionInterruption) (*agent.Session, error)
 	OpenToolResultMemory(string, string) (*agent.SessionMemory, []agent.ToolResultReference, error)
@@ -48,6 +49,8 @@ type durableAgentRun struct {
 	journalMu        sync.Mutex
 	journalMarker    *agent.SessionInterruption
 	journalEntries   []agent.ToolExecutionJournalEntry
+	requestReceipt   *agent.AgentRequestReceipt
+	runKind          agent.RunTerminalKind
 	// completed mirrors observer.Completed for the existing SSE cleanup
 	// decision in server.go. Transcript and interruption state remain owned by
 	// the transport-neutral observer.
@@ -346,6 +349,14 @@ func (run *durableAgentRun) SetRuntimeRunID(id string) {
 
 func (run *durableAgentRun) Observe(event agent.Event) {
 	if run != nil && run.observer != nil {
+		if event.Type == "done" {
+			var payload struct {
+				Kind agent.RunTerminalKind `json:"kind"`
+			}
+			if encoded, err := json.Marshal(event.Data); err == nil && json.Unmarshal(encoded, &payload) == nil {
+				run.runKind = payload.Kind
+			}
+		}
 		run.observer.Observe(event)
 		run.completed = run.observer.Completed()
 	}
@@ -455,7 +466,7 @@ func (run *durableAgentRun) Finalize(provider, model string) (*agent.Session, er
 		return nil, fmt.Errorf("%w: ambiguous durable tool lifecycle", agent.ErrSessionReconcileRequired)
 	}
 	delta := run.observer.Messages()
-	if len(delta) == 0 && !terminalSet {
+	if len(delta) == 0 && !terminalSet && run.requestReceipt == nil {
 		copySession := cloneDurableSession(run.session)
 		return &copySession, nil
 	}
@@ -468,7 +479,14 @@ func (run *durableAgentRun) Finalize(provider, model string) (*agent.Session, er
 	candidate.Model = strings.TrimSpace(model)
 	marker := run.persistedJournalMarker()
 	var commitErr error
-	if marker != nil {
+	if run.requestReceipt != nil {
+		receipt := *run.requestReceipt
+		receipt.Kind = run.runKind
+		if terminalSet {
+			receipt.Terminal = &terminal
+		}
+		commitErr = run.store.CommitAgentRun(&candidate, run.expectedRevision, marker, receipt)
+	} else if marker != nil {
 		commitErr = run.store.CommitInterruptedRun(&candidate, run.expectedRevision, *marker)
 	} else {
 		commitErr = run.store.SaveExpected(&candidate, run.expectedRevision)
@@ -704,6 +722,10 @@ func cloneDurableSession(session agent.Session) agent.Session {
 	if session.LastRunTerminal != nil {
 		terminal := *session.LastRunTerminal
 		copySession.LastRunTerminal = &terminal
+	}
+	if session.LastAgentRequest != nil {
+		receipt := *session.LastAgentRequest
+		copySession.LastAgentRequest = &receipt
 	}
 	return copySession
 }

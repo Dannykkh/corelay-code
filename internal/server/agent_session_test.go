@@ -545,6 +545,95 @@ func TestAgentLoopBindsAndCommitsDurableSessionBeforeDone(t *testing.T) {
 	}
 }
 
+func TestAgentLoopReplaysCommittedRequestWithoutRedispatch(t *testing.T) {
+	t.Setenv("CORELAY_MEMORY", "off")
+	t.Setenv("CORELAY_AUTOSKILL", "off")
+	t.Setenv("CORELAY_AUTOVERIFY", "off")
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+	store := agent.NewSessionStore(storeDir)
+	session := agent.Session{Workspace: workDir, Messages: []agent.SessionMessage{{Role: "user", Content: "hello"}}}
+	if err := store.Save(&session); err != nil {
+		t.Fatal(err)
+	}
+	provider := &agentLoopFakeProvider{text: "once only"}
+	server := New(provider, "fake-model", 0)
+	server.SetWorkDir(workDir)
+	server.SetSessionStore(store)
+	request := map[string]any{
+		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
+		"durableSessionId": session.ID, "expectedRevision": session.Revision,
+		"requestId": "turn_123",
+	}
+	post := func(target *Server, payload map[string]any) *httptest.ResponseRecorder {
+		encoded, _ := json.Marshal(payload)
+		recorder := httptest.NewRecorder()
+		target.handleAgentLoop(recorder, httptest.NewRequest(http.MethodPost, "/api/agent", bytes.NewReader(encoded)))
+		return recorder
+	}
+	first := post(server, request)
+	if first.Code != http.StatusOK || provider.calls != 1 {
+		t.Fatalf("first status=%d calls=%d body=%s", first.Code, provider.calls, first.Body.String())
+	}
+	committed, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.LastAgentRequest == nil || committed.LastAgentRequest.CommittedRevision != committed.Revision {
+		t.Fatalf("missing committed request receipt: %#v", committed.LastAgentRequest)
+	}
+	restarted := New(provider, "fake-model", 0)
+	restarted.SetWorkDir(workDir)
+	restarted.SetSessionStore(agent.NewSessionStore(storeDir))
+	replay := post(restarted, request)
+	if replay.Code != http.StatusOK || provider.calls != 1 ||
+		!strings.Contains(replay.Body.String(), `"type":"text","data":"once only"`) ||
+		!strings.Contains(replay.Body.String(), `"type":"done"`) {
+		t.Fatalf("replay status=%d calls=%d body=%s", replay.Code, provider.calls, replay.Body.String())
+	}
+	changed := map[string]any{}
+	for key, value := range request {
+		changed[key] = value
+	}
+	changed["responseLang"] = "ko"
+	conflict := post(restarted, changed)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), `"code":"agent_request_conflict"`) || provider.calls != 1 {
+		t.Fatalf("conflict status=%d calls=%d body=%s", conflict.Code, provider.calls, conflict.Body.String())
+	}
+	forged := *committed
+	forged.LastAgentRequest = &agent.AgentRequestReceipt{ID: "forged"}
+	if err := store.SaveExpected(&forged, committed.Revision); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := store.Get(session.ID)
+	if err != nil || reloaded.LastAgentRequest == nil || reloaded.LastAgentRequest.ID != "turn_123" {
+		t.Fatalf("public session save changed server receipt: %#v err=%v", reloaded, err)
+	}
+}
+
+func TestAgentRequestReplayPreservesTerminalFailure(t *testing.T) {
+	session := &agent.Session{
+		ID: "sess_20260924-000000", Revision: 3,
+		Messages: []agent.SessionMessage{
+			{Role: "user", Content: "prompt"},
+			{Role: "assistant", Content: "partial result"},
+		},
+		LastAgentRequest: &agent.AgentRequestReceipt{
+			ID: "failed_turn", MessageCount: 1,
+			Kind:     agent.RunTerminalFailed,
+			Terminal: &agent.DurableRunTerminalMetadata{TerminalState: agent.EvidenceTerminalBlocked},
+		},
+	}
+	recorder := httptest.NewRecorder()
+	writeAgentRequestReplay(recorder, session)
+	response := recorder.Body.String()
+	if !strings.Contains(response, `"type":"text","data":"partial result"`) ||
+		!strings.Contains(response, `"kind":"failed"`) ||
+		!strings.Contains(response, `"terminalState":"blocked"`) {
+		t.Fatalf("replay lost failure semantics: %s", response)
+	}
+}
+
 func TestAgentLoopUsesDurableSessionWorkspaceWorkstreamAndModel(t *testing.T) {
 	t.Setenv("CORELAY_MEMORY", "off")
 	t.Setenv("CORELAY_AUTOSKILL", "off")

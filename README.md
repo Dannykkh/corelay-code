@@ -48,7 +48,7 @@ one fully automatic pipeline.
 | Execute work consistently | Shared agent kernel for Web, TUI, HTTP, ACP, team workers, and background work | Model quality still affects task success; not every ingress supports every workflow |
 | Keep projects and actions under control | Workspace/session binding, permissions, approvals, sandbox adapters, tool validation | Isolation depends on the configured platform/backend; this is not a complete security certification |
 | Detect incomplete work | Verification commands, completion evidence, typed terminal states, execution receipts | Passing a fixture does not prove an arbitrary user task is complete |
-| Recover from interruption | Durable sessions, revision checks, write-ahead markers, checkpoints and reconciliation | Ambiguous side effects require reconciliation rather than automatic replay |
+| Recover from interruption | Durable sessions, revision checks, write-ahead markers, checkpoints, request IDs, completed-turn replay, and reconciliation | CLI/TUI recovery is bounded; ambiguous side effects still require reconciliation, and live SSE events are not replayed |
 | Turn failures into test material | Failed Chronos/Team traces can be promoted to regression cases | Production traces are not yet automatically converted into safe, isolated acceptance tasks |
 | Evaluate behavior before adoption | Profiler with isolated calibration, holdout and safety probes; immutable profiles | Fixed-suite measurements do not establish general or statistically reliable improvement |
 | Learn bounded workflow reminders | `improve --learn` proposes reminders from repeated calibration failures, runs control/candidate evaluations, and publishes only accepted candidates | Four code-owned reminder types; no arbitrary skill generation, source-code rewriting, or model training |
@@ -110,11 +110,12 @@ corelaycode-profile shadow-eval --corpus cmd/corelaycode-profile/testdata/shadow
 ```
 
 The model command is opt-in and saves bounded answers, reported tokens, and
-measured latency. Jev is an optional provider requiring `TYPESAFE_API_KEY`; it
-has not been called live in this experiment. The bundled corpus is synthetic:
-the local model calls validate the measurement path, not an improvement in real
-coding tasks. Real reviewed cases and a separate evaluation split are still
-needed before considering intervention. See the [shadow evaluation guide](docs/shadow-evaluation.md)
+measured latency. Jev is an optional provider requiring `TYPESAFE_API_KEY`.
+Local Ollama and Jev were called on synthetic development cases; those calls
+validate the measurement path, not an improvement in real coding tasks. Jev
+responses also retain the returned model version and Noul probabilities for
+later calibration. Real reviewed cases and a separate evaluation split are
+still needed before considering intervention. See the [shadow evaluation guide](docs/shadow-evaluation.md)
 and [P3 results and limits](docs/plan/self-questioning-rsi/plan.md).
 
 ## Two paths, one runtime plane
@@ -221,7 +222,17 @@ verification evidence, teams, memory, activity, and KAIROS background work.
 - Every authorized side effect is journaled before the start event and executor.
 - Successful completion atomically commits the transcript and terminal state
   while clearing the exact interruption marker.
-- Cancel, crash, transport failure, or ambiguous persistence keeps the run
+- Durable `/api/agent` turns may include `requestId` (1–128 URL-safe characters).
+  Resend the exact body, session ID, and expected revision after a lost SSE
+  connection. A committed turn replays its saved assistant text and terminal
+  without dispatching the model or tools again; a changed body returns 409.
+  An active turn returns 409, and an interrupted tool run still requires
+  reconciliation. The CLI and TUI supply a fresh ID for each turn and attempt
+  to recover a dropped stream with that same ID. After partial output, they
+  only append the suffix of a matching committed transcript; recovery waits up
+  to 20 seconds.
+  An in-flight SSE stream itself is not replayed.
+- Interrupted tool execution or ambiguous persistence keeps the run
   quarantined until explicit reconciliation.
 - Forked sessions preserve lineage without sharing mutable state.
 
@@ -285,6 +296,11 @@ make all
 ```
 
 The browser opens at `http://localhost:4000/app`.
+
+The executable runs the agent harness and connects to a configured provider;
+it does not bundle or serve model weights. Select a provider and model ID, or
+configure default provider/model and optional routing rules so users do not
+choose a model for every task. Local inference servers are separate processes.
 
 From the project the agent should edit, `corelaycode chat` connects to the
 configured local server or starts a loopback-only managed server when that
@@ -350,8 +366,9 @@ docker compose up --build
 ```
 
 The release workflow builds `corelaycode`, `corelaycode-acp`, and
-`corelaycode-profile` for the supported platforms. Tagged releases also publish
-the Corelay Code container image.
+`corelaycode-profile` for Linux amd64/arm64, macOS amd64/arm64, and Windows
+amd64. The CI workflow runs Go tests on Linux, macOS, and Windows. Tagged
+releases also publish the Corelay Code container image.
 
 ## Use an existing CLI as the loop owner
 

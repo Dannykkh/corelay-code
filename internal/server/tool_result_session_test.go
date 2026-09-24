@@ -179,6 +179,7 @@ func TestDurableHTTPActiveRunSingleWinnerAndDeleteGate(t *testing.T) {
 		"messages":         []map[string]string{{"role": "user", "content": "hello"}},
 		"durableSessionId": session.ID,
 		"expectedRevision": session.Revision,
+		"requestId":        "active_turn_123",
 	})
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {

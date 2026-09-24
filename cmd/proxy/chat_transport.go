@@ -23,6 +23,8 @@ const (
 	maxAgentSSELineBytes       = 1 << 20
 	maxAgentSSEEventBytes      = 1 << 20
 	maxAgentHTTPErrorBodyBytes = 4 << 10
+	agentRecoveryWindow        = 20 * time.Second
+	agentRecoveryPoll          = 300 * time.Millisecond
 )
 
 var (
@@ -107,6 +109,7 @@ type agentTurnRequest struct {
 	ExecutionPolicy  *agent.ExecutionPolicyRequest `json:"executionPolicy,omitempty"`
 	DurableSessionID string                        `json:"durableSessionId,omitempty"`
 	ExpectedRevision *uint64                       `json:"expectedRevision,omitempty"`
+	RequestID        string                        `json:"requestId,omitempty"`
 }
 
 func parseExecutionModeFlag(value string) (agent.ExecutionMode, error) {
@@ -509,21 +512,31 @@ func truncateUTF8Bytes(value string, limit int) string {
 	return value
 }
 
-// StartTurn starts a single ordered SSE stream. It deliberately never retries
-// or re-POSTs an agent turn: the POST can mutate files, so a dropped response
-// fails closed until a future protocol can resume by an explicit idempotency key.
-// On a clean HTTP EOF it emits one EOF item; protocol, transport, and context
-// failures emit one Err item.
+// StartTurn starts one logical turn and recovers an uncertain transport ending through
+// the durable session receipt. A retry always reuses the exact request body.
 func (t *agentStreamTransport) StartTurn(ctx context.Context, turn agentTurnRequest) <-chan agentStreamItem {
+	body, err := json.Marshal(turn)
+	if err != nil {
+		items := make(chan agentStreamItem, 1)
+		items <- agentStreamItem{Err: err}
+		close(items)
+		return items
+	}
+	if turn.RequestID == "" || turn.DurableSessionID == "" || turn.ExpectedRevision == nil {
+		return t.startTurnOnce(ctx, body)
+	}
+	revision := *turn.ExpectedRevision
+	turn.ExpectedRevision = &revision
+	items := make(chan agentStreamItem, 16)
+	go t.startRecoverableTurn(ctx, turn, body, items)
+	return items
+}
+
+// startTurnOnce owns exactly one POST and preserves the bounded SSE parser.
+func (t *agentStreamTransport) startTurnOnce(ctx context.Context, body []byte) <-chan agentStreamItem {
 	items := make(chan agentStreamItem, 16)
 	go func() {
 		defer close(items)
-
-		body, err := json.Marshal(turn)
-		if err != nil {
-			emitAgentTerminal(items, agentStreamItem{Err: err})
-			return
-		}
 		req, err := t.newRequest(ctx, http.MethodPost, "/api/agent", nil, bytes.NewReader(body))
 		if err != nil {
 			emitAgentTerminal(items, agentStreamItem{Err: err})
@@ -587,6 +600,190 @@ func (t *agentStreamTransport) StartTurn(ctx context.Context, turn agentTurnRequ
 		}
 	}()
 	return items
+}
+
+type agentTurnRecoveryState struct {
+	text      strings.Builder
+	runtimeID string
+	material  bool
+	tooMuch   bool
+	done      bool
+}
+
+func (s *agentTurnRecoveryState) observe(event agentWireEvent) {
+	switch event.Type {
+	case "done":
+		s.done = true
+	case "session":
+		var value struct {
+			SessionID string `json:"sessionId"`
+		}
+		if json.Unmarshal(event.Data, &value) == nil {
+			s.runtimeID = value.SessionID
+		}
+	case "text":
+		s.material = true
+		var value string
+		if json.Unmarshal(event.Data, &value) != nil || s.text.Len()+len(value) > maxAgentSSEEventBytes {
+			s.tooMuch = true
+			return
+		}
+		s.text.WriteString(value)
+	case "heartbeat", "status", "workstream", "context_plan", "stream_end":
+	default:
+		s.material = true
+	}
+}
+
+func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn agentTurnRequest, body []byte, items chan<- agentStreamItem) {
+	defer close(items)
+	state := &agentTurnRecoveryState{}
+	var deadline time.Time
+	recoveryCtx := ctx
+	var last agentStreamItem
+	for post := 0; post < 3; post++ {
+		if post > 0 {
+			if !waitAgentRecovery(recoveryCtx, agentRecoveryPoll) {
+				err := recoveryCtx.Err()
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				}
+				emitAgentTerminal(items, agentStreamItem{Err: err})
+				return
+			}
+		}
+		for item := range t.startTurnOnce(recoveryCtx, body) {
+			if item.Err != nil || item.EOF {
+				last = item
+				continue
+			}
+			state.observe(item.Event)
+			items <- item
+		}
+		if state.done || ctx.Err() != nil || state.tooMuch || !retryableAgentTurnEnd(last, post > 0) {
+			if ctx.Err() != nil {
+				last = agentStreamItem{Err: ctx.Err()}
+			}
+			emitAgentTerminal(items, last)
+			return
+		}
+		if deadline.IsZero() {
+			deadline = time.Now().Add(agentRecoveryWindow)
+			var cancel context.CancelFunc
+			recoveryCtx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
+		}
+		session, err := t.GetSession(recoveryCtx, turn.DurableSessionID)
+		if err != nil {
+			if ctx.Err() != nil {
+				last = agentStreamItem{Err: ctx.Err()}
+			}
+			emitAgentTerminal(items, last)
+			return
+		}
+		if emitRecoveredAgentTurn(items, turn, session, state) {
+			return
+		}
+		if state.material || session.Revision != *turn.ExpectedRevision {
+			break
+		}
+	}
+	for time.Now().Before(deadline) && recoveryCtx.Err() == nil {
+		if state.runtimeID == "" && last.EOF {
+			break
+		}
+		if !waitAgentRecovery(recoveryCtx, agentRecoveryPoll) {
+			break
+		}
+		session, err := t.GetSession(recoveryCtx, turn.DurableSessionID)
+		if err != nil {
+			break
+		}
+		if emitRecoveredAgentTurn(items, turn, session, state) {
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		last = agentStreamItem{Err: ctx.Err()}
+	}
+	emitAgentTerminal(items, last)
+}
+
+func retryableAgentTurnEnd(item agentStreamItem, afterDisconnect bool) bool {
+	if item.EOF {
+		return true
+	}
+	if item.Err == nil || errors.Is(item.Err, context.Canceled) || errors.Is(item.Err, context.DeadlineExceeded) ||
+		errors.Is(item.Err, errAgentSSELineTooLong) || errors.Is(item.Err, errAgentSSEEventTooLong) ||
+		strings.HasPrefix(item.Err.Error(), "decode agent SSE event:") ||
+		strings.Contains(item.Err.Error(), "agent SSE event is missing type") {
+		return false
+	}
+	var httpErr *agentHTTPError
+	if errors.As(item.Err, &httpErr) {
+		if !afterDisconnect || httpErr.StatusCode != http.StatusConflict {
+			return false
+		}
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal([]byte(httpErr.Body), &envelope)
+		return envelope.Error.Code == "session_run_active" || envelope.Error.Code == "session_revision_conflict" ||
+			envelope.Error.Code == "session_reconcile_required"
+	}
+	return true
+}
+
+func emitRecoveredAgentTurn(items chan<- agentStreamItem, turn agentTurnRequest, session *agent.Session, state *agentTurnRecoveryState) bool {
+	if session == nil || session.ID != turn.DurableSessionID || session.LastAgentRequest == nil ||
+		session.LastAgentRequest.ID != turn.RequestID ||
+		session.LastAgentRequest.ExpectedRevision != *turn.ExpectedRevision ||
+		session.LastAgentRequest.CommittedRevision != session.Revision || state.tooMuch {
+		return false
+	}
+	receipt := session.LastAgentRequest
+	if receipt.MessageCount < 0 || receipt.MessageCount > len(session.Messages) {
+		return false
+	}
+	var saved strings.Builder
+	for _, message := range session.Messages[receipt.MessageCount:] {
+		if message.Role == "assistant" {
+			if saved.Len()+len(message.Content) > maxAgentSSEEventBytes {
+				return false
+			}
+			saved.WriteString(message.Content)
+		}
+	}
+	if !strings.HasPrefix(saved.String(), state.text.String()) {
+		return false
+	}
+	if suffix := strings.TrimPrefix(saved.String(), state.text.String()); suffix != "" {
+		data, _ := json.Marshal(suffix)
+		items <- agentStreamItem{Event: agentWireEvent{Type: "text", Data: data}}
+	}
+	done := map[string]any{"kind": receipt.Kind}
+	if receipt.Terminal != nil {
+		encoded, _ := json.Marshal(receipt.Terminal)
+		_ = json.Unmarshal(encoded, &done)
+		done["kind"] = receipt.Kind
+	}
+	data, _ := json.Marshal(done)
+	items <- agentStreamItem{Event: agentWireEvent{Type: "done", Data: data}}
+	emitAgentTerminal(items, agentStreamItem{EOF: true})
+	return true
+}
+
+func waitAgentRecovery(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (t *agentStreamTransport) emitSSEEvent(

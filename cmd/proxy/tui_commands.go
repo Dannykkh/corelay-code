@@ -448,6 +448,7 @@ func (m tuiModel) prepareTurnCmd(ctx context.Context, prompt string, cancel cont
 			ExecutionPolicy:  requestedExecutionPolicy(m.opts.Mode),
 			DurableSessionID: session.ID,
 			ExpectedRevision: &revision,
+			RequestID:        newChatRunID(),
 		})
 		return tuiTurnPreparedMsg{generation: generation, session: session, stream: stream, cancel: cancel}
 	}

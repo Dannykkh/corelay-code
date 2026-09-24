@@ -63,6 +63,7 @@ var (
 	legacySessionIDPattern    = regexp.MustCompile(`^sess_[0-9]{8}-[0-9]{6}$`)
 	opaqueSessionIDPattern    = regexp.MustCompile(`^sess_[a-z2-7]{26}$`)
 	sessionInputDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	agentRequestIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )
 
 const (
@@ -298,6 +299,47 @@ type Session struct {
 	Interruption          *SessionInterruption          `json:"interruption,omitempty"`
 	LastReconciliation    *SessionReconciliationReceipt `json:"lastReconciliation,omitempty"`
 	LastRunTerminal       *DurableRunTerminalMetadata   `json:"lastRunTerminal,omitempty"`
+	LastAgentRequest      *AgentRequestReceipt          `json:"lastAgentRequest,omitempty"`
+}
+
+// AgentRequestReceipt binds the last committed agent turn to its exact input.
+// It contains no prompt or tool data; the transcript remains in Messages.
+type AgentRequestReceipt struct {
+	ID                string                      `json:"id"`
+	Digest            string                      `json:"digest"`
+	ExpectedRevision  uint64                      `json:"expectedRevision"`
+	CommittedRevision uint64                      `json:"committedRevision"`
+	MessageCount      int                         `json:"messageCount"`
+	Terminal          *DurableRunTerminalMetadata `json:"terminal,omitempty"`
+	Kind              RunTerminalKind             `json:"kind,omitempty"`
+}
+
+func ValidateAgentRequestID(id string) error {
+	if !agentRequestIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid agent request id")
+	}
+	return nil
+}
+
+func validateAgentRequestReceipt(receipt *AgentRequestReceipt, revision uint64, messageCount int) error {
+	if receipt == nil {
+		return nil
+	}
+	if ValidateAgentRequestID(receipt.ID) != nil || !sessionInputDigestPattern.MatchString(receipt.Digest) ||
+		receipt.ExpectedRevision == 0 || receipt.CommittedRevision <= receipt.ExpectedRevision ||
+		receipt.CommittedRevision > revision || receipt.MessageCount < 1 || receipt.MessageCount > messageCount {
+		return fmt.Errorf("invalid agent request receipt")
+	}
+	if err := validateOptionalDurableRunTerminal(receipt.Terminal); err != nil {
+		return err
+	}
+	switch receipt.Kind {
+	case "", RunTerminalCompleted, RunTerminalCommand, RunTerminalCancelled, RunTerminalContextBlocked,
+		RunTerminalMaxIterations, RunTerminalMaxCycles, RunTerminalFailed, RunTerminalNoTerminal:
+	default:
+		return fmt.Errorf("invalid agent request terminal kind")
+	}
+	return nil
 }
 
 // SessionMessage is a message in a session (user, assistant, or tool).
@@ -688,7 +730,7 @@ func (s *SessionStore) loadStoredSession(path, expectedID string) (Session, erro
 	if sess.Version == 0 {
 		if sess.Revision != 0 || sess.ParentSessionID != "" || sess.ParentRevision != 0 ||
 			sess.LifecycleStatus != "" || sess.LastCommittedRevision != 0 ||
-			sess.ReconcileRequired || sess.Interruption != nil || sess.LastRunTerminal != nil ||
+			sess.ReconcileRequired || sess.Interruption != nil || sess.LastRunTerminal != nil || sess.LastAgentRequest != nil ||
 			sess.ExecutionPolicy != nil || sess.WorkstreamID != "" || sess.PlanID != "" ||
 			sess.PlanRevision != 0 || sess.StageID != "" || sessionHasImageReferences(sess.Messages) {
 			return Session{}, s.sessionRecoveryError(
@@ -751,6 +793,9 @@ func (s *SessionStore) loadStoredSession(path, expectedID string) (Session, erro
 		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
 	}
 	if err := validateOptionalDurableRunTerminal(sess.LastRunTerminal); err != nil {
+		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
+	}
+	if err := validateAgentRequestReceipt(sess.LastAgentRequest, sess.Revision, len(sess.Messages)); err != nil {
 		return Session{}, s.sessionRecoveryError(ErrSessionCorrupt, path, expectedID, data, err)
 	}
 	if err := validateSessionParentMetadata(sess.ID, sess.ParentSessionID, sess.ParentRevision); err != nil {
@@ -1276,14 +1321,14 @@ func (s *SessionStore) findSessionPathLocked(id string) (string, error) {
 
 // Save persists a session to disk under its workspace directory.
 func (s *SessionStore) Save(sess *Session) error {
-	return s.save(sess, nil, nil)
+	return s.save(sess, nil, nil, nil)
 }
 
 // SaveExpected persists a session only when expectedRevision matches the
 // revision currently on disk. A new or legacy-unversioned session has current
 // revision zero. The check and atomic replacement occur under one store lock.
 func (s *SessionStore) SaveExpected(sess *Session, expectedRevision uint64) error {
-	return s.save(sess, &expectedRevision, nil)
+	return s.save(sess, &expectedRevision, nil, nil)
 }
 
 // CommitInterruptedRun atomically commits a successful run transcript and
@@ -1302,7 +1347,14 @@ func (s *SessionStore) CommitInterruptedRun(
 		return err
 	}
 	marker = *cloneSessionInterruption(&marker)
-	return s.save(sess, &expectedRevision, &marker)
+	return s.save(sess, &expectedRevision, &marker, nil)
+}
+
+// CommitAgentRun atomically records the exact request receipt with the run's
+// transcript. A replay can then prove the input and terminal revision without
+// trusting caller supplied session metadata.
+func (s *SessionStore) CommitAgentRun(sess *Session, expectedRevision uint64, marker *SessionInterruption, receipt AgentRequestReceipt) error {
+	return s.save(sess, &expectedRevision, marker, &receipt)
 }
 
 // Fork atomically snapshots a versioned parent at expectedParentRevision into
@@ -1755,6 +1807,7 @@ func (s *SessionStore) save(
 	sess *Session,
 	expectedRevision *uint64,
 	committedInterruption *SessionInterruption,
+	agentReceipt *AgentRequestReceipt,
 ) error {
 	if sess == nil {
 		return fmt.Errorf("session is nil")
@@ -1769,6 +1822,10 @@ func (s *SessionStore) save(
 	candidate := *sess
 	candidate.ExecutionPolicy = cloneExecutionPolicySnapshot(sess.ExecutionPolicy)
 	candidate.LastRunTerminal = cloneDurableRunTerminalMetadata(sess.LastRunTerminal)
+	if sess.LastAgentRequest != nil {
+		receipt := *sess.LastAgentRequest
+		candidate.LastAgentRequest = &receipt
+	}
 	var existingPath string
 	var existing *Session
 	if candidate.ID == "" {
@@ -1853,6 +1910,18 @@ func (s *SessionStore) save(
 	if existing != nil && candidate.LastRunTerminal == nil {
 		candidate.LastRunTerminal = cloneDurableRunTerminalMetadata(existing.LastRunTerminal)
 	}
+	// Public session saves cannot create or replace a run receipt.
+	if agentReceipt == nil {
+		candidate.LastAgentRequest = nil
+		if existing != nil && existing.LastAgentRequest != nil {
+			copyReceipt := *existing.LastAgentRequest
+			candidate.LastAgentRequest = &copyReceipt
+		}
+	} else {
+		receipt := *agentReceipt
+		receipt.CommittedRevision = 0 // assigned after the revision CAS below
+		candidate.LastAgentRequest = &receipt
+	}
 	if existing != nil && candidate.ExecutionPolicy == nil {
 		candidate.ExecutionPolicy = cloneExecutionPolicySnapshot(existing.ExecutionPolicy)
 	}
@@ -1887,6 +1956,12 @@ func (s *SessionStore) save(
 		candidate.Revision = 1
 	} else {
 		candidate.Revision = existing.Revision + 1
+	}
+	if agentReceipt != nil {
+		candidate.LastAgentRequest.CommittedRevision = candidate.Revision
+	}
+	if err := validateAgentRequestReceipt(candidate.LastAgentRequest, candidate.Revision, len(candidate.Messages)); err != nil {
+		return err
 	}
 	candidate.LastCommittedRevision = candidate.Revision
 

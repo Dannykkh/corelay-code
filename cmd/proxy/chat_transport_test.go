@@ -287,6 +287,255 @@ func TestAgentStreamTransportRejectsOversizeSSELine(t *testing.T) {
 	}
 }
 
+func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testing.T) {
+	const sessionID = "recovery-session"
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+			var turn agentTurnRequest
+			if err := json.NewDecoder(r.Body).Decode(&turn); err != nil || turn.RequestID != "turn_1" {
+				t.Errorf("unexpected retry body: %#v err=%v", turn, err)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"hel\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			_ = json.NewEncoder(w).Encode(agent.Session{
+				ID: sessionID, Revision: 2,
+				Messages: []agent.SessionMessage{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}},
+				LastAgentRequest: &agent.AgentRequestReceipt{
+					ID: "turn_1", ExpectedRevision: 1, CommittedRevision: 2, MessageCount: 1,
+					Kind: agent.RunTerminalCompleted,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
+		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_1",
+	}))
+	if posts != 1 || len(items) != 4 || items[0].Event.Type != "text" ||
+		items[1].Event.Type != "text" || items[2].Event.Type != "done" || !items[3].EOF {
+		t.Fatalf("posts=%d items=%#v", posts, items)
+	}
+	var suffix string
+	if err := json.Unmarshal(items[1].Event.Data, &suffix); err != nil || suffix != "lo" {
+		t.Fatalf("recovered suffix=%q err=%v", suffix, err)
+	}
+}
+
+func TestAgentStreamTransportRetriesBeforeOutputWithSameRequestID(t *testing.T) {
+	const sessionID = "recovery-session"
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+			var turn agentTurnRequest
+			if err := json.NewDecoder(r.Body).Decode(&turn); err != nil || turn.RequestID != "turn_2" ||
+				turn.ExpectedRevision == nil || *turn.ExpectedRevision != 1 ||
+				len(turn.Messages) != 1 || turn.Messages[0].Content != "original" {
+				t.Errorf("retry changed request binding: %#v err=%v", turn, err)
+			}
+			if posts == 2 {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"done\"}\n\n")
+				_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"data\":{\"kind\":\"completed\"}}\n\n")
+			}
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			_ = json.NewEncoder(w).Encode(agent.Session{ID: sessionID, Revision: 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	messages := []chatMsg{{Role: "user", Content: "original"}}
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	stream := transport.StartTurn(context.Background(), agentTurnRequest{
+		Messages: messages, DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_2",
+	})
+	messages[0].Content = "changed after StartTurn"
+	items := collectAgentStream(t, stream)
+	if posts != 2 || len(items) != 3 || items[0].Event.Type != "text" ||
+		items[1].Event.Type != "done" || !items[2].EOF {
+		t.Fatalf("posts=%d items=%#v", posts, items)
+	}
+}
+
+func TestAgentStreamTransportDoesNotRepostAfterUncommittedPartialOutput(t *testing.T) {
+	const sessionID = "recovery-session"
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"partial\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			_ = json.NewEncoder(w).Encode(agent.Session{ID: sessionID, Revision: 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
+		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_3",
+	}))
+	if posts != 1 || len(items) != 2 || items[0].Event.Type != "text" || !items[1].EOF {
+		t.Fatalf("posts=%d items=%#v", posts, items)
+	}
+}
+
+func TestAgentStreamTransportWaitsForActiveRequestReceipt(t *testing.T) {
+	const sessionID = "recovery-session"
+	var posts, gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+			if posts == 2 {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = fmt.Fprint(w, `{"type":"error","error":{"code":"session_run_active"}}`)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			gets++
+			session := agent.Session{ID: sessionID, Revision: 1}
+			if gets >= 2 {
+				session.Revision = 2
+				session.Messages = []agent.SessionMessage{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "saved"}}
+				session.LastAgentRequest = &agent.AgentRequestReceipt{
+					ID: "turn_active", ExpectedRevision: 1, CommittedRevision: 2, MessageCount: 1,
+					Kind: agent.RunTerminalCompleted,
+				}
+			}
+			_ = json.NewEncoder(w).Encode(session)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
+		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_active",
+	}))
+	if posts != 2 || len(items) != 3 || items[0].Event.Type != "text" ||
+		items[1].Event.Type != "done" || !items[2].EOF {
+		t.Fatalf("posts=%d gets=%d items=%#v", posts, gets, items)
+	}
+}
+
+func TestAgentStreamTransportChecksReceiptAfterRunLeavesRegistry(t *testing.T) {
+	const sessionID = "recovery-session"
+	var gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"session\",\"data\":{\"sessionId\":\"run_1\"}}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"he\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			gets++
+			session := agent.Session{ID: sessionID, Revision: 1}
+			if gets >= 2 {
+				session.Revision = 2
+				session.Messages = []agent.SessionMessage{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}}
+				session.LastAgentRequest = &agent.AgentRequestReceipt{
+					ID: "turn_release", ExpectedRevision: 1, CommittedRevision: 2, MessageCount: 1,
+					Kind: agent.RunTerminalCompleted,
+				}
+			}
+			_ = json.NewEncoder(w).Encode(session)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/agent/loops":
+			_, _ = fmt.Fprint(w, `{"loops":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
+		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_release",
+	}))
+	if gets != 2 || len(items) != 5 || items[0].Event.Type != "session" ||
+		items[1].Event.Type != "text" || items[2].Event.Type != "text" ||
+		items[3].Event.Type != "done" || !items[4].EOF {
+		t.Fatalf("gets=%d items=%#v", gets, items)
+	}
+}
+
+func TestAgentStreamTransportRejectsMismatchedSavedText(t *testing.T) {
+	const sessionID = "recovery-session"
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"old\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			_ = json.NewEncoder(w).Encode(agent.Session{
+				ID: sessionID, Revision: 2,
+				Messages: []agent.SessionMessage{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "different"}},
+				LastAgentRequest: &agent.AgentRequestReceipt{
+					ID: "turn_mismatch", ExpectedRevision: 1, CommittedRevision: 2, MessageCount: 1,
+					Kind: agent.RunTerminalCompleted,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
+		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_mismatch",
+	}))
+	if posts != 1 || len(items) != 2 || items[0].Event.Type != "text" || !items[1].EOF {
+		t.Fatalf("posts=%d items=%#v", posts, items)
+	}
+}
+
+func TestAgentStreamTransportCancellationStopsRecovery(t *testing.T) {
+	getStarted := make(chan struct{})
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
+			posts++
+		case r.Method == http.MethodGet && r.URL.Path == sessionPath("cancel-session"):
+			close(getStarted)
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	revision := uint64(1)
+	transport := newAgentStreamTransport(server.URL, "", server.Client())
+	stream := transport.StartTurn(ctx, agentTurnRequest{
+		DurableSessionID: "cancel-session", ExpectedRevision: &revision, RequestID: "cancel_recovery",
+	})
+	select {
+	case <-getStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery did not inspect the session")
+	}
+	cancel()
+	items := collectAgentStream(t, stream)
+	if posts != 1 || len(items) != 1 || !errors.Is(items[0].Err, context.Canceled) {
+		t.Fatalf("posts=%d items=%#v", posts, items)
+	}
+}
+
 func TestAgentStreamTransportRejectsOversizeMultilineSSEEvent(t *testing.T) {
 	t.Parallel()
 
@@ -387,7 +636,10 @@ func TestAgentStreamTransportStartTurnCanBeCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	transport := newAgentStreamTransport(server.URL, "", server.Client())
-	stream := transport.StartTurn(ctx, agentTurnRequest{})
+	revision := uint64(1)
+	stream := transport.StartTurn(ctx, agentTurnRequest{
+		DurableSessionID: "cancel-session", ExpectedRevision: &revision, RequestID: "cancel_turn",
+	})
 	select {
 	case <-requestStarted:
 	case <-time.After(2 * time.Second):

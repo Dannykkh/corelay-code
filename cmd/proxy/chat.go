@@ -811,6 +811,7 @@ func (c *chatClient) streamTurn() (string, error) {
 		ExecutionPolicy:  requestedExecutionPolicy(c.mode),
 		DurableSessionID: session.ID,
 		ExpectedRevision: &revisionForRun,
+		RequestID:        newChatRunID(),
 	})
 	var streamErr error
 	for item := range stream {
