@@ -1,7 +1,7 @@
 # 자체질문 기반 실행 정책 실험
 
 작성: 2026-09-22 / source: codex
-상태: P1 관찰 기반과 P2 영속 기록/오프라인 평가 완료. P3 로컬 합성 모델 smoke 완료; 실제 reviewed/Jev 실험은 미완료.
+상태: P1 관찰 기반과 P2 영속 기록/오프라인 평가 완료. P3 로컬 모델·Jev 합성 smoke 완료; 실제 reviewed 평가는 미완료.
 읽는 순서: 이 계약 → [구현 순서](plan.md) → [검증 계약](validation.md).
 
 ## 목적과 첫 실험
@@ -92,4 +92,4 @@ run-owned 근거 ID를 해석하고 정제해야 하며, 원시 결과 자동 �
 
 - [기존 RSI 계약](../../rsi.md)
 - [Dream-RSI](https://dream-rsi.com/): 탐색 기록 재생과 실제 실행의 순환. Corelay 적용 효과는 미검증.
-- [jev-code 스킬](https://github.com/FrancoisChastel/jev-code/blob/main/skills/jev/SKILL.md): 좁은 typed judgment의 참고. 스킬 설치·Jev 실호출은 수행하지 않음.
+- [jev-code 스킬](https://github.com/FrancoisChastel/jev-code/blob/main/skills/jev/SKILL.md): 좁은 typed judgment의 참고. 스킬은 설치하지 않았다. Jev 실호출은 합성 development 사례에 한정했고 실제 reviewed 평가는 미실행이다.

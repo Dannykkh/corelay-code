@@ -119,6 +119,10 @@ become `yes`, at or below 0.2 become `no`, and middle values become `unknown`.
 These thresholds are provisional and must be selected on reviewed data. Jev
 does not supply source citations, so its `evidenceIds` identify the excerpts
 provided to the call, not model-selected proof.
+The response artifact preserves Jev's three original probabilities and the
+resolved model version alongside its thresholded answers. The evaluator rejects
+out-of-range or label-inconsistent probabilities. Older Jev artifacts without
+probabilities remain readable, but cannot support threshold calibration.
 
 The new response file is created with mode `0600` where supported, cannot
 overwrite an existing file, and
@@ -145,6 +149,8 @@ coverage and accuracy among evaluated cases must both be considered. Observed
 outcomes are shown beside recommendations, not attributed causally to them.
 The report contains no source evidence text and does not deploy a winner.
 
-Next: collect actual reviewed cases and, with credentials available, run Jev on
-the same approved corpus. Only then decide whether model judgments are worth
+Jev's live transport was exercised on the bundled synthetic development cases;
+its responses are not evidence of real-world accuracy. Next: collect actual
+reviewed cases and run the same approved corpus across the candidate models.
+Only then decide whether model judgments are worth
 testing as interventions. See the [implementation plan](plan/self-questioning-rsi/plan.md).

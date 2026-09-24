@@ -79,7 +79,7 @@ func TestShadowJudgeJevConvertsNoulAndAbstains(t *testing.T) {
 		if json.NewDecoder(r.Body).Decode(&body) != nil || body["questions"] == nil || body["state"] == nil || body["labels"] != nil {
 			t.Error("invalid TypeSafe request")
 		}
-		json.NewEncoder(w).Encode(map[string]any{"answers": map[string]any{
+		json.NewEncoder(w).Encode(map[string]any{"model": "jev-2026-09-11", "answers": map[string]any{
 			"sameFailure":          map[string]any{"type": "noul", "noul": 0.92},
 			"newEvidence":          map[string]any{"type": "noul", "noul": 0.49},
 			"alternativeSupported": map[string]any{"type": "noul", "noul": 0.04},
@@ -87,11 +87,11 @@ func TestShadowJudgeJevConvertsNoulAndAbstains(t *testing.T) {
 	}))
 	defer server.Close()
 	client := shadowJudgeClient{provider: "jev", model: "jev-latest", endpoint: server.URL, apiKey: "test-key", http: server.Client()}
-	raw, in, out, err := client.judge(context.Background(), request)
-	if err != nil || in != 73 || out != 12 {
+	result, err := client.judge(context.Background(), request)
+	if err != nil || result.inputTokens != 73 || result.outputTokens != 12 || result.resolvedModel != "jev-2026-09-11" || result.jevProbabilities["newEvidence"] != 0.49 {
 		t.Fatalf("jev call failed: %v", err)
 	}
-	answers, advisory, status := agent.EvaluateShadowResponse(request, raw)
+	answers, advisory, status := agent.EvaluateShadowResponse(request, result.response)
 	if status != "evaluated" || advisory != "abstain" || answers.NewEvidence.Value != "unknown" {
 		t.Fatalf("unexpected Jev mapping: %s %s %+v", status, advisory, answers)
 	}
@@ -135,7 +135,7 @@ func TestShadowJudgeRejectsMissingUsageInsteadOfCountingZero(t *testing.T) {
 	}))
 	defer server.Close()
 	client := shadowJudgeClient{provider: "ollama", model: "test", endpoint: server.URL, http: server.Client()}
-	if _, _, _, err := client.judge(context.Background(), request); err == nil {
+	if _, err := client.judge(context.Background(), request); err == nil {
 		t.Fatal("missing usage accepted as zero")
 	}
 }

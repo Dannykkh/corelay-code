@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -41,17 +42,19 @@ type shadowCorpus struct {
 	Cases         []shadowCase `json:"cases"`
 }
 type shadowRecordedResponse struct {
-	CaseID        string           `json:"caseId"`
-	RequestDigest string           `json:"requestDigest"`
-	Response      json.RawMessage  `json:"response"`
-	Usage         *shadowCallUsage `json:"usage,omitempty"`
+	CaseID           string             `json:"caseId"`
+	RequestDigest    string             `json:"requestDigest"`
+	Response         json.RawMessage    `json:"response"`
+	JevProbabilities map[string]float64 `json:"jevProbabilities,omitempty"`
+	Usage            *shadowCallUsage   `json:"usage,omitempty"`
 }
 type shadowCallUsage struct {
-	Provider     string `json:"provider"`
-	Model        string `json:"model"`
-	DurationMS   int64  `json:"durationMs"`
-	InputTokens  int    `json:"inputTokens"`
-	OutputTokens int    `json:"outputTokens"`
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	ResolvedModel string `json:"resolvedModel,omitempty"`
+	DurationMS    int64  `json:"durationMs"`
+	InputTokens   int    `json:"inputTokens"`
+	OutputTokens  int    `json:"outputTokens"`
 }
 type shadowResponses struct {
 	SchemaVersion int                      `json:"schemaVersion"`
@@ -89,12 +92,13 @@ type shadowEvalReport struct {
 	Results           []shadowCaseResult        `json:"results"`
 }
 type shadowUsageTotal struct {
-	Provider     string `json:"provider"`
-	Model        string `json:"model"`
-	Calls        int    `json:"calls"`
-	DurationMS   int64  `json:"durationMs"`
-	InputTokens  int    `json:"inputTokens"`
-	OutputTokens int    `json:"outputTokens"`
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	ResolvedModel string `json:"resolvedModel,omitempty"`
+	Calls         int    `json:"calls"`
+	DurationMS    int64  `json:"durationMs"`
+	InputTokens   int    `json:"inputTokens"`
+	OutputTokens  int    `json:"outputTokens"`
 }
 
 var shadowCaseID = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,80}$`)
@@ -124,6 +128,41 @@ func validShadowAdvisory(s string) bool {
 }
 func validShadowSplit(s string) bool {
 	return s == "development" || s == "selection" || s == "evaluation"
+}
+
+func jevNoulLabel(probability float64) string {
+	if probability >= 0.8 {
+		return "yes"
+	}
+	if probability <= 0.2 {
+		return "no"
+	}
+	return "unknown"
+}
+
+func validShadowJevProbabilities(v shadowRecordedResponse) bool {
+	if v.JevProbabilities == nil {
+		return true // Older response files remain readable but cannot be recalibrated.
+	}
+	if v.Usage == nil || v.Usage.Provider != "jev" || len(v.JevProbabilities) != 3 {
+		return false
+	}
+	var answers agent.ShadowResponse
+	if agent.DecodeShadowDocument(v.Response, &answers) != nil {
+		return false
+	}
+	values := map[string]string{
+		"sameFailure":          answers.SameFailure.Value,
+		"newEvidence":          answers.NewEvidence.Value,
+		"alternativeSupported": answers.AlternativeSupported.Value,
+	}
+	for name, answer := range values {
+		probability, ok := v.JevProbabilities[name]
+		if !ok || math.IsNaN(probability) || math.IsInf(probability, 0) || probability < 0 || probability > 1 || jevNoulLabel(probability) != answer {
+			return false
+		}
+	}
+	return true
 }
 
 func validateShadowCorpus(c shadowCorpus) error {
@@ -219,8 +258,12 @@ func runShadowEval(ctx context.Context, args []string, stdout, stderr io.Writer)
 				fmt.Fprintln(stderr, "duplicate or unknown response case")
 				return 2
 			}
-			if v.Usage != nil && (v.Usage.Provider == "" || v.Usage.Model == "" || len(v.Usage.Model) > 128 || v.Usage.DurationMS < 0 || v.Usage.InputTokens < 0 || v.Usage.OutputTokens < 0) {
+			if v.Usage != nil && (v.Usage.Provider == "" || v.Usage.Model == "" || len(v.Usage.Model) > 128 || len(v.Usage.ResolvedModel) > 128 || v.Usage.DurationMS < 0 || v.Usage.InputTokens < 0 || v.Usage.OutputTokens < 0) {
 				fmt.Fprintln(stderr, "invalid response usage")
+				return 2
+			}
+			if !validShadowJevProbabilities(v) {
+				fmt.Fprintln(stderr, "invalid Jev probabilities")
 				return 2
 			}
 			byID[v.CaseID] = v
@@ -259,9 +302,9 @@ func runShadowEval(ctx context.Context, args []string, stdout, stderr io.Writer)
 		} else {
 			if response.Usage != nil {
 				if report.Usage == nil {
-					report.Usage = &shadowUsageTotal{Provider: response.Usage.Provider, Model: response.Usage.Model}
+					report.Usage = &shadowUsageTotal{Provider: response.Usage.Provider, Model: response.Usage.Model, ResolvedModel: response.Usage.ResolvedModel}
 				}
-				if report.Usage.Provider != response.Usage.Provider || report.Usage.Model != response.Usage.Model {
+				if report.Usage.Provider != response.Usage.Provider || report.Usage.Model != response.Usage.Model || report.Usage.ResolvedModel != response.Usage.ResolvedModel {
 					fmt.Fprintln(stderr, "mixed response models")
 					return 2
 				}

@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "responses": [
+    {
+      "caseId": "repeat",
+      "requestDigest": "843f0a51aefb8193d7be40cd1e716b06f061d3cd207d938bb3a9755eef697591",
+      "response": {
+        "sameFailure": {
+          "value": "yes",
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ]
+        },
+        "newEvidence": {
+          "value": "yes",
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ]
+        },
+        "alternativeSupported": {
+          "value": "unknown",
+          "evidenceIds": null
+        }
+      },
+      "jevProbabilities": {
+        "alternativeSupported": 0.79,
+        "newEvidence": 0.87,
+        "sameFailure": 0.91
+      },
+      "usage": {
+        "provider": "jev",
+        "model": "jev-latest",
+        "resolvedModel": "jev-1.13.0",
+        "durationMs": 378,
+        "inputTokens": 775,
+        "outputTokens": 63
+      }
+    },
+    {
+      "caseId": "progress",
+      "requestDigest": "e634cddbef135d8279fe4f6490e5d35a5cc812b499d2987f9f6b973e48ea554e",
+      "response": {
+        "sameFailure": {
+          "value": "no",
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ]
+        },
+        "newEvidence": {
+          "value": "yes",
+          "evidenceIds": [
+            "r1-t0",
+            "r2-t0"
+          ]
+        },
+        "alternativeSupported": {
+          "value": "unknown",
+          "evidenceIds": null
+        }
+      },
+      "jevProbabilities": {
+        "alternativeSupported": 0.28,
+        "newEvidence": 0.92,
+        "sameFailure": 0.07
+      },
+      "usage": {
+        "provider": "jev",
+        "model": "jev-latest",
+        "resolvedModel": "jev-1.13.0",
+        "durationMs": 240,
+        "inputTokens": 774,
+        "outputTokens": 63
+      }
+    },
+    {
+      "caseId": "uncertain",
+      "requestDigest": "9c2a52d27816d596e6fc39e379057c1169c334715cad8f7aa844d2439d84be48",
+      "response": {
+        "sameFailure": {
+          "value": "unknown",
+          "evidenceIds": null
+        },
+        "newEvidence": {
+          "value": "unknown",
+          "evidenceIds": null
+        },
+        "alternativeSupported": {
+          "value": "unknown",
+          "evidenceIds": null
+        }
+      },
+      "jevProbabilities": {
+        "alternativeSupported": 0.29,
+        "newEvidence": 0.23,
+        "sameFailure": 0.27
+      },
+      "usage": {
+        "provider": "jev",
+        "model": "jev-latest",
+        "resolvedModel": "jev-1.13.0",
+        "durationMs": 236,
+        "inputTokens": 768,
+        "outputTokens": 63
+      }
+    }
+  ]
+}

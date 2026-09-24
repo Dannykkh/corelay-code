@@ -28,6 +28,14 @@ type shadowJudgeClient struct {
 	http     *http.Client
 }
 
+type shadowJudgeResult struct {
+	response         []byte
+	jevProbabilities map[string]float64
+	resolvedModel    string
+	inputTokens      int
+	outputTokens     int
+}
+
 func runShadowJudge(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("shadow-judge", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -88,21 +96,21 @@ func runShadowJudge(ctx context.Context, args []string, stdout, stderr io.Writer
 		}
 		callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		start := time.Now()
-		raw, inputTokens, outputTokens, err := client.judge(callCtx, request)
+		result, err := client.judge(callCtx, request)
 		cancel()
 		if err != nil {
 			fmt.Fprintf(stderr, "model call failed for case %s: %s\n", c.ID, safeShadowCallError(err))
 			return 1
 		}
-		if !json.Valid(raw) || len(raw) > 2048 {
+		if !json.Valid(result.response) || len(result.response) > 2048 {
 			// Never persist unbounded or non-JSON model text.
-			raw = []byte(`null`)
-		} else if _, _, status := agent.EvaluateShadowResponse(request, raw); status != "evaluated" {
+			result.response, result.jevProbabilities = []byte(`null`), nil
+		} else if _, _, status := agent.EvaluateShadowResponse(request, result.response); status != "evaluated" {
 			// The response file is a bounded decision artifact, not a raw model log.
-			raw = []byte(`null`)
+			result.response, result.jevProbabilities = []byte(`null`), nil
 		}
-		responses.Responses = append(responses.Responses, shadowRecordedResponse{CaseID: c.ID, RequestDigest: digest, Response: raw,
-			Usage: &shadowCallUsage{Provider: *provider, Model: *model, DurationMS: time.Since(start).Milliseconds(), InputTokens: inputTokens, OutputTokens: outputTokens}})
+		responses.Responses = append(responses.Responses, shadowRecordedResponse{CaseID: c.ID, RequestDigest: digest, Response: result.response, JevProbabilities: result.jevProbabilities,
+			Usage: &shadowCallUsage{Provider: *provider, Model: *model, ResolvedModel: result.resolvedModel, DurationMS: time.Since(start).Milliseconds(), InputTokens: result.inputTokens, OutputTokens: result.outputTokens}})
 	}
 	if len(responses.Responses) == 0 {
 		fmt.Fprintln(stderr, "selected split has no cases")
@@ -176,14 +184,14 @@ func (c shadowJudgeClient) post(ctx context.Context, body any) ([]byte, error) {
 	return b, nil
 }
 
-func (c shadowJudgeClient) judge(ctx context.Context, request agent.ShadowRequest) ([]byte, int, int, error) {
+func (c shadowJudgeClient) judge(ctx context.Context, request agent.ShadowRequest) (shadowJudgeResult, error) {
 	if c.provider == "jev" {
 		return c.judgeJev(ctx, request)
 	}
 	return c.judgeOllama(ctx, request)
 }
 
-func (c shadowJudgeClient) judgeOllama(ctx context.Context, request agent.ShadowRequest) ([]byte, int, int, error) {
+func (c shadowJudgeClient) judgeOllama(ctx context.Context, request agent.ShadowRequest) (shadowJudgeResult, error) {
 	state, _ := json.Marshal(struct {
 		Objective  string            `json:"objective"`
 		Acceptance string            `json:"acceptance"`
@@ -205,7 +213,7 @@ func (c shadowJudgeClient) judgeOllama(ctx context.Context, request agent.Shadow
 	}}
 	b, err := c.post(ctx, body)
 	if err != nil {
-		return nil, 0, 0, err
+		return shadowJudgeResult{}, err
 	}
 	var result struct {
 		Message struct {
@@ -216,12 +224,12 @@ func (c shadowJudgeClient) judgeOllama(ctx context.Context, request agent.Shadow
 		EvalCount       *int `json:"eval_count"`
 	}
 	if json.Unmarshal(b, &result) != nil || !result.Done || result.PromptEvalCount == nil || result.EvalCount == nil || *result.PromptEvalCount < 0 || *result.EvalCount < 0 {
-		return nil, 0, 0, errors.New("invalid provider response")
+		return shadowJudgeResult{}, errors.New("invalid provider response")
 	}
-	return []byte(result.Message.Content), *result.PromptEvalCount, *result.EvalCount, nil
+	return shadowJudgeResult{response: []byte(result.Message.Content), inputTokens: *result.PromptEvalCount, outputTokens: *result.EvalCount}, nil
 }
 
-func (c shadowJudgeClient) judgeJev(ctx context.Context, request agent.ShadowRequest) ([]byte, int, int, error) {
+func (c shadowJudgeClient) judgeJev(ctx context.Context, request agent.ShadowRequest) (shadowJudgeResult, error) {
 	ids := make([]string, 0, len(request.Evidence.Excerpts))
 	for id := range request.Evidence.Excerpts {
 		ids = append(ids, id)
@@ -236,9 +244,10 @@ func (c shadowJudgeClient) judgeJev(ctx context.Context, request agent.ShadowReq
 	}
 	b, err := c.post(ctx, map[string]any{"model": c.model, "state": state, "questions": questions})
 	if err != nil {
-		return nil, 0, 0, err
+		return shadowJudgeResult{}, err
 	}
 	var result struct {
+		Model   string `json:"model"`
 		Answers map[string]struct {
 			Type string   `json:"type"`
 			Noul *float64 `json:"noul"`
@@ -248,21 +257,18 @@ func (c shadowJudgeClient) judgeJev(ctx context.Context, request agent.ShadowReq
 			OutputTokens *int `json:"output_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal(b, &result) != nil || len(result.Answers) != 3 || result.Usage.InputTokens == nil || result.Usage.OutputTokens == nil || *result.Usage.InputTokens < 0 || *result.Usage.OutputTokens < 0 {
-		return nil, 0, 0, errors.New("invalid provider response")
+	if json.Unmarshal(b, &result) != nil || result.Model == "" || len(result.Model) > 128 || len(result.Answers) != 3 || result.Usage.InputTokens == nil || result.Usage.OutputTokens == nil || *result.Usage.InputTokens < 0 || *result.Usage.OutputTokens < 0 {
+		return shadowJudgeResult{}, errors.New("invalid provider response")
 	}
 	values := map[string]agent.ShadowAnswer{}
+	probabilities := map[string]float64{}
 	for _, name := range []string{"sameFailure", "newEvidence", "alternativeSupported"} {
 		a, ok := result.Answers[name]
 		if !ok || a.Type != "noul" || a.Noul == nil || *a.Noul < 0 || *a.Noul > 1 {
-			return nil, 0, 0, errors.New("invalid provider answer")
+			return shadowJudgeResult{}, errors.New("invalid provider answer")
 		}
-		value := "unknown"
-		if *a.Noul >= 0.8 {
-			value = "yes"
-		} else if *a.Noul <= 0.2 {
-			value = "no"
-		}
+		probabilities[name] = *a.Noul
+		value := jevNoulLabel(*a.Noul)
 		answer := agent.ShadowAnswer{Value: value}
 		if value != "unknown" {
 			// Jev does not return citations. These IDs identify evidence supplied to the
@@ -272,5 +278,5 @@ func (c shadowJudgeClient) judgeJev(ctx context.Context, request agent.ShadowReq
 		values[name] = answer
 	}
 	raw, _ := json.Marshal(agent.ShadowResponse{SameFailure: values["sameFailure"], NewEvidence: values["newEvidence"], AlternativeSupported: values["alternativeSupported"]})
-	return raw, *result.Usage.InputTokens, *result.Usage.OutputTokens, nil
+	return shadowJudgeResult{response: raw, jevProbabilities: probabilities, resolvedModel: result.Model, inputTokens: *result.Usage.InputTokens, outputTokens: *result.Usage.OutputTokens}, nil
 }

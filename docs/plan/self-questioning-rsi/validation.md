@@ -1,7 +1,7 @@
 # 검증·실험 계약
 
 상태: P1/P2 결정론적 회귀 및 Linux race PASS. 상세 실행 증거는 plan.md 참조.
-아래 표는 전체 단계의 검증 목표다. P3 로컬 모델의 합성 smoke는 실행했다. 실제 reviewed 사례와 Jev 실호출은 NOT RUN이며 표 전체 PASS가 아니다.
+아래 표는 전체 단계의 검증 목표다. P3 로컬 모델과 Jev의 합성 smoke는 실행했다. 실제 reviewed 사례 평가는 NOT RUN이며 표 전체 PASS가 아니다.
 구현 계약은 [spec.md](spec.md), 작업 상태는 [plan.md](plan.md)가 정본이다.
 
 ## P1–P2 필수 회귀

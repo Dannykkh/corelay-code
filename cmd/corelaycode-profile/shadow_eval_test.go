@@ -136,6 +136,31 @@ func TestShadowEvalRejectsDuplicateJSONAndCancellation(t *testing.T) {
 	}
 }
 
+func TestShadowJevProbabilitiesStayBoundToThresholdedAnswers(t *testing.T) {
+	c := shadowEvalFixture().Cases[0]
+	r := shadowResponseFixture(c)
+	r.Usage = &shadowCallUsage{Provider: "jev", Model: "jev-latest", ResolvedModel: "jev-2026-09-11"}
+	r.JevProbabilities = map[string]float64{"sameFailure": 0.92, "newEvidence": 0.04, "alternativeSupported": 0.87}
+	if !validShadowJevProbabilities(r) {
+		t.Fatal("valid provider probabilities rejected")
+	}
+	for _, mutate := range []func(*shadowRecordedResponse){
+		func(v *shadowRecordedResponse) { v.JevProbabilities["sameFailure"] = 0.1 },
+		func(v *shadowRecordedResponse) { v.JevProbabilities = map[string]float64{} },
+		func(v *shadowRecordedResponse) { delete(v.JevProbabilities, "newEvidence") },
+		func(v *shadowRecordedResponse) { v.JevProbabilities["alternativeSupported"] = 1.1 },
+		func(v *shadowRecordedResponse) { v.Usage.Provider = "ollama" },
+	} {
+		copy := r
+		copy.Usage = &shadowCallUsage{Provider: r.Usage.Provider, Model: r.Usage.Model, ResolvedModel: r.Usage.ResolvedModel}
+		copy.JevProbabilities = map[string]float64{"sameFailure": r.JevProbabilities["sameFailure"], "newEvidence": r.JevProbabilities["newEvidence"], "alternativeSupported": r.JevProbabilities["alternativeSupported"]}
+		mutate(&copy)
+		if validShadowJevProbabilities(copy) {
+			t.Fatal("invalid or mismatched provider probabilities accepted")
+		}
+	}
+}
+
 func TestShadowBundledCorpusBindings(t *testing.T) {
 	for _, split := range []string{"development", "selection", "evaluation"} {
 		var out, errOut bytes.Buffer

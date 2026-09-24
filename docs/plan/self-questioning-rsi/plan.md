@@ -7,7 +7,7 @@
 | P0 연결 지점·계약 | DONE (문서) | 기존 guard/recorder/profiler 조사, 질문·비용·평가 계약 | 실제 경로 확인, 문서 링크·공백 검사 |
 | P1 결정론적 관찰 기반 | DONE (로컬 검증) | shadow_judgment.go, RunOptions seam, loop 결과 집계 연결 | fake judge/실제 kernel 회귀, Linux race PASS |
 | P2 기록·평가 fixture 연결 | DONE (로컬 검증) | 기존 recorder 영속 저장, corpus/label 형식, shadow-eval 오프라인 비교 | kernel→composite→trace 재개방, 관련 4개 suite/race PASS |
-| P3 모델 비교 | PARTIAL (합성 smoke) | 명시 `shadow-judge` Ollama/optional Jev HTTP adapter, 토큰·지연 평가 | 실제 reviewed corpus/Jev credential 전에는 품질 판정 보류 |
+| P3 모델 비교 | PARTIAL (합성 smoke) | 명시 `shadow-judge` Ollama/Jev HTTP adapter, 토큰·지연·Jev 확률 기록 | 실제 reviewed corpus 전에는 품질 판정 보류 |
 | P4 제한 개입 | DEFERRED | 질문 결과에 따른 기존 조사/전환 경로 연결 | 관찰 근거 확인 후 live paired 실험에서 가치 확인 |
 | P5 개선 후보·채택 | DEFERRED | 정책 artifact identity/평가/명시 activation/복귀 | unseen 과제 검증, 잘못된 후보 비활성 유지 |
 | P6 기록 재생 | DEFERRED | 관측 행동과 parent state가 연결된 replay world | unseen은 unsupported, 미래 근거 누출 없음, live 검증 별도 |
@@ -28,7 +28,7 @@ P1은 주입 가능한 관찰 기능의 구현 완료, P2는 기록과 시험 �
 ## 현재 판정과 다음 행동
 
 P0/P1/P2 완료. P3 모델 adapter와 합성 사례 호출·측정까지 완료했으며, 실제 사례에 대한 정확도·비용 비교는 남았다.
-실험용 로컬 모델만 사용했다. 유료 호출·전역 스킬 설치·실행 정책 채택은 하지 않았다.
+로컬 모델과 TypeSafe Jev에 합성 development 사례만 사용했다. Jev API는 확률 기록 보완 전후로 3건씩 총 6회 호출했고 실제 청구 금액은 확인하지 않았다. 전역 스킬 설치·실행 정책 채택은 하지 않았다.
 사용자의 “성능은 괜찮았다”는 전제를 유지한다. 초기 실제 사례 10건은 진단 자료이며 성공·비개입 사례도 따로 포함한다.
 기존 신뢰성 로드맵 S13 잔여 검증은 이 계획의 완료로 대체되지 않는다.
 
@@ -58,7 +58,7 @@ P0/P1/P2 완료. P3 모델 adapter와 합성 사례 호출·측정까지 완료�
 
 ## P3 합성 smoke (2026-09-23)
 
-명시적 `shadow-judge`로 Ollama `/api/chat`와 TypeSafe Jev `/v1/systemone`를 연결했다. 평가는 기존 `shadow-eval`의 request digest/응답 계약을 사용하며, 원래 agent 실행 정책에는 연결하지 않았다. Jev의 세 Noul은 한 호출에 묶고 0.2 이하 `no`, 0.8 이상 `yes`, 중간은 `unknown`으로 처리한다. Jev는 근거 ID를 선택해 돌려주지 않아 제공한 excerpt ID를 참조용으로만 기록한다. 이 임계값은 실제 데이터에서 아직 보정되지 않았다.
+명시적 `shadow-judge`로 Ollama `/api/chat`와 TypeSafe Jev `/v1/systemone`를 연결했다. 평가는 기존 `shadow-eval`의 request digest/응답 계약을 사용하며, 원래 agent 실행 정책에는 연결하지 않았다. Jev의 세 Noul은 한 호출에 묶고 0.2 이하 `no`, 0.8 이상 `yes`, 중간은 `unknown`으로 처리한다. Jev는 근거 ID를 선택해 돌려주지 않아 제공한 excerpt ID를 참조용으로만 기록한다. Jev 응답 파일에는 실제 확률과 서버가 반환한 모델 버전을 보존해 후속 보정 근거를 잃지 않는다. 이 임계값은 실제 데이터에서 아직 보정되지 않았다.
 
 로컬 Ollama 합성 development 사례 3개 결과. 초깃값/고정 규칙의 advisory 일치도는 각각 1/3이다. 두 모델 모두 유효 응답 3/3, 기권 3/3, advisory 일치 1/3이다. 질문별 정확 일치는 Qwen3 0.6B가 3/9, Gemma4 12B가 5/9다. 합성 정답으로 만든 fixture이므로 이 숫자는 실제 성능이나 개선 효과가 아니다.
 
@@ -66,7 +66,8 @@ P0/P1/P2 완료. P3 모델 adapter와 합성 사례 호출·측정까지 완료�
 |---|---:|---:|---:|---|
 | Qwen3 0.6B | 1404/309 | 1,528ms | 480/573ms | [responses](qwen3-0.6b-development-responses-v2.json) |
 | Gemma4 12B | 1402/339 | 51,795ms | 3,940/44,089ms | [responses](gemma4-12b-development-responses.json) |
+| Jev (`jev-1.13.0`) | 2317/189 | 854ms | 240/378ms | [responses](jev-development-responses-v2.json) |
 
-Gemma4 p95에는 모델 적재가 포함되고 Qwen3 재측정은 이미 적재된 상태라 지연을 공정하게 비교할 수 없다. Qwen3 첫 JSON-only 시도는 형식 오류 3/3이었고 JSON Schema를 지정한 뒤 유효 응답 3/3으로 바뀌었다. 이 수정은 development split에서만 했다. 실제 금액·전력·GPU 경합은 측정하지 않았고 TypeSafe 키가 없어 Jev 실호출은 `NOT RUN`이다. Jev HTTP 계약 변환은 mock 서버 테스트만 통과했다.
+Jev는 승인된 합성 development 사례 3건을 실호출했고 유효 응답 3/3, 기권 3/3, advisory 일치 1/3, 질문 일치 6/9였다. 첫 실호출은 1,387ms였지만 확률 저장 누락을 발견해 응답 계약을 보완한 뒤 재호출한 최종 산출물의 지연만 표에 적었다. Gemma4 p95에는 모델 적재가 포함되고 Qwen3 재측정은 이미 적재된 상태다. Jev는 원격 호출이고 tokenizer도 다르므로 이 숫자만으로 공정한 속도·토큰 효율 비교를 할 수 없다. Qwen3 첫 JSON-only 시도는 형식 오류 3/3이었고 JSON Schema를 지정한 뒤 유효 응답 3/3으로 바뀌었다. 이 수정은 development split에서만 했다. 실제 청구 금액·전력·GPU 경합은 측정하지 않았다. 세 모델의 합성 일치도는 실사용 품질 근거가 아니다.
 
-로컬 run trace 저장소를 읽기 전용으로 확인한 결과 agent run 17개, failed 4개, shadow judgment 0개였다. 기존 trace에는 이 평가 계약의 전후 tool excerpt/독립 라벨이 없어 reviewed corpus를 추론하거나 자동 생성하지 않았다. 다음 작업은 실제 실행에서 승인된 excerpt와 독립 라벨을 수집한 뒤 새 selection/evaluation 과제로 비교하는 것이다. 그 전까지 P3 품질 판정과 P4 개입은 보류한다.
+로컬 run trace 저장소를 읽기 전용으로 확인한 결과 전체 21개(agent 17개, team 4개) 중 실패는 agent 1개와 team 3개였고 shadow judgment는 0개였다. 기존 trace에는 이 평가 계약의 전후 tool excerpt/독립 라벨이 없어 reviewed corpus를 추론하거나 자동 생성하지 않았다. 다음 작업은 실제 실행에서 승인된 excerpt와 독립 라벨을 수집한 뒤 새 selection/evaluation 과제로 비교하는 것이다. 그 전까지 P3 품질 판정과 P4 개입은 보류한다.
