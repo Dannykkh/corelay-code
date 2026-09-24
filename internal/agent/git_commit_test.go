@@ -598,6 +598,8 @@ func newGitCommitFixture(t *testing.T) string {
 	runGitCommitFixture(t, repo, "config", "user.name", "Corelay Test")
 	runGitCommitFixture(t, repo, "config", "user.email", "corelay-test@example.invalid")
 	runGitCommitFixture(t, repo, "config", "commit.gpgsign", "false")
+	runGitCommitFixture(t, repo, "config", "gc.auto", "0")
+	runGitCommitFixture(t, repo, "config", "maintenance.auto", "false")
 	writeGitCommitFile(t, repo, "A.txt", "A base\n")
 	writeGitCommitFile(t, repo, "B.txt", "B base\n")
 	runGitCommitFixture(t, repo, "add", "--", "A.txt", "B.txt")
