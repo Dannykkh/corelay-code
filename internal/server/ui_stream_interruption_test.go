@@ -101,12 +101,12 @@ func checkBrowserChatInterruptedStream(t *testing.T, payload string) {
 	})
 	go router.Run()
 	defer func() { _ = router.Stop() }()
-	page := browser.MustPage(base + "/app").Timeout(10 * time.Second)
+	page := browser.MustPage(base + "/app").Timeout(20 * time.Second)
 	page.MustWaitLoad()
 	page.MustElement("textarea").MustInput("stream truncation probe")
 	page.MustElementR("button", "전송|Send").MustClick()
 	var body string
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 300; i++ {
 		body = page.MustEval(`() => document.body.innerText`).Str()
 		if strings.Contains(body, "Connection interrupted before the run completed") {
 			break

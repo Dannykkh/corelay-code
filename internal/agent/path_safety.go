@@ -479,6 +479,7 @@ func canonicalWorkspace(workDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve working directory links: %w", err)
 	}
+	canonical = canonicalFilesystemCase(canonical)
 	info, err := os.Stat(canonical)
 	if err != nil {
 		return "", fmt.Errorf("inspect working directory: %w", err)
@@ -487,6 +488,38 @@ func canonicalWorkspace(workDir string) (string, error) {
 		return "", errors.New("working directory is not a directory")
 	}
 	return filepath.Clean(canonical), nil
+}
+
+// EvalSymlinks on a case-insensitive macOS volume can retain the caller's
+// spelling. Use directory entries to recover the stored names before path
+// comparisons and ancestor instruction lookup.
+func canonicalFilesystemCase(path string) string {
+	if runtime.GOOS != "darwin" || !filepath.IsAbs(path) {
+		return path
+	}
+	clean := filepath.Clean(path)
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(clean, current), current) {
+		if component == "" {
+			continue
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return clean
+		}
+		actual := component
+		for _, entry := range entries {
+			if entry.Name() == component {
+				actual = component
+				break
+			}
+			if strings.EqualFold(entry.Name(), component) {
+				actual = entry.Name()
+			}
+		}
+		current = filepath.Join(current, actual)
+	}
+	return current
 }
 
 // canonicalPathWithinWorkspace resolves existing targets through all symlinks.
@@ -570,6 +603,7 @@ func canonicalizeTarget(target string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("resolve links for %q: %w", current, err)
 			}
+			canonical = canonicalFilesystemCase(canonical)
 			if len(missing) > 0 {
 				resolvedInfo, err := os.Stat(canonical)
 				if err != nil {

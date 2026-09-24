@@ -2,6 +2,13 @@
 
 All notable changes to Corelay Code are documented here.
 
+## [2.0.1] - 2026-09-24
+
+### Bug Fixes
+
+- Resolve macOS workspace paths to their stored filesystem casing before comparing paths and loading ancestor instructions.
+- Make cross-platform integration tests use an explicit execution policy and filesystem case detection; allow more time for browser stream checks on hosted runners.
+
 ## [2.0.0] - 2026-09-24
 
 ### Breaking Changes
@@ -138,4 +145,5 @@ All notable changes to Corelay Code are documented here.
 - Chat welcome + page descriptions + clearer navigation ([bb353d3](https://github.com/Dannykkh/corelay-code/commit/bb353d3))
 - Settings — simplified one-click start ([f00dcf9](https://github.com/Dannykkh/corelay-code/commit/f00dcf9))
 
+[2.0.1]: https://github.com/Dannykkh/corelay-code/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/Dannykkh/corelay-code/compare/v1.6.0...v2.0.0
