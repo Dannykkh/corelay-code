@@ -7,7 +7,7 @@ All notable changes to Corelay Code are documented here.
 ### Bug Fixes
 
 - Resolve macOS workspace paths to their stored filesystem casing before comparing paths and loading ancestor instructions.
-- Make cross-platform integration tests use an explicit execution policy and filesystem case detection; stabilize browser stream checks and Git fixture cleanup on hosted runners.
+- Make cross-platform integration tests use an explicit execution policy and filesystem case detection; use an HTTP fixture for browser stream checks and disable Git fixture auto-maintenance on hosted runners.
 
 ## [2.0.0] - 2026-09-24
 

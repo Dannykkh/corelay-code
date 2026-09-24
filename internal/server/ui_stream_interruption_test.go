@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,12 +22,11 @@ import (
 )
 
 func TestBrowserChatReportsInterruptedStreamWithoutSavingSuccess(t *testing.T) {
-	// web/tests/sse.test.mjs covers an unterminated done frame; CDP's
-	// fulfilled response is inconsistent for that tail on Windows runners.
 	partial := "data: {\"type\":\"text\",\"data\":\"PARTIAL_ONLY_RESPONSE\"}\n\n"
 	for name, payload := range map[string]string{
-		"partial-only": partial,
-		"empty-eof":    "",
+		"partial-only":      partial,
+		"unterminated-done": partial + "data: {\"type\":\"done\",\"data\":{}}",
+		"empty-eof":         "",
 	} {
 		t.Run(name, func(t *testing.T) { checkBrowserChatInterruptedStream(t, payload) })
 	}
@@ -89,19 +91,31 @@ func checkBrowserChatInterruptedStream(t *testing.T, payload string) {
 		t.Fatal("server did not become ready")
 	}
 	t.Log("server ready", base)
+	upstream, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := httputil.NewSingleHostReverseProxy(upstream)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/agent" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, payload)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return
+		}
+		backend.ServeHTTP(w, r)
+	}))
+	defer stub.Close()
+	base = stub.URL
 	u := launcher.New().Bin(bin).Headless(true).MustLaunch()
 	t.Log("browser launched")
 	browser := rod.New().ControlURL(u).MustConnect()
 	t.Log("browser connected")
 	defer browser.MustClose()
 
-	router := browser.HijackRequests()
-	router.MustAdd(base+"/api/agent", func(h *rod.Hijack) {
-		h.Response.SetHeader("Content-Type", "text/event-stream")
-		h.Response.SetBody(payload)
-	})
-	go router.Run()
-	defer func() { _ = router.Stop() }()
 	page := browser.MustPage(base + "/app").Timeout(20 * time.Second)
 	page.MustWaitLoad()
 	page.MustElement("textarea").MustInput("stream truncation probe")
