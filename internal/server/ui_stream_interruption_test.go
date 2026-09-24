@@ -96,8 +96,13 @@ func checkBrowserChatInterruptedStream(t *testing.T, payload string) {
 		t.Fatal(err)
 	}
 	backend := httputil.NewSingleHostReverseProxy(upstream)
+	agentRequested := make(chan struct{}, 1)
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/api/agent" {
+			select {
+			case agentRequested <- struct{}{}:
+			default:
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, payload)
@@ -118,8 +123,14 @@ func checkBrowserChatInterruptedStream(t *testing.T, payload string) {
 
 	page := browser.MustPage(base + "/app").Timeout(20 * time.Second)
 	page.MustWaitLoad()
+	page.MustElementR("span", "Project")
 	page.MustElement("textarea").MustInput("stream truncation probe")
 	page.MustElementR("button", "전송|Send").MustClick()
+	select {
+	case <-agentRequested:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent request did not reach the HTTP fixture")
+	}
 	var body string
 	for i := 0; i < 300; i++ {
 		body = page.MustEval(`() => document.body.innerText`).Str()

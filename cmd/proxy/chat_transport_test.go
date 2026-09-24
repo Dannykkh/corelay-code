@@ -289,7 +289,7 @@ func TestAgentStreamTransportRejectsOversizeSSELine(t *testing.T) {
 
 func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testing.T) {
 	const sessionID = "recovery-session"
-	var posts int
+	var posts, gets int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/agent":
@@ -301,6 +301,11 @@ func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testin
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"hel\"}\n\n")
 		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
+			gets++
+			if gets == 1 {
+				http.Error(w, "server restarting", http.StatusServiceUnavailable)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(agent.Session{
 				ID: sessionID, Revision: 2,
 				Messages: []agent.SessionMessage{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "hello"}},
@@ -319,9 +324,9 @@ func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testin
 	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
 		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_1",
 	}))
-	if posts != 1 || len(items) != 4 || items[0].Event.Type != "text" ||
+	if posts != 1 || gets != 2 || len(items) != 4 || items[0].Event.Type != "text" ||
 		items[1].Event.Type != "text" || items[2].Event.Type != "done" || !items[3].EOF {
-		t.Fatalf("posts=%d items=%#v", posts, items)
+		t.Fatalf("posts=%d gets=%d items=%#v", posts, gets, items)
 	}
 	var suffix string
 	if err := json.Unmarshal(items[1].Event.Data, &suffix); err != nil || suffix != "lo" {

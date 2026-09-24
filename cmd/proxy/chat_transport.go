@@ -675,6 +675,9 @@ func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn ag
 		}
 		session, err := t.GetSession(recoveryCtx, turn.DurableSessionID)
 		if err != nil {
+			if retryableAgentRecoveryRead(err) {
+				break
+			}
 			if ctx.Err() != nil {
 				last = agentStreamItem{Err: ctx.Err()}
 			}
@@ -689,7 +692,7 @@ func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn ag
 		}
 	}
 	for time.Now().Before(deadline) && recoveryCtx.Err() == nil {
-		if state.runtimeID == "" && last.EOF {
+		if state.runtimeID == "" && !state.material && last.EOF {
 			break
 		}
 		if !waitAgentRecovery(recoveryCtx, agentRecoveryPoll) {
@@ -697,6 +700,9 @@ func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn ag
 		}
 		session, err := t.GetSession(recoveryCtx, turn.DurableSessionID)
 		if err != nil {
+			if retryableAgentRecoveryRead(err) {
+				continue
+			}
 			break
 		}
 		if emitRecoveredAgentTurn(items, turn, session, state) {
@@ -707,6 +713,18 @@ func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn ag
 		last = agentStreamItem{Err: ctx.Err()}
 	}
 	emitAgentTerminal(items, last)
+}
+
+func retryableAgentRecoveryRead(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var httpErr *agentHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func retryableAgentTurnEnd(item agentStreamItem, afterDisconnect bool) bool {
