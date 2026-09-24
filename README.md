@@ -369,6 +369,7 @@ The release workflow builds `corelaycode`, `corelaycode-acp`, and
 `corelaycode-profile` for Linux amd64/arm64, macOS amd64/arm64, and Windows
 amd64. The CI workflow runs Go tests on Linux, macOS, and Windows. Tagged
 releases also publish the Corelay Code container image.
+See the [changelog](CHANGELOG.md) for release history and migration notes.
 
 ## Use an existing CLI as the loop owner
 
