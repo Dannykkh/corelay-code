@@ -692,7 +692,7 @@ func (t *agentStreamTransport) startRecoverableTurn(ctx context.Context, turn ag
 		}
 	}
 	for time.Now().Before(deadline) && recoveryCtx.Err() == nil {
-		if state.runtimeID == "" && !state.material && last.EOF {
+		if state.runtimeID == "" && last.EOF {
 			break
 		}
 		if !waitAgentRecovery(recoveryCtx, agentRecoveryPoll) {

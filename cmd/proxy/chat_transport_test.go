@@ -299,6 +299,7 @@ func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testin
 				t.Errorf("unexpected retry body: %#v err=%v", turn, err)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"session\",\"data\":{\"sessionId\":\"runtime-1\"}}\n\n")
 			_, _ = fmt.Fprint(w, "data: {\"type\":\"text\",\"data\":\"hel\"}\n\n")
 		case r.Method == http.MethodGet && r.URL.Path == sessionPath(sessionID):
 			gets++
@@ -324,12 +325,13 @@ func TestAgentStreamTransportRecoversCommittedPartialTextWithoutRepost(t *testin
 	items := collectAgentStream(t, transport.StartTurn(context.Background(), agentTurnRequest{
 		DurableSessionID: sessionID, ExpectedRevision: &revision, RequestID: "turn_1",
 	}))
-	if posts != 1 || gets != 2 || len(items) != 4 || items[0].Event.Type != "text" ||
-		items[1].Event.Type != "text" || items[2].Event.Type != "done" || !items[3].EOF {
+	if posts != 1 || gets != 2 || len(items) != 5 || items[0].Event.Type != "session" ||
+		items[1].Event.Type != "text" || items[2].Event.Type != "text" ||
+		items[3].Event.Type != "done" || !items[4].EOF {
 		t.Fatalf("posts=%d gets=%d items=%#v", posts, gets, items)
 	}
 	var suffix string
-	if err := json.Unmarshal(items[1].Event.Data, &suffix); err != nil || suffix != "lo" {
+	if err := json.Unmarshal(items[2].Event.Data, &suffix); err != nil || suffix != "lo" {
 		t.Fatalf("recovered suffix=%q err=%v", suffix, err)
 	}
 }
