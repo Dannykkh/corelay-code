@@ -152,6 +152,22 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 		return nil
 	}
 
+	// The app resolves the selected workspace asynchronously after load, and a
+	// workspace change aborts the active run (Chat.tsx workspace epoch guard). On
+	// a slow runner a send issued before that resolution was cancelled and no
+	// approval appeared, so wait for the project to be selected first, as the S10
+	// browser test does.
+	projectReady := false
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if strings.Contains(bodyText(), "Overhaul") {
+			projectReady = true
+			break
+		}
+	}
+	if !projectReady {
+		t.Fatalf("workspace was not selected; page text:\n%s", bodyText())
+	}
+
 	step().MustElement("textarea").MustInput("run the probe tool")
 	step().MustElementR("button", "전송|Send").MustClick()
 
