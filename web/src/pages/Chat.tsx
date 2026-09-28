@@ -119,6 +119,8 @@ function readImageAttachment(file: File): Promise<AttachedImage> {
 
 interface ChatPageProps {
   selectedWorkspace: string;
+  /** False until the app has resolved the initial workspace selection. */
+  workspaceReady?: boolean;
   loadSessionId?: string | null;
   onSessionLoaded?: () => void;
   onOpenHistory?: (tab?: HistoryTab) => void;
@@ -281,6 +283,7 @@ function planIsApprovedCurrentRevision(plan: WorkstreamPlan, revision: number | 
 
 export function ChatPage({
   selectedWorkspace,
+  workspaceReady = true,
   loadSessionId,
   onSessionLoaded,
   onOpenHistory,
@@ -339,6 +342,8 @@ export function ChatPage({
   const turnNumberRef = useRef(0);
   const activeWorkspaceRef = useRef(selectedWorkspace);
   const runtimeSessionIdRef = useRef<string | null>(null);
+  const workspaceReadyRef = useRef(workspaceReady);
+  const workspaceReadyWaitersRef = useRef<Array<() => void>>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const denyApprovalRef = useRef<HTMLButtonElement>(null);
@@ -365,6 +370,14 @@ export function ChatPage({
       runtimeSessionIdRef.current = null;
     }
   }, [selectedWorkspace, updateActiveWorkspace]);
+
+  // Declared after the workspace effect so a released send binds to the
+  // resolved workspace: without this, a send issued right after page load was
+  // cancelled as a "project switch" when the initial resolution landed.
+  useEffect(() => {
+    workspaceReadyRef.current = workspaceReady;
+    if (workspaceReady) workspaceReadyWaitersRef.current.splice(0).forEach((resolve) => resolve());
+  }, [workspaceReady]);
 
   useEffect(() => {
     let active = true;
@@ -651,6 +664,10 @@ export function ChatPage({
     if (!text && !attachedImage) return;
     if (streaming || sendInProgressRef.current) return;
     sendInProgressRef.current = true;
+    if (!workspaceReadyRef.current) {
+      setStatus('작업 공간을 불러오는 중…');
+      await new Promise<void>((resolve) => workspaceReadyWaitersRef.current.push(resolve));
+    }
     turnNumberRef.current += 1;
     const sendWorkspace = activeWorkspaceRef.current;
     const sendWorkspaceEpoch = workspaceEpochRef.current;

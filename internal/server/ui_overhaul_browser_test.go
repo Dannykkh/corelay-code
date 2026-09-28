@@ -124,6 +124,17 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 	u := launcher.New().Bin(bin).Headless(true).MustLaunch()
 	browser := rod.New().ControlURL(u).MustConnect()
 	defer browser.MustClose()
+	// Hold the initial workspace resolution so the first send is issued before
+	// the app knows its workspace. The send must wait for that resolution rather
+	// than be cancelled by it (it used to be treated as a project switch).
+	workspaceDelay := 2 * time.Second
+	router := browser.HijackRequests()
+	router.MustAdd(base+"/api/workspace", func(h *rod.Hijack) {
+		time.Sleep(workspaceDelay)
+		h.MustLoadResponse()
+	})
+	go router.Run()
+	defer func() { _ = router.Stop() }()
 	page := browser.MustPage(base + "/app")
 	if err := page.WaitLoad(); err != nil {
 		t.Fatal(err)
@@ -152,24 +163,12 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 		return nil
 	}
 
-	// The app resolves the selected workspace asynchronously after load, and a
-	// workspace change aborts the active run (Chat.tsx workspace epoch guard). On
-	// a slow runner a send issued before that resolution was cancelled and no
-	// approval appeared, so wait for the project to be selected first, as the S10
-	// browser test does.
-	projectReady := false
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if strings.Contains(bodyText(), "Overhaul") {
-			projectReady = true
-			break
-		}
-	}
-	if !projectReady {
-		t.Fatalf("workspace was not selected; page text:\n%s", bodyText())
-	}
-
+	// Send immediately, while /api/workspace is still held back.
 	step().MustElement("textarea").MustInput("run the probe tool")
 	step().MustElementR("button", "전송|Send").MustClick()
+	if strings.Contains(bodyText(), "Overhaul") {
+		t.Log("workspace resolved before the send; the early-send path was not exercised this run")
+	}
 
 	// The approval is linked to its step card by toolCallId and the card stays open.
 	card := waitFor(`[data-pending-approval="true"]`)
@@ -180,6 +179,19 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 		}
 	}
 	step().MustElementR("button", "승인 필요")
+
+	// Let the held workspace resolution land while the approval is pending.
+	// Before sends waited for it, the resolution cancelled the run as a project
+	// switch and the pending card disappeared.
+	for deadline := time.Now().Add(30 * time.Second); !strings.Contains(bodyText(), "Overhaul"); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("workspace never resolved; page text:\n%s", bodyText())
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+	if has, _, _ := page.Has(`[data-pending-approval="true"]`); !has {
+		t.Fatalf("workspace resolution cancelled the pending run (provider calls=%d); page text:\n%s", providerCalls(), bodyText())
+	}
 
 	// A pending decision is badged on the workspace while another page is shown.
 	step().MustElement(`button[aria-label^="Settings"], button[aria-label^="설정"]`).MustClick()

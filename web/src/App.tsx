@@ -74,6 +74,9 @@ function App() {
   const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState(loadWorkspaceSelection);
+  // False until the first /api/workspace + /api/projects resolution settles the
+  // selection; a send issued earlier waits for it instead of being cancelled.
+  const [workspaceResolved, setWorkspaceResolved] = useState(false);
   const [viewingFile, setViewingFile] = useState<{ path: string; content: string; workspace: string; type: FileReadKind | string; size: number; truncated?: boolean } | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [editContent, setEditContent] = useState('');
@@ -113,6 +116,7 @@ function App() {
           if (next) saveWorkspaceSelection(next);
           return next;
         });
+        setWorkspaceResolved(true);
       })();
     });
     const interval = setInterval(load, 15000);
@@ -197,6 +201,7 @@ function App() {
         <div className={(page === 'chat' || (page === 'files' && !viewingFile)) ? 'h-full flex-1 flex flex-col min-w-0' : 'hidden'}>
           <ChatPage
             selectedWorkspace={selectedWorkspace}
+            workspaceReady={workspaceResolved}
             loadSessionId={loadSessionId}
             onSessionLoaded={() => setLoadSessionId(null)}
             onApprovalPendingChange={setChatApprovalPending}
