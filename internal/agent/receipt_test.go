@@ -203,3 +203,26 @@ func TestWriteTeamRunReceiptToDir(t *testing.T) {
 		t.Fatalf("task resources not preserved: %+v", got.Tasks[0].Resources)
 	}
 }
+
+func TestReceiptTerminalStateBlocksFailedRunTerminals(t *testing.T) {
+	cases := []struct {
+		name              string
+		evidence          string
+		completionBlocked bool
+		stopReason        string
+		want              string
+	}{
+		{name: "verified run stays verified", evidence: EvidenceTerminalVerified, want: EvidenceTerminalVerified},
+		{name: "unverified run stays unverified", evidence: EvidenceTerminalUnverified, want: EvidenceTerminalUnverified},
+		{name: "blocked completion overrides verified", evidence: EvidenceTerminalVerified, completionBlocked: true, want: EvidenceTerminalBlocked},
+		{name: "max cycles overrides verified", evidence: EvidenceTerminalVerified, stopReason: "max_cycles", want: EvidenceTerminalBlocked},
+		{name: "other stop reasons keep evidence", evidence: EvidenceTerminalVerified, stopReason: "completed", want: EvidenceTerminalVerified},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := receiptTerminalState(tc.evidence, tc.completionBlocked, tc.stopReason); got != tc.want {
+				t.Fatalf("receiptTerminalState(%q, %v, %q) = %q, want %q", tc.evidence, tc.completionBlocked, tc.stopReason, got, tc.want)
+			}
+		})
+	}
+}

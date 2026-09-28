@@ -1,8 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { t } from '../lib/i18n';
-import { CircleCheck, CircleX, LoaderCircle, ShieldAlert } from 'lucide-react';
+import { t, getLang } from '../lib/i18n';
+import { CircleX, LoaderCircle, ShieldAlert, Mic, Paperclip, Volume2, X, FolderGit2, GitBranch, SlidersHorizontal, RotateCcw, ExternalLink, Compass, Layers, Bug, CodeXml } from 'lucide-react';
 import { Markdown } from '../components/Markdown';
-import { HTTPError, resolveApproval, type ApprovalDecision } from '../lib/api';
+import { HTTPError, resolveApproval, fetchJSON, type ApprovalDecision } from '../lib/api';
+import { Inspector, type InspectorTab, type RunReceipt } from '../components/Inspector';
+import { StepCard } from '../components/StepCard';
+import { ReceiptBadge } from '../components/ReceiptBadge';
+import type { HistoryTab } from './History';
+import { loadPreferredExecutionMode } from '../lib/executionMode';
+import { WorkspaceModeSwitch, type WorkspaceMode } from '../components/WorkspaceModeSwitch';
 import { streamSSE } from '../lib/sse';
 import {
   getSession,
@@ -33,11 +39,25 @@ interface ChatMessage {
   content: string;
   attachments?: SessionImageReference[];
   toolName?: string;
+  toolCallId?: string;
   toolInput?: Record<string, unknown> | string;
   toolResult?: string;
   toolDiff?: string;
   isError?: boolean;
   timestamp: Date;
+  receipt?: RunReceipt;
+}
+
+// Tool events carry the provider call id. With an id only the card of that exact
+// call matches (a reloaded card without an id never absorbs another call); name
+// matching is only for events from servers that did not send an id.
+function findOpenToolMessage(messages: ChatMessage[], toolCallId?: string, toolName?: string): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'tool' || message.toolResult !== undefined) continue;
+    if (toolCallId ? message.toolCallId === toolCallId : message.toolName === toolName) return i;
+  }
+  return -1;
 }
 
 interface DiffRecord {
@@ -101,6 +121,10 @@ interface ChatPageProps {
   selectedWorkspace: string;
   loadSessionId?: string | null;
   onSessionLoaded?: () => void;
+  onOpenHistory?: (tab?: HistoryTab) => void;
+  onApprovalPendingChange?: (pending: boolean) => void;
+  onWorkspaceModeChange?: (mode: WorkspaceMode) => void;
+  workspaceModeAttention?: Partial<Record<WorkspaceMode, boolean>>;
 }
 
 type AgentEvent = {
@@ -130,6 +154,7 @@ type AgentEventObject = {
   code?: string;
   message?: string;
   toolName?: string;
+  toolCallId?: string;
   redactedInput?: string;
   dangerLevel?: string;
   scope?: string;
@@ -147,6 +172,7 @@ type ActiveApproval = {
   id: string;
   runtimeSessionId: string;
   toolName: string;
+  toolCallId?: string;
   redactedInput: string;
   dangerLevel?: string;
   scope?: string;
@@ -253,7 +279,16 @@ function planIsApprovedCurrentRevision(plan: WorkstreamPlan, revision: number | 
     (plan.status === 'approved' || plan.status === 'executing' || plan.status === 'failed');
 }
 
-export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: ChatPageProps) {
+export function ChatPage({
+  selectedWorkspace,
+  loadSessionId,
+  onSessionLoaded,
+  onOpenHistory,
+  onApprovalPendingChange,
+  onWorkspaceModeChange,
+  workspaceModeAttention,
+}: ChatPageProps) {
+  const ko = getLang() === 'ko';
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
@@ -286,6 +321,10 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
   const [diffRecords, setDiffRecords] = useState<DiffRecord[]>([]);
   const [undoEntries, setUndoEntries] = useState<UndoEntry[]>([]);
   const [undoActionBusy, setUndoActionBusy] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('changes');
+  const [latestReceipt, setLatestReceipt] = useState<RunReceipt | null>(null);
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const durableSessionIDRef = useRef<string | null>(null);
@@ -341,6 +380,20 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
         if (active) setSessions([]);
       });
     });
+    return () => { active = false; };
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    let active = true;
+    const query = activeWorkspace ? `?workDir=${encodeURIComponent(activeWorkspace)}` : '';
+    fetchJSON<{ branch?: string }>(`/api/kairos/git${query}`)
+      .then((data) => {
+        if (active && data?.branch) setGitBranch(data.branch);
+        else if (active) setGitBranch(null);
+      })
+      .catch(() => {
+        if (active) setGitBranch(null);
+      });
     return () => { active = false; };
   }, [activeWorkspace]);
 
@@ -431,6 +484,7 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
     setSessionNotice('');
     setDiffRecords([]);
     setUndoEntries([]);
+    setLatestReceipt(null);
     turnNumberRef.current = 0;
   }, [selectedWorkspace, updateActiveWorkspace]);
 
@@ -456,6 +510,7 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
     setSessionNotice('');
     setDiffRecords([]);
     setUndoEntries([]);
+    setLatestReceipt(null);
     turnNumberRef.current = 0;
   }, [selectedWorkspace, updateActiveWorkspace]);
 
@@ -658,7 +713,7 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
     setActiveApproval(null);
     setPlanReady(false); // any new turn clears the plan-approval prompt
     if (overrideText === undefined) setInput('');
-    const displayText = attachedImage ? `${text} [📎 image attached]` : text;
+    const displayText = attachedImage ? `${text} [image attached]` : text;
     const userMsg: ChatMessage = { role: 'user', content: displayText || '[image]', timestamp: new Date() };
     const newMsgs = [...messages, userMsg];
     setMessages([...newMsgs, { role: 'assistant', content: '', timestamp: new Date() }]);
@@ -720,6 +775,9 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
       if (!durableSessionId || expectedRevision == null) {
         throw new Error('Durable session binding is unavailable');
       }
+      // Only an explicit user choice is sent; otherwise the session's stored
+      // policy or the server default applies (see lib/executionMode.ts).
+      const preferredMode = loadPreferredExecutionMode();
       const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -728,6 +786,7 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
           workstreamId: runBinding.workstreamId || undefined,
           durableSessionId,
           expectedRevision,
+          executionPolicy: preferredMode ? { mode: preferredMode } : undefined,
         }),
         signal: controller.signal,
       });
@@ -878,11 +937,17 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
       case 'durable_session_error':
         setSessionNotice(`Durable session checkpoint failed${data.code ? ` (${data.code})` : ''}: ${data.message || 'reload before continuing'}`);
         break;
-      case 'undo_preview':
-        setUndoEntries(readUndoEntries(data.entries));
+      case 'undo_preview': {
+        const entries = readUndoEntries(data.entries);
+        setUndoEntries(entries);
         setUndoActionBusy(false);
+        if (entries.length > 0) {
+          setInspectorOpen(true);
+          setInspectorTab('changes');
+        }
         if (typeof data.error === 'string' && data.error) setSessionNotice(data.error);
         break;
+      }
       case 'undo_result':
         setUndoEntries(readUndoEntries(data.entries));
         setUndoActionBusy(false);
@@ -905,19 +970,17 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
         // payload from the live transcript before it can be persisted; the
         // approval row below renders only the server-provided redacted view.
         setMessages((prev) => {
+          const index = findOpenToolMessage(prev, data.toolCallId, data.toolName);
+          if (index < 0) return prev;
           const updated = [...prev];
-          for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === 'tool' && updated[i].toolName === data.toolName && !updated[i].toolResult) {
-              updated[i] = { ...updated[i], toolInput: undefined };
-              break;
-            }
-          }
+          updated[index] = { ...updated[index], toolInput: undefined };
           return updated;
         });
         setActiveApproval({
           id: data.id,
           runtimeSessionId,
           toolName: data.toolName,
+          toolCallId: typeof data.toolCallId === 'string' && data.toolCallId ? data.toolCallId : undefined,
           redactedInput: typeof data.redactedInput === 'string' ? data.redactedInput : 'Input details unavailable',
           dangerLevel: data.dangerLevel,
           scope: data.scope,
@@ -956,18 +1019,25 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
       case 'tool_input':
         setMessages((prev) => [...prev, {
           role: 'tool' as const, content: '', toolName: data.name,
+          toolCallId: typeof data.id === 'string' && data.id ? data.id : undefined,
           toolInput: data.input, timestamp: new Date(),
         }]);
         break;
       case 'tool_result':
         setMessages((prev) => {
-          const updated = [...prev];
-          for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === 'tool' && updated[i].toolName === data.name && !updated[i].toolResult) {
-              updated[i] = { ...updated[i], toolResult: data.result, isError: data.isError };
-              break;
-            }
+          const toolCallId = typeof data.id === 'string' && data.id ? data.id : undefined;
+          const index = findOpenToolMessage(prev, toolCallId, data.name);
+          const result = typeof data.result === 'string' ? data.result : '';
+          if (index < 0) {
+            // Calls rejected before execution (read-only or plan mode) emit no
+            // tool_input; show the result as its own card instead of dropping it.
+            return [...prev, {
+              role: 'tool' as const, content: '', toolName: data.name, toolCallId,
+              toolResult: result, isError: data.isError, timestamp: new Date(),
+            }];
           }
+          const updated = [...prev];
+          updated[index] = { ...updated[index], toolResult: result, isError: data.isError };
           return updated;
         });
         setStatus('');
@@ -983,6 +1053,8 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
             file: diffFile,
             diff: diffText,
           }].slice(-200));
+          setInspectorOpen(true);
+          setInspectorTab('changes');
         }
         setMessages((prev) => {
           const updated = [...prev];
@@ -1012,12 +1084,47 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
         break;
       case 'done':
       case 'stream_end':
-        if (event.type === 'done' && completionBlocksSuccess(data)) {
-          const status = data.completionStatus || data.terminalState || 'blocked';
-          const revision = typeof data.completionRevision === 'number' ? ` at revision ${data.completionRevision}` : '';
-          setSessionNotice(`Run ended without successful completion: ${status}${revision}. Continue or reconcile this session.`);
-        } else if (event.type === 'done' && data.planMode) {
-          setPlanReady(true);
+        if (event.type === 'done') {
+          if (data && typeof data === 'object') {
+            const raw = data as Record<string, unknown>;
+            const receiptPath = typeof raw.receipt === 'string'
+              ? raw.receipt
+              : (typeof raw.receiptPath === 'string' ? raw.receiptPath : undefined);
+            // Only the server's verification result counts as a verification
+            // status; the terminal state is presented separately by describeReceipt.
+            const receipt: RunReceipt = {
+              terminalState: typeof raw.terminalState === 'string' ? raw.terminalState : undefined,
+              kind: typeof raw.kind === 'string' ? raw.kind : undefined,
+              stopReason: typeof raw.stopReason === 'string' ? raw.stopReason : undefined,
+              completionStatus: typeof raw.completionStatus === 'string' ? raw.completionStatus : undefined,
+              completionRevision: typeof raw.completionRevision === 'number' ? raw.completionRevision : undefined,
+              // The server reports the number of blocked completion criteria.
+              completionBlocked: raw.completionBlocked === true ||
+                (typeof raw.completionBlocked === 'number' && raw.completionBlocked > 0),
+              verificationStatus: typeof raw.verificationStatus === 'string' ? raw.verificationStatus : undefined,
+              receiptPath: receiptPath,
+              timestamp: new Date(),
+            };
+            setLatestReceipt(receipt);
+            setMessages((prev) => {
+              if (prev.length === 0) return prev;
+              const lastIdx = prev.length - 1;
+              const lastMsg = prev[lastIdx];
+              if (lastMsg && lastMsg.role === 'assistant') {
+                const next = [...prev];
+                next[lastIdx] = { ...lastMsg, receipt };
+                return next;
+              }
+              return prev;
+            });
+          }
+          if (completionBlocksSuccess(data)) {
+            const status = data.completionStatus || data.terminalState || 'blocked';
+            const revision = typeof data.completionRevision === 'number' ? ` at revision ${data.completionRevision}` : '';
+            setSessionNotice(`Run ended without successful completion: ${status}${revision}. Continue or reconcile this session.`);
+          } else if (data.planMode) {
+            setPlanReady(true);
+          }
         }
         setStatus('');
         setMessages((prev) => {
@@ -1039,22 +1146,25 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
   // canonical "it's alive" signal for a slow local model (Claude Code style).
   const approvalNeedsAction = activeApproval != null &&
     (activeApproval.state === 'pending' || activeApproval.state === 'submitting' || activeApproval.state === 'error');
+  const approvalCardIndex = activeApproval
+    ? findOpenToolMessage(messages, activeApproval.toolCallId, activeApproval.toolName)
+    : -1;
+
+  // Let the app shell show a pending decision while this page is hidden.
+  useEffect(() => {
+    onApprovalPendingChange?.(approvalNeedsAction);
+  }, [approvalNeedsAction, onApprovalPendingChange]);
   const liveLabel = streaming
     ? `${status || 'Thinking…'} · ${elapsed}s${genChars > 0 ? ` · ${genChars.toLocaleString()} chars` : ''}`
     : '';
-  const selectedWorkstream = workstreams.find((w) => w.id === selectedWorkstreamId);
   const selectedPlan = plans.find((plan) => plan.id === selectedPlanId);
   const selectedStage = selectedPlan?.stages.find((stage) => stage.id === selectedStageId);
-  const selectedStageName = selectedPlan?.definition.stages?.find((stage) => stage.id === selectedStageId)?.name || selectedStage?.id;
   const changedFiles = Array.from(new Set(diffRecords.map((record) => record.file).filter(Boolean)));
   const currentTurnDiffs = diffRecords.filter((record) => record.turn === turnNumberRef.current);
-  const currentSessionLabel = currentSession
-    ? `${currentSession.id.slice(0, 8)} · r${currentSession.revision} · ${currentSession.lifecycleStatus}`
-    : 'new';
   const permissionLabel = executionPolicyPending
     ? 'checking…'
     : effectiveExecutionPolicy
-      ? `${executionModeLabel(effectiveExecutionPolicy.mode)} · r${effectiveExecutionPolicy.revision}`
+      ? executionModeLabel(effectiveExecutionPolicy.mode)
       : 'unknown';
   const persistedBinding = persistedWorkflowBindingRef.current;
   const cannotClearWorkstream = Boolean(durableSessionIDRef.current && persistedBinding.workstreamId);
@@ -1145,11 +1255,8 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
     const stage = plan?.stages.find((item) => item.id === selectedStageId);
     const attempts = stage?.attempts ?? [];
     const attempt = attempts[attempts.length - 1];
+    // The Inspector's inline confirmation is the single confirmation step.
     if (!selectedWorkstreamId || !plan || !stage || stage.status !== 'running' || !attempt || streaming || planActionBusy) return;
-    const confirmed = window.confirm(
-      `Plan stage ${stage.id} is still recorded as running (${attempt.runId}). Confirm the old process is stopped and inspect its file changes before marking this attempt incomplete?`,
-    );
-    if (!confirmed) return;
     setPlanActionBusy(true);
     try {
       const reconciled = await reconcileWorkstreamPlanStage(
@@ -1205,17 +1312,91 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
     }
   }
 
+  function handleCheckRestore() {
+    setUndoActionBusy(true);
+    void send('/undo --list');
+  }
+
+  function handleRestoreUndoEntry(id: string) {
+    setUndoActionBusy(true);
+    void send(`/undo --select ${id}`);
+  }
+
   return (
-    <div className="flex flex-col flex-1 min-w-0 h-full w-full">
+    <div className="flex flex-col flex-1 min-w-0 h-full w-full overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          {approvalNeedsAction ? (
-            <div className="flex items-center gap-1.5 text-[var(--color-yellow)] text-xs font-medium">
-              <ShieldAlert aria-hidden="true" className="w-3.5 h-3.5" />
-              Permission required
-            </div>
-          ) : streaming ? (
+      <header className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <div className="flex items-center gap-1.5 font-medium text-xs text-[var(--color-text)]">
+            <FolderGit2 className="w-3.5 h-3.5 text-[var(--color-accent)] flex-shrink-0" />
+            <span title={activeWorkspace || 'No project'}>
+              <span className="text-[var(--color-text)]">Project</span> {workspaceLabel(activeWorkspace)}
+            </span>
+          </div>
+
+          {gitBranch && (
+            <span className="flex items-center gap-1 text-[11px] font-mono text-[var(--color-text2)] bg-[var(--color-bg)] px-1.5 py-0.5 rounded border border-[var(--color-border)]">
+              <GitBranch className="w-3 h-3 text-[var(--color-text2)]" />
+              <span>{gitBranch}</span>
+            </span>
+          )}
+
+          <span
+            className="px-2 py-0.5 rounded text-[11px] font-mono bg-[var(--color-bg)] border border-[var(--color-border)] text-[var(--color-text)]"
+            title={effectiveExecutionPolicy ? `Effective execution mode, revision ${effectiveExecutionPolicy.revision}` : 'Effective execution mode has not been confirmed'}
+          >
+            <span className="text-[var(--color-text2)]">Permission</span> {permissionLabel}
+          </span>
+
+          {approvalNeedsAction && (
+            <button
+              type="button"
+              onClick={() => {
+                // The deny button belongs to the linked step card or, without a
+                // card, to the fallback panel; both are the decision point.
+                const pendingCard = document.querySelector('[data-pending-approval="true"]');
+                (pendingCard ?? denyApprovalRef.current)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                denyApprovalRef.current?.focus({ preventScroll: true });
+              }}
+              className="flex items-center gap-1 text-[var(--color-warning)] border border-[var(--color-warning)]/50 px-2 py-0.5 rounded-full text-[11px] font-medium animate-pulse"
+              title="승인 대기 중인 도구 호출이 있습니다"
+            >
+              <ShieldAlert aria-hidden="true" className="w-3 h-3" />
+              <span>승인 필요</span>
+            </button>
+          )}
+
+          {selectedPlan && (selectedPlan.status === 'draft' || (selectedPlan.approvedRevision !== selectedPlan.revision)) && (
+            <button
+              type="button"
+              onClick={() => {
+                setInspectorTab('workflow');
+                setInspectorOpen(true);
+              }}
+              className="flex items-center gap-1 text-[var(--color-warning)] bg-[var(--color-warning)]/15 border border-[var(--color-warning)]/40 px-2 py-0.5 rounded-full text-[11px] font-medium"
+              title="Workstream Plan 승인이 필요합니다"
+            >
+              <ShieldAlert className="w-3 h-3" />
+              <span>Plan 승인 필요</span>
+            </button>
+          )}
+
+          {(selectedStage?.status === 'running' || (sessionNotice && sessionNotice.includes('reconcile'))) && (
+            <button
+              type="button"
+              onClick={() => {
+                setInspectorTab('workflow');
+                setInspectorOpen(true);
+              }}
+              className="flex items-center gap-1 text-[var(--color-warning)] bg-[var(--color-warning)]/15 border border-[var(--color-warning)]/40 px-2 py-0.5 rounded-full text-[11px] font-medium"
+              title="중단된 단계가 있어 복구가 필요합니다"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>복구 필요</span>
+            </button>
+          )}
+
+          {streaming ? (
             <div className="flex items-center gap-1.5 text-[var(--color-accent)] text-xs">
               <div className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-pulse" />
               {liveLabel}
@@ -1225,250 +1406,142 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
               <div className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-pulse" />
               {status}
             </div>
-          ) : (
-            <span className="text-xs text-[var(--color-text2)]">
-              {messages.length > 0 ? `${messages.filter(m => m.role === 'user').length} messages` : 'New conversation'}
-            </span>
-          )}
+          ) : null}
         </div>
-        <div className="flex items-center gap-2 min-w-0">
-          <select
-            value={selectedWorkstreamId}
-            onChange={(e) => changeWorkstream(e.target.value)}
-            disabled={streaming || planActionBusy}
-            className="max-w-72 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)]"
-            title="Workstream"
-          >
-            <option value="" disabled={cannotClearWorkstream}>No workstream</option>
-            {workstreams.map((ws) => (
-              <option key={ws.id} value={ws.id}>{ws.title}</option>
-            ))}
-          </select>
+
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className="text-xs text-[var(--color-text2)] hidden sm:inline">
+            {messages.length > 0 ? `${messages.filter(m => m.role === 'user').length} messages` : 'New conversation'}
+          </span>
+
           <button
-            onClick={createCurrentWorkstream}
-            disabled={streaming || planActionBusy}
-            className="px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)]"
+            type="button"
+            onClick={() => setInspectorOpen((prev) => !prev)}
+            aria-expanded={inspectorOpen}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+              inspectorOpen
+                ? 'bg-[var(--color-accent)]/15 border-[var(--color-accent)] text-[var(--color-accent)]'
+                : 'border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)]'
+            }`}
+            title="Toggle Inspector drawer"
           >
-            New
-          </button>
-          <button
-            onClick={exportHandoff}
-            disabled={!selectedWorkstreamId}
-            className="px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text)] disabled:opacity-40 hover:border-[var(--color-accent)]"
-          >
-            Handoff
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>Inspector</span>
+            {(changedFiles.length > 0 || undoEntries.length > 0 || selectedPlan != null) && (
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-accent)]" />
+            )}
           </button>
         </div>
-      </div>
+      </header>
 
-      <nav
-        aria-label="Current project, workstream, session, stage, and permission"
-        className="px-4 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[var(--color-text2)]"
-      >
-        <span title={activeWorkspace || 'No project'}><span className="text-[var(--color-text)]">Project</span> {workspaceLabel(activeWorkspace)}</span>
-        <span aria-hidden="true">›</span>
-        <span title={selectedWorkstream?.id || selectedWorkstreamId || 'No workstream'}><span className="text-[var(--color-text)]">Work</span> {selectedWorkstream?.title || (selectedWorkstreamId ? 'unavailable' : 'none')}</span>
-        <span aria-hidden="true">›</span>
-        <span title={currentSession?.id || 'No durable session'}><span className="text-[var(--color-text)]">Session</span> {currentSessionLabel}</span>
-        <span aria-hidden="true">›</span>
-        <span title={selectedPlan?.id || selectedPlanId || 'No plan'}><span className="text-[var(--color-text)]">Stage</span> {selectedStageName ? `${selectedStageName} · ${selectedStage?.status || 'unknown'}` : 'none'}</span>
-        <span aria-hidden="true">›</span>
-        <span title={effectiveExecutionPolicy ? `Effective execution mode, revision ${effectiveExecutionPolicy.revision}` : 'Effective execution mode has not been confirmed'}><span className="text-[var(--color-text)]">Permission</span> {permissionLabel}</span>
-      </nav>
-
-      {selectedWorkstreamId && (
-        <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex flex-wrap items-center gap-2 text-xs">
-          <label className="flex items-center gap-1.5 text-[var(--color-text2)]">
-            Plan
-            <select
-              value={selectedPlanId}
-              onChange={(e) => changePlan(e.target.value)}
-              disabled={streaming || planActionBusy || plansLoading}
-              className="max-w-64 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)] disabled:opacity-50"
-              aria-label="Workstream plan"
-            >
-              <option value="" disabled={cannotClearPlan}>Chat only</option>
-              {plans.map((plan) => (
-                <option key={plan.id} value={plan.id}>
-                  {plan.definition.name || plan.definition.objective || plan.id} · {plan.status} · r{plan.revision}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-1.5 text-[var(--color-text2)]">
-            Stage
-            <select
-              value={selectedStageId}
-              onChange={(e) => changeStage(e.target.value)}
-              disabled={streaming || planActionBusy || !selectedPlan || selectedPlan.stages.length === 0}
-              className="max-w-56 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg px-2 py-1.5 text-xs text-[var(--color-text)] focus:outline-none focus:border-[var(--color-accent)] disabled:opacity-50"
-              aria-label="Plan stage"
-            >
-              {!selectedStageId && <option value="">Select stage</option>}
-              {selectedPlan && selectedPlan.stages.map((stage) => (
-                <option key={stage.id} value={stage.id} disabled={!planStageEligible(selectedPlan, stage.id)}>
-                  {selectedPlan.definition.stages?.find((item) => item.id === stage.id)?.name || stage.id} · {stage.status}
-                </option>
-              ))}
-            </select>
-          </label>
-          {plansLoading && <span className="text-[var(--color-text2)]">Plans loading…</span>}
-          {!plansLoading && selectedPlanId && !selectedPlan && (
-            <span className="text-[var(--color-red)]">선택한 Plan을 불러올 수 없습니다.</span>
-          )}
-          {selectedPlan && (
-            <>
-              <span className={selectedPlan.approvedRevision === selectedPlan.revision ? 'text-[var(--color-green)]' : 'text-[var(--color-yellow)]'}>
-                {selectedPlan.approvedRevision === selectedPlan.revision
-                  ? `승인됨 · r${selectedPlan.revision}`
-                  : `승인 필요 · ${selectedPlan.status} · r${selectedPlan.revision}`}
-              </span>
-              <span className="text-[var(--color-text2)]">
-                {selectedPlan.stages.filter((stage) => stage.status === 'completed').length}/{selectedPlan.stages.length} stages complete
-              </span>
-              {selectedPlanRevision !== selectedPlan.revision && (
-                <button
-                  onClick={bindCurrentPlanRevision}
-                  disabled={streaming || planActionBusy}
-                  className="px-2.5 py-1.5 rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
-                >
-                  현재 revision 연결
-                </button>
-              )}
-              <button
-                onClick={approveSelectedPlan}
-                disabled={streaming || planActionBusy || selectedPlan.status !== 'draft' ||
-                  selectedPlanRevision !== selectedPlan.revision || !selectedPlan.revision || !selectedPlan.stateRevision}
-                className="px-2.5 py-1.5 rounded-lg border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-40"
-                title={selectedPlan.status !== 'draft' ? 'Draft Plan만 승인할 수 있습니다.' : '현재 definition/state revision을 CAS로 승인합니다.'}
-              >
-                {planActionBusy ? '승인 중…' : 'Plan 승인'}
-              </button>
-              {selectedPlan.stages.find((stage) => stage.id === selectedStageId)?.status === 'running' && (
-                <button
-                  onClick={reconcileSelectedPlanStage}
-                  disabled={streaming || planActionBusy}
-                  className="px-2.5 py-1.5 rounded-lg border border-[var(--color-yellow)] text-[var(--color-yellow)] hover:border-[var(--color-accent)] disabled:opacity-40"
-                  title="실행 프로세스가 끝났음을 확인한 뒤 미완료 상태로 수동 복구합니다."
-                >
-                  {planActionBusy ? '상태 처리 중…' : '중단 단계 복구'}
-                </button>
-              )}
-            </>
-          )}
+      {(workstreamNotice || sessionNotice) && (
+        <div className="px-4 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex items-center justify-between text-xs text-[var(--color-text2)]">
+          <span className="truncate">{sessionNotice || workstreamNotice}</span>
+          <button
+            type="button"
+            onClick={() => { setSessionNotice(''); setWorkstreamNotice(''); }}
+            className="hover:text-[var(--color-text)] ml-2 flex-shrink-0"
+            title="Dismiss notice"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
-      {(selectedWorkstream || workstreamNotice || sessionNotice) && (
-        <div className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)] flex items-center gap-3 text-xs min-h-10">
-          {selectedWorkstream && (
-            <>
-              <span className="font-medium text-[var(--color-text)] truncate max-w-64">{selectedWorkstream.title}</span>
-              <span className="text-[var(--color-text2)]">{selectedWorkstream.status}</span>
-              {selectedWorkstream.lastVerification?.status && (
-                <span className="text-[var(--color-text2)]">verify: {selectedWorkstream.lastVerification.status}</span>
-              )}
-              {selectedWorkstream.nextAction && (
-                <span className="text-[var(--color-text2)] truncate min-w-0">next: {selectedWorkstream.nextAction}</span>
-              )}
-            </>
-          )}
-          {workstreamNotice && (
-            <span className="ml-auto text-[var(--color-text2)] truncate">{workstreamNotice}</span>
-          )}
-          {sessionNotice && (
-            <span className="ml-auto text-[var(--color-text2)] truncate">{sessionNotice}</span>
-          )}
-        </div>
-      )}
-
-      {(diffRecords.length > 0 || undoEntries.length > 0) && (
-        <section className="px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-surface)] text-xs" aria-label="Run changes and restore">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium text-[var(--color-text)]">Changes</span>
-            <span className="text-[var(--color-text2)]">{changedFiles.length} file{changedFiles.length === 1 ? '' : 's'} · {diffRecords.length} diff{diffRecords.length === 1 ? '' : 's'}</span>
-            {currentTurnDiffs.length > 0 && <span className="text-[var(--color-accent)]">current turn {currentTurnDiffs.length}</span>}
-            <button
-              onClick={() => { setUndoActionBusy(true); void send('/undo --list'); }}
-              disabled={streaming || undoActionBusy}
-              className="ml-auto px-2 py-1 rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
-            >
-              {undoActionBusy ? 'Checking restore…' : 'Check restore'}
-            </button>
-          </div>
-          {changedFiles.length > 0 && (
-            <div className="mt-1 text-[var(--color-text2)] truncate" title={changedFiles.join(', ')}>
-              {changedFiles.join(' · ')}
-            </div>
-          )}
-          {undoEntries.length > 0 && (
-            <div className="mt-2 flex flex-col gap-1.5">
-              <span className="text-[var(--color-text2)]">Checkpoint restore candidates</span>
-              {undoEntries.map((entry) => {
-                const restorable = entry.status === 'restorable';
-                return (
-                  <div key={entry.id} className="flex items-center gap-2">
-                    <span className={`truncate flex-1 ${restorable ? 'text-[var(--color-text)]' : 'text-[var(--color-yellow)]'}`} title={entry.path}>
-                      {entry.path} · {entry.status}
-                    </span>
-                    {restorable && (
-                      <button
-                        onClick={() => { setUndoActionBusy(true); void send(`/undo --select ${entry.id}`); }}
-                        disabled={streaming || undoActionBusy}
-                        className="px-2 py-0.5 rounded border border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)] disabled:opacity-50"
-                      >
-                        Restore
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          {diffRecords.length > 0 && (
-            <details className="mt-2">
-              <summary className="cursor-pointer text-[var(--color-text2)]">Show accumulated turn diffs</summary>
-              <div className="mt-1 max-h-56 overflow-auto space-y-2">
-                {diffRecords.map((record, index) => (
-                  <div key={`${record.turn}-${record.file}-${index}`} className="border-l-2 border-[var(--color-border)] pl-2">
-                    <div className="text-[var(--color-text)]">turn {record.turn} · {record.file}</div>
-                    <pre className="mt-0.5 whitespace-pre-wrap text-[10px] font-mono text-[var(--color-text2)]">{record.diff}</pre>
-                  </div>
-                ))}
-              </div>
-            </details>
-          )}
-        </section>
-      )}
-
-      {/* Messages Area — full width */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
+      {/* Main Layout Area: Chat column on the left, Inspector on the right */}
+      <div className="flex flex-1 min-h-0 w-full overflow-hidden">
+        <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
+          {/* Messages Area — full width */}
+          <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
             {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-[var(--color-text2)] max-w-lg mx-auto">
-                <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--color-accent)] to-purple-400 flex items-center justify-center text-white text-xl font-bold mb-5">C</div>
-                <div className="text-xl font-semibold mb-2 text-[var(--color-text)]">What can I help you with?</div>
-                <div className="text-sm mb-8 text-center">I can read your code, write new files, run commands, search your project, and more.</div>
-
-                <div className="grid grid-cols-2 gap-2.5 w-full">
-                  {[
-                    { text: 'What does this project do?', desc: 'Understand the codebase' },
-                    { text: 'Find bugs and fix them', desc: 'Debug and repair' },
-                    { text: 'Add a new feature', desc: 'Write code for me' },
-                    { text: 'Clean up this code', desc: 'Improve quality' },
-                  ].map((example) => (
-                    <button
-                      key={example.text}
-                      onClick={() => { setInput(example.text); }}
-                      className="text-left px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl hover:border-[var(--color-accent)] transition-colors"
-                    >
-                      <div className="text-sm text-[var(--color-text)]">{example.text}</div>
-                      <div className="text-[10px] text-[var(--color-text2)] mt-0.5">{example.desc}</div>
-                    </button>
-                  ))}
+              <div className="flex flex-col items-center justify-center h-full text-[var(--color-text2)] max-w-xl mx-auto px-4 py-8">
+                {/* Logo & Emblem */}
+                <div className="relative mb-5 flex items-center justify-center">
+                  <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--color-accent)] to-[var(--color-accent2)] flex items-center justify-center text-[var(--color-bg)] text-xl font-bold shadow-lg shadow-[var(--color-accent)]/20 ring-4 ring-[var(--color-accent)]/10">
+                    C
+                  </div>
                 </div>
 
-                <div className="text-[10px] mt-6 text-center leading-relaxed">
-                  Tip: Just type what you need in plain language. I'll figure out which files to read and what to do.
+                <h2 className="text-xl font-semibold mb-2 text-[var(--color-text)] text-center tracking-tight">
+                  {ko ? '어떤 작업을 진행할까요?' : 'What would you like to build today?'}
+                </h2>
+                <p className="text-xs text-[var(--color-text2)] mb-6 text-center max-w-md leading-relaxed">
+                  {ko
+                    ? '프로젝트 분석부터 새 기능 구현, 대화형 계획(/plan), 실시간 diff 검증까지 지원합니다.'
+                    : 'Analyze project architecture, implement new features, create staged plans, and verify diffs in real-time.'}
+                </p>
+
+                {/* 2x2 Prompt Starters Grid with Icons */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full mb-6">
+                  {[
+                    {
+                      icon: Compass,
+                      title: ko ? '프로젝트 구조 분석' : 'Analyze Architecture',
+                      desc: ko ? '주요 아키텍처와 흐름 파악' : 'Understand key flows & components',
+                      prompt: ko ? '이 프로젝트의 핵심 구조와 아키텍처를 분석해줘.' : 'Analyze the core architecture and key components of this project.',
+                    },
+                    {
+                      icon: Layers,
+                      title: ko ? '대화형 계획 수립' : 'Create Plan (/plan)',
+                      desc: ko ? '요구사항 인터뷰와 단계별 플랜' : 'Interactive interview & staged steps',
+                      prompt: '/plan ',
+                    },
+                    {
+                      icon: Bug,
+                      title: ko ? '결함 탐지 및 검증' : 'Find Bugs & Verify',
+                      desc: ko ? '잠재적 버그 점검 및 테스트 실행' : 'Inspect edge cases and run tests',
+                      prompt: ko ? '현재 코드베이스의 잠재적 결함을 점검하고 테스트를 실행해줘.' : 'Check for potential bugs in this codebase and run relevant tests.',
+                    },
+                    {
+                      icon: CodeXml,
+                      title: ko ? '새 기능 구현 및 리팩토링' : 'Implement & Refactor',
+                      desc: ko ? '안전한 파일 수정 및 diff 확인' : 'Safe edits with live diff inspection',
+                      prompt: ko ? '새로운 기능을 추가하거나 기존 코드를 깔끔하게 리팩토링해줘.' : 'Implement a new feature or refactor existing code cleanly.',
+                    },
+                  ].map((card, idx) => {
+                    const IconComp = card.icon;
+                    return (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => {
+                          setInput(card.prompt);
+                          inputRef.current?.focus();
+                        }}
+                        className="text-left p-3.5 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl hover:border-[var(--color-accent)] hover:shadow-sm transition-all group"
+                      >
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <div className="p-1.5 rounded-lg bg-[var(--color-surface2)] text-[var(--color-accent)] group-hover:bg-[var(--color-accent)] group-hover:text-[var(--color-bg)] transition-colors">
+                            <IconComp className="w-3.5 h-3.5" />
+                          </div>
+                          <div className="text-xs font-semibold text-[var(--color-text)] group-hover:text-[var(--color-accent)] transition-colors">
+                            {card.title}
+                          </div>
+                        </div>
+                        <div className="text-[11px] text-[var(--color-text2)] leading-snug">
+                          {card.desc}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Quick Command Shortcuts */}
+                <div className="flex flex-wrap items-center justify-center gap-1.5 text-xs text-[var(--color-text2)]">
+                  <span className="text-[11px] mr-1">{ko ? '빠른 명령:' : 'Quick commands:'}</span>
+                  {['/plan', '/undo', '/help'].map((cmd) => (
+                    <button
+                      key={cmd}
+                      type="button"
+                      onClick={() => {
+                        setInput(cmd + ' ');
+                        inputRef.current?.focus();
+                      }}
+                      className="px-2 py-0.5 rounded-md font-mono text-[11px] bg-[var(--color-surface2)] border border-[var(--color-border)] text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-colors"
+                    >
+                      {cmd}
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
@@ -1477,59 +1550,29 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
               if (msg.role === 'user') {
                 return (
                   <div key={i} className="flex justify-end">
-                    <div className="max-w-[85%] bg-[var(--color-accent)] text-white rounded-xl rounded-br-sm px-4 py-3 text-sm">
+                    <div className="max-w-[85%] bg-[var(--color-accent)] text-[var(--color-bg)] rounded-xl rounded-br-sm px-4 py-3 text-sm">
                       <div className="whitespace-pre-wrap">{msg.content}</div>
-                      <div className="text-[10px] text-white/50 mt-1">{msg.timestamp.toLocaleTimeString()}</div>
+                      <div className="text-[10px] text-[var(--color-bg)]/70 mt-1">{msg.timestamp.toLocaleTimeString()}</div>
                     </div>
                   </div>
                 );
               }
               if (msg.role === 'tool') {
+                const linkedApproval = i === approvalCardIndex ? activeApproval : null;
                 return (
-                  <div key={i} className="mx-4">
-                    <div className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg overflow-hidden">
-                      <div className="flex items-center gap-2 px-3 py-2 bg-[var(--color-surface2)] border-b border-[var(--color-border)]">
-                        <span className="text-xs font-semibold text-[var(--color-accent)]">{msg.toolName ?? ''}</span>
-                        {msg.isError && <span className="text-[10px] text-[var(--color-red)] bg-red-500/10 px-1.5 py-0.5 rounded">ERROR</span>}
-                      </div>
-                      {msg.toolInput && (
-                        <div className="px-3 py-2 border-b border-[var(--color-border)]">
-                          <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">{t('chat.input')}</div>
-                          <pre className="text-xs text-[var(--color-text)] overflow-x-auto whitespace-pre-wrap font-mono">
-                            {typeof msg.toolInput === 'string' ? msg.toolInput : String(JSON.stringify(msg.toolInput, null, 2))}
-                          </pre>
-                        </div>
-                      )}
-                      {msg.toolResult ? (
-                        <div className="px-3 py-2 max-h-60 overflow-y-auto">
-                          <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">{t('chat.output')}</div>
-                          <pre className={`text-xs overflow-x-auto whitespace-pre-wrap font-mono ${msg.isError ? 'text-[var(--color-red)]' : 'text-[var(--color-green)]'}`}>
-                            {msg.toolResult}
-                          </pre>
-                        </div>
-                      ) : (
-                        <div className="px-3 py-2 flex items-center gap-2">
-                          <div className="w-3 h-3 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin" />
-                          <span className="text-xs text-[var(--color-text2)]">{t('chat.executing')}</span>
-                        </div>
-                      )}
-                      {msg.toolDiff && (
-                        <div className="px-3 py-2 border-t border-[var(--color-border)] max-h-72 overflow-auto">
-                          <div className="text-[10px] text-[var(--color-text2)] uppercase mb-1">Diff</div>
-                          <pre className="text-xs whitespace-pre font-mono leading-snug">
-                            {msg.toolDiff.split('\n').map((ln, k) => {
-                              const cls = ln.startsWith('+ ')
-                                ? 'text-[var(--color-green)] bg-green-500/10'
-                                : ln.startsWith('- ')
-                                  ? 'text-[var(--color-red)] bg-red-500/10'
-                                  : 'text-[var(--color-text2)]';
-                              return <div key={k} className={cls}>{ln || ' '}</div>;
-                            })}
-                          </pre>
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <StepCard
+                    key={i}
+                    toolName={msg.toolName}
+                    toolInput={msg.toolInput}
+                    toolResult={msg.toolResult}
+                    toolDiff={msg.toolDiff}
+                    isError={msg.isError}
+                    timestamp={msg.timestamp}
+                    activeApproval={linkedApproval}
+                    onResolveApproval={decideApproval}
+                    denyRef={linkedApproval && approvalNeedsAction ? denyApprovalRef : undefined}
+                    runActive={streaming}
+                  />
                 );
               }
               if (msg.content === '' && streaming) {
@@ -1550,6 +1593,9 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                 );
               }
               if (msg.content === '') return null;
+              const lastAssistantIdx = messages.reduce((last, m, idx) => m.role === 'assistant' ? idx : last, -1);
+              const isLastAssistant = i === lastAssistantIdx;
+              const receipt = msg.receipt || (isLastAssistant && !streaming ? latestReceipt : undefined);
               return (
                 <div key={i} className="flex justify-start group">
                   <div className="max-w-[95%] bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl rounded-bl-sm px-4 py-3 text-sm">
@@ -1566,25 +1612,52 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                         title="Bad response"
                       >-1</button>
                     </div>
+
+                    {/* Inline Turn Verification Receipt */}
+                    {receipt && (
+                      <div className="mt-3 pt-2.5 border-t border-[var(--color-border)] flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] uppercase font-semibold text-[var(--color-text2)]">Turn Verification</span>
+                          <ReceiptBadge receipt={receipt} />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setInspectorTab('receipt');
+                            setInspectorOpen(true);
+                          }}
+                          className="inline-flex items-center gap-1 text-[11px] text-[var(--color-accent)] hover:underline"
+                        >
+                          Receipt details
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
             })}
-            {activeApproval && (
+            {/* An expiry with no card to carry it is still reported, quietly. */}
+            {activeApproval && activeApproval.state === 'expired' && approvalCardIndex < 0 && (
+              <div role="status" className="mx-0 sm:mx-4 px-3 py-2 rounded-lg border border-[var(--color-border)] text-xs text-[var(--color-text2)]">
+                <span className="font-mono">{activeApproval.toolName}</span> 승인 요청이 만료되어 아무것도 허용되지 않았습니다.
+              </div>
+            )}
+            {/* Fallback only when a decision is still needed and no step card is linked. */}
+            {activeApproval && approvalNeedsAction && approvalCardIndex < 0 && (
               <div
                 role="alert"
-                aria-live="assertive"
                 aria-busy={activeApproval.state === 'submitting'}
-                className="mx-0 sm:mx-4 border border-[var(--color-yellow)] bg-[var(--color-surface2)] rounded-lg px-3 py-3"
+                className="mx-0 sm:mx-4 border border-[var(--color-warning)] bg-[var(--color-surface2)] rounded-lg px-3 py-3"
               >
                 <div className="flex items-start gap-2.5">
-                  <ShieldAlert aria-hidden="true" className="w-4 h-4 mt-0.5 shrink-0 text-[var(--color-yellow)]" />
+                  <ShieldAlert aria-hidden="true" className="w-4 h-4 mt-0.5 shrink-0 text-[var(--color-warning)]" />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <span className="text-xs font-semibold text-[var(--color-text)]">Permission required</span>
                       <span className="text-xs font-mono text-[var(--color-text)] break-all">{activeApproval.toolName}</span>
                       {activeApproval.dangerLevel && (
-                        <span className="text-[10px] uppercase text-[var(--color-yellow)]">risk: {activeApproval.dangerLevel}</span>
+                        <span className="text-[10px] uppercase text-[var(--color-warning)]">risk: {activeApproval.dangerLevel}</span>
                       )}
                       {activeApproval.scope && (
                         <span className="text-[10px] text-[var(--color-text2)]">scope: {activeApproval.scope}</span>
@@ -1603,21 +1676,11 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                       {activeApproval.state === 'submitting' && (
                         <><LoaderCircle aria-hidden="true" className="w-3.5 h-3.5 animate-spin motion-reduce:animate-none" /> Submitting decision</>
                       )}
-                      {activeApproval.state === 'resolved' && activeApproval.decision === 'allow_once' && (
-                        <><CircleCheck aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-green)]" /> Allowed once</>
-                      )}
-                      {activeApproval.state === 'resolved' && activeApproval.decision === 'deny' && (
-                        <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> Denied</>
-                      )}
-                      {activeApproval.state === 'expired' && (
-                        <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> Expired; nothing was approved</>
-                      )}
                       {activeApproval.state === 'error' && (
                         <><CircleX aria-hidden="true" className="w-3.5 h-3.5 text-[var(--color-red)]" /> {activeApproval.error}</>
                       )}
                     </div>
-                    {(activeApproval.state === 'pending' || activeApproval.state === 'submitting' || activeApproval.state === 'error') && (
-                      <div className="mt-3 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+                    <div className="mt-3 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
                         <button
                           ref={denyApprovalRef}
                           type="button"
@@ -1631,12 +1694,11 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                           type="button"
                           onClick={() => decideApproval('allow_once')}
                           disabled={activeApproval.state === 'submitting'}
-                          className="min-h-10 w-full sm:w-auto px-3 py-2 rounded-md bg-[var(--color-accent)] text-xs font-semibold text-white hover:bg-[var(--color-accent2)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
+                          className="min-h-10 w-full sm:w-auto px-3 py-2 rounded-md border border-[var(--color-green)] bg-[var(--color-bg)] text-xs font-semibold text-[var(--color-text)] hover:bg-[var(--color-green)]/10 focus:outline-none focus:ring-2 focus:ring-[var(--color-green)] disabled:opacity-50"
                         >
                           Allow once
                         </button>
-                      </div>
-                    )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1651,7 +1713,7 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
               <div className="w-full mb-2 flex items-center gap-2">
                 <div className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg p-1 flex items-center gap-2">
                   <img src={`data:${attachedImage.mediaType};base64,${attachedImage.data}`} className="h-12 rounded" alt="attached" />
-                  <button onClick={() => setAttachedImage(null)} className="text-xs text-[var(--color-red)] px-1">✕</button>
+                  <button type="button" onClick={() => setAttachedImage(null)} aria-label="첨부 이미지 제거" title="첨부 이미지 제거" className="text-xs text-[var(--color-red)] px-1 flex items-center"><X aria-hidden="true" className="w-3 h-3" /></button>
                 </div>
                 <span className="text-xs text-[var(--color-text2)]">Image attached</span>
               </div>
@@ -1661,16 +1723,21 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                 <span className="text-xs text-[var(--color-text)]">이 제안은 대화에만 있습니다. 버튼은 일반 요청을 보내며 저장된 Workstream Plan 승인을 기록하지 않습니다.</span>
                 <button
                   onClick={() => send('위 계획대로 구현을 진행해줘.')}
-                  className="text-xs font-semibold px-3 py-1.5 rounded-md bg-[var(--color-accent)] text-white hover:opacity-90 whitespace-nowrap"
+                  className="text-xs font-semibold px-3 py-1.5 rounded-md bg-[var(--color-accent)] text-[var(--color-bg)] hover:opacity-90 whitespace-nowrap"
                 >
                   이 계획으로 계속 요청
                 </button>
               </div>
             )}
+            {onWorkspaceModeChange && (
+              <div className="w-full mb-2 flex items-center">
+                <WorkspaceModeSwitch mode="single" onChange={onWorkspaceModeChange} attention={workspaceModeAttention} />
+              </div>
+            )}
             <div className="flex gap-2 items-end w-full">
               {/* Image upload */}
-              <label className="px-3 py-3 rounded-xl cursor-pointer text-[var(--color-text2)] hover:bg-[var(--color-surface2)] transition-colors" title="Attach image">
-                <span>📎</span>
+              <label className="px-3 py-3 rounded-xl cursor-pointer text-[var(--color-text2)] hover:bg-[var(--color-surface2)] transition-colors" title="Attach image" aria-label="이미지 첨부">
+                <Paperclip aria-hidden="true" className="w-4 h-4" />
                 <input
                   type="file"
                   accept="image/png,image/jpeg,image/gif,image/webp"
@@ -1720,12 +1787,14 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                 }}
                 className={`px-3 py-3 rounded-xl transition-colors ${
                   isListening
-                    ? 'bg-[var(--color-red)] text-white animate-pulse'
+                    ? 'bg-[var(--color-red)] text-[var(--color-bg)] animate-pulse'
                     : 'text-[var(--color-text2)] hover:bg-[var(--color-surface2)]'
                 }`}
                 title="Voice input"
+                aria-label="음성 입력"
+                aria-pressed={isListening}
               >
-                🎤
+                <Mic aria-hidden="true" className="w-4 h-4" />
               </button>
 
               <textarea
@@ -1775,30 +1844,74 @@ export function ChatPage({ selectedWorkspace, loadSessionId, onSessionLoaded }: 
                 }}
                 className="px-3 py-3 rounded-xl text-[var(--color-text2)] hover:bg-[var(--color-surface2)] transition-colors"
                 title="Read last response aloud"
+                aria-label="마지막 응답 읽어 주기"
               >
-                🔊
+                <Volume2 aria-hidden="true" className="w-4 h-4" />
               </button>
 
               {streaming ? (
                 <button
                   onClick={() => abortRef.current?.abort()}
-                  className="px-5 py-3 bg-[var(--color-red)] text-white rounded-xl text-sm font-medium hover:opacity-90 transition-colors flex items-center gap-1.5"
+                  className="px-5 py-3 bg-[var(--color-red)] text-[var(--color-bg)] rounded-xl text-sm font-medium hover:opacity-90 transition-colors flex items-center gap-1.5"
                   title="Stop generation (Esc)"
                 >
-                  <span className="w-2.5 h-2.5 bg-white rounded-[2px]" />
+                  <span aria-hidden="true" className="w-2.5 h-2.5 bg-[var(--color-bg)] rounded-[2px]" />
                   Stop
                 </button>
               ) : (
                 <button
                   onClick={() => send()}
                   disabled={!input.trim() && !attachedImage}
-                  className="px-5 py-3 bg-[var(--color-accent)] text-white rounded-xl text-sm font-medium disabled:opacity-40 hover:bg-[var(--color-accent2)] transition-colors"
+                  className="px-5 py-3 bg-[var(--color-accent)] text-[var(--color-bg)] rounded-xl text-sm font-medium disabled:opacity-40 hover:bg-[var(--color-accent2)] transition-colors"
                 >
                   {t('chat.send')}
                 </button>
               )}
             </div>
           </div>
+        </div>
+
+        {/* Right-side Inspector Drawer */}
+        <Inspector
+          open={inspectorOpen}
+          onClose={() => setInspectorOpen(false)}
+          tab={inspectorTab}
+          onTabChange={setInspectorTab}
+          changedFiles={changedFiles}
+          diffRecords={diffRecords}
+          currentTurnDiffs={currentTurnDiffs}
+          undoEntries={undoEntries}
+          undoActionBusy={undoActionBusy}
+          onCheckRestore={handleCheckRestore}
+          onRestoreEntry={handleRestoreUndoEntry}
+          workstreams={workstreams}
+          selectedWorkstreamId={selectedWorkstreamId}
+          onSelectWorkstream={changeWorkstream}
+          onCreateWorkstream={createCurrentWorkstream}
+          onExportHandoff={exportHandoff}
+          cannotClearWorkstream={cannotClearWorkstream}
+          plans={plans}
+          selectedPlanId={selectedPlanId}
+          selectedPlan={selectedPlan}
+          selectedPlanRevision={selectedPlanRevision}
+          plansLoading={plansLoading}
+          cannotClearPlan={cannotClearPlan}
+          onSelectPlan={changePlan}
+          selectedStageId={selectedStageId}
+          selectedStage={selectedStage}
+          onSelectStage={changeStage}
+          planActionBusy={planActionBusy}
+          onBindCurrentPlanRevision={bindCurrentPlanRevision}
+          onApproveSelectedPlan={approveSelectedPlan}
+          onReconcileSelectedPlanStage={reconcileSelectedPlanStage}
+          currentSession={currentSession}
+          sessionNotice={sessionNotice}
+          workstreamNotice={workstreamNotice}
+          latestReceipt={latestReceipt}
+          streaming={streaming}
+          onNavigateHistory={(historyTab) => onOpenHistory?.(historyTab)}
+        />
+      </div>
     </div>
   );
 }

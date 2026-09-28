@@ -35,6 +35,7 @@ type evidenceRecentItem struct {
 	Provider        string                 `json:"provider,omitempty"`
 	Model           string                 `json:"model,omitempty"`
 	Status          string                 `json:"status"`
+	TerminalState   string                 `json:"terminalState,omitempty"`
 	Source          string                 `json:"source"`
 	Command         string                 `json:"command,omitempty"`
 	Gate            string                 `json:"gate,omitempty"`
@@ -194,6 +195,7 @@ func readEvidenceReceipt(path string) (evidenceRecentItem, bool) {
 			Provider:      receipt.Provider,
 			Model:         receipt.Model,
 			Status:        status,
+			TerminalState: verification.TerminalState,
 			Source:        source,
 			Command:       command,
 			Gate:          verification.Gate,
@@ -225,6 +227,7 @@ func readEvidenceReceipt(path string) (evidenceRecentItem, bool) {
 		Provider:        receipt.Provider,
 		Model:           receipt.Model,
 		Status:          status,
+		TerminalState:   verification.TerminalState,
 		Source:          source,
 		Command:         verification.Command,
 		Gate:            verification.Gate,

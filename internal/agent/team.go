@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Dannykkh/corelay-code/internal/approval"
+	"github.com/Dannykkh/corelay-code/internal/executionpolicy"
 	"github.com/Dannykkh/corelay-code/internal/sandbox"
 	"github.com/Dannykkh/corelay-code/internal/types"
 )
@@ -72,7 +73,8 @@ func (r *teamRunTerminalReducer) Observe(event Event, contextErr error) {
 		r.terminalSeen = true
 		if terminal, ok := DecodeDurableRunTerminalMetadata(event.Data); ok && terminal.BlocksSuccess() {
 			r.fail(fmt.Sprintf(
-				"worker terminal blocks task success (terminalState=%q, completionStatus=%q, completionBlocked=%d)",
+				"worker terminal blocks task success (stopReason=%q, terminalState=%q, completionStatus=%q, completionBlocked=%d)",
+				teamRunDoneStopReason(event.Data),
 				terminal.TerminalState,
 				terminal.CompletionStatus,
 				terminal.CompletionBlocked,
@@ -115,6 +117,17 @@ func (r *teamRunTerminalReducer) fail(message string) {
 	if r.failure == "" {
 		r.failure = "worker run failed"
 	}
+}
+
+// teamRunDoneStopReason surfaces the kernel's bounded stop reason (for
+// example deadline_exceeded) so a blocked task result says why it stopped.
+func teamRunDoneStopReason(data interface{}) string {
+	payload, ok := data.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	reason, _ := payload["stopReason"].(string)
+	return strings.TrimSpace(reason)
 }
 
 func teamRunEventFailure(event Event) string {
@@ -206,16 +219,17 @@ type TeamTask struct {
 
 // Team manages the Lead/Worker orchestration.
 type Team struct {
-	mu       sync.RWMutex
-	config   TeamConfig
-	tasks    []*TeamTask
-	workers  map[string]*workerState
-	mailbox  *Mailbox
-	provider types.Provider
-	model    string
-	workDir  string
-	baseDir  string
-	eventCh  chan<- Event // report progress to caller
+	mu           sync.RWMutex
+	config       TeamConfig
+	tasks        []*TeamTask
+	workers      map[string]*workerState
+	mailbox      *Mailbox
+	provider     types.Provider
+	model        string
+	workDir      string
+	baseDir      string
+	eventCh      chan<- Event // report progress to caller
+	activeBudget *waveBudgetManager
 }
 
 type workerState struct {
@@ -453,9 +467,135 @@ func (t *Team) ExecuteWaves(ctx context.Context, eventCh chan<- Event) error {
 	return nil
 }
 
+type waveBudgetManager struct {
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	waveCtx    context.Context
+	remaining  time.Duration
+	lastResume time.Time
+	timer      *time.Timer
+	mu         sync.Mutex
+	waitCount  int
+	timedOut   bool
+}
+
+func newWaveBudgetManager(ctx context.Context, timeout time.Duration) *waveBudgetManager {
+	// Budget expiry cancels with DeadlineExceeded as the cause so worker runs
+	// record deadline_exceeded rather than a plain cancellation.
+	waveCtx, cancel := context.WithCancelCause(ctx)
+	mgr := &waveBudgetManager{
+		ctx:        ctx,
+		cancel:     cancel,
+		waveCtx:    waveCtx,
+		remaining:  timeout,
+		lastResume: time.Now(),
+	}
+	mgr.timer = time.AfterFunc(timeout, func() {
+		mgr.mu.Lock()
+		mgr.timedOut = true
+		mgr.mu.Unlock()
+		cancel(context.DeadlineExceeded)
+	})
+	return mgr
+}
+
+func (m *waveBudgetManager) pause() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.waitCount++
+	if m.waitCount == 1 {
+		if m.timer.Stop() {
+			elapsed := time.Since(m.lastResume)
+			m.remaining -= elapsed
+			if m.remaining < 0 {
+				m.remaining = 0
+			}
+		}
+	}
+}
+
+func (m *waveBudgetManager) resume() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.waitCount--
+	if m.waitCount <= 0 {
+		m.waitCount = 0
+		if !m.timedOut {
+			m.lastResume = time.Now()
+			m.timer.Reset(m.remaining)
+		}
+	}
+}
+
+func (m *waveBudgetManager) stop() {
+	m.timer.Stop()
+	m.cancel(context.Canceled)
+}
+
+func (m *waveBudgetManager) err() error {
+	m.mu.Lock()
+	timedOut := m.timedOut
+	m.mu.Unlock()
+	if timedOut {
+		return context.DeadlineExceeded
+	}
+	return m.waveCtx.Err()
+}
+
+type teamWaveApprovalRequester struct {
+	base approval.Requester
+	mgr  *waveBudgetManager
+}
+
+func (w *teamWaveApprovalRequester) Open(draft approval.Draft) (approval.Pending, error) {
+	return w.base.Open(draft)
+}
+
+func (w *teamWaveApprovalRequester) Await(ctx context.Context, sessionID, approvalID string) (approval.Resolution, error) {
+	w.mgr.pause()
+	defer w.mgr.resume()
+	return w.base.Await(ctx, sessionID, approvalID)
+}
+
+func (w *teamWaveApprovalRequester) IssueFullModeGrant(draft approval.Draft, policy executionpolicy.Snapshot) (approval.Pending, error) {
+	if issuer, ok := w.base.(approval.FullModeIssuer); ok {
+		return issuer.IssueFullModeGrant(draft, policy)
+	}
+	return approval.Pending{}, fmt.Errorf("full-mode grant issuer is unavailable")
+}
+
+func (w *teamWaveApprovalRequester) ConsumeFullModeGrant(pending approval.Pending, draft approval.Draft, policy executionpolicy.Snapshot) error {
+	if consumer, ok := w.base.(approval.FullModeGrantConsumer); ok {
+		return consumer.ConsumeFullModeGrant(pending, draft, policy)
+	}
+	return fmt.Errorf("full-mode grant consumer is unavailable")
+}
+
+func (t *Team) wrapWaveApprovalRequester(base approval.Requester) approval.Requester {
+	if base == nil {
+		return nil
+	}
+	t.mu.RLock()
+	budget := t.activeBudget
+	t.mu.RUnlock()
+	if budget == nil {
+		return base
+	}
+	return &teamWaveApprovalRequester{base: base, mgr: budget}
+}
+
 func (t *Team) executeWave(ctx context.Context, waveIdx int, taskIDs []string) error {
-	waveCtx, cancel := context.WithTimeout(ctx, t.config.CycleTimeout)
-	defer cancel()
+	budget := newWaveBudgetManager(ctx, t.config.CycleTimeout)
+	defer budget.stop()
+
+	t.mu.Lock()
+	t.activeBudget = budget
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.activeBudget = nil
+		t.mu.Unlock()
+	}()
 
 	pending := make([]*TeamTask, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
@@ -468,7 +608,7 @@ func (t *Team) executeWave(ctx context.Context, waveIdx int, taskIDs []string) e
 
 	batchIndex := 0
 	for len(pending) > 0 {
-		if err := waveCtx.Err(); err != nil {
+		if err := budget.err(); err != nil {
 			return err
 		}
 		batch := t.selectWaveBatch(pending)
@@ -484,7 +624,10 @@ func (t *Team) executeWave(ctx context.Context, waveIdx int, taskIDs []string) e
 			t.report(fmt.Sprintf("Wave %d batch %d: %d/%d tasks (%s)", waveIdx+1, batchIndex, len(batch), len(pending), strings.Join(ids, ", ")))
 		}
 
-		if err := t.runWaveBatch(waveCtx, batch); err != nil {
+		if err := t.runWaveBatch(budget.waveCtx, batch); err != nil {
+			if budget.err() != nil {
+				return budget.err()
+			}
 			return err
 		}
 
@@ -668,7 +811,7 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 		DurableSessionID:  t.config.CheckpointScope.ownerSnapshot().SessionID,
 		CheckpointScope:   t.config.CheckpointScope,
 		SessionRevision:   t.config.SessionRevision,
-		ApprovalRequester: t.config.ApprovalRequester,
+		ApprovalRequester: t.wrapWaveApprovalRequester(t.config.ApprovalRequester),
 		ResponseLang:      "auto",
 		WorkstreamContext: t.config.WorkstreamContext,
 		CompactionContext: cloneCompactionContext(t.config.CompactionContext),
@@ -699,7 +842,7 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 	var terminal teamRunTerminalReducer
 	toolCalls := 0
 	for event := range innerEventCh {
-		terminal.Observe(event, workerCtx.Err())
+		terminal.Observe(event, context.Cause(workerCtx))
 		switch event.Type {
 		case "text":
 			if text, ok := event.Data.(string); ok {
@@ -739,7 +882,7 @@ func (t *Team) executeTask(ctx context.Context, task *TeamTask) {
 
 	// Keep only a bounded prefix in memory; the complete text remains on disk.
 	result := partialResult.Summary(outputPath)
-	success, runFailure := terminal.Result(workerCtx.Err())
+	success, runFailure := terminal.Result(context.Cause(workerCtx))
 
 	// Update task status
 	t.mu.Lock()

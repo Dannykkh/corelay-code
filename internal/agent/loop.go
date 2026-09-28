@@ -1902,11 +1902,14 @@ func RunLoopWithOptions(
 				case <-ctx.Done():
 					stopHeartbeat()
 					finishMakerSpan("failed", map[string]string{"error": ctx.Err().Error()})
+					// The cause distinguishes a budget expiry delivered through
+					// cancellation (Team waves) from a plain cancel.
+					cause := context.Cause(ctx)
 					cancelReason := "cancelled"
-					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					if errors.Is(cause, context.DeadlineExceeded) {
 						cancelReason = "deadline_exceeded"
 					}
-					terminal.Fail(RunTerminalCancelled, cancelReason, ctx.Err().Error(), nil)
+					terminal.Fail(RunTerminalCancelled, cancelReason, cause.Error(), nil)
 					return
 				case <-time.After(2 * time.Second):
 				}
@@ -2009,12 +2012,13 @@ func RunLoopWithOptions(
 		// before tool execution (tools emit their own progress) and before any
 		// return path that would close eventCh.
 		stopHeartbeat()
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctx.Err() != nil {
+			cause := context.Cause(ctx)
 			cancelReason := "cancelled"
-			if errors.Is(ctxErr, context.DeadlineExceeded) {
+			if errors.Is(cause, context.DeadlineExceeded) {
 				cancelReason = "deadline_exceeded"
 			}
-			terminal.Fail(RunTerminalCancelled, cancelReason, ctxErr.Error(), nil)
+			terminal.Fail(RunTerminalCancelled, cancelReason, cause.Error(), nil)
 			return
 		}
 		if !sawProviderEvent {
@@ -2256,8 +2260,8 @@ func RunLoopWithOptions(
 				eventCh <- Event{Type: "status", Data: fmt.Sprintf("Evidence gate: %s — %s", gate.Decision, gate.Summary)}
 			}
 			completionVerification := evidence.ApplyToReceipt(receiptVerification(testResult))
+			completionVerification.TerminalState = receiptTerminalState(completionVerification.TerminalState, completionBlocked, runModeStopReason)
 			if completionBlocked {
-				completionVerification.TerminalState = EvidenceTerminalBlocked
 				eventCh <- Event{Type: "status", Data: "Completion contract blocked the run terminal"}
 			}
 			var runModeSnapshot *RunModeSnapshot
@@ -2362,13 +2366,15 @@ func RunLoopWithOptions(
 				terminalStopReason = "completion_blocked"
 			}
 			doneData := map[string]interface{}{
-				"iterations":    i + 1,
-				"tokenEstimate": tokenEstimate,
-				"project":       project.Type,
-				"planMode":      planMode,
-				"receipt":       receiptPath,
-				"stopReason":    terminalStopReason,
-				"terminalState": completionVerification.TerminalState,
+				"iterations":         i + 1,
+				"tokenEstimate":      tokenEstimate,
+				"project":            project.Type,
+				"planMode":           planMode,
+				"receipt":            receiptPath,
+				"receiptPath":        receiptPath,
+				"stopReason":         terminalStopReason,
+				"terminalState":      completionVerification.TerminalState,
+				"verificationStatus": completionVerification.Status,
 			}
 			for key, value := range completionDoneMetadata(completionSnapshot) {
 				doneData[key] = value
@@ -2721,7 +2727,9 @@ func RunLoopWithOptions(
 			data := map[string]interface{}{}
 			if recovery != nil {
 				data["recovery"] = *recovery
-				data["receipt"] = writeRecoveryReceipt(i+1, recovery)
+				receiptPath := writeRecoveryReceipt(i+1, recovery)
+				data["receipt"] = receiptPath
+				data["receiptPath"] = receiptPath
 			}
 			eventCh <- Event{Type: "error", Data: msg}
 			terminal.Fail(RunTerminalFailed, "consecutive_tool_failures", msg, data)
@@ -2735,7 +2743,9 @@ func RunLoopWithOptions(
 	data := map[string]interface{}{}
 	if recovery != nil {
 		data["recovery"] = *recovery
-		data["receipt"] = writeRecoveryReceipt(maxIterations, recovery)
+		receiptPath := writeRecoveryReceipt(maxIterations, recovery)
+		data["receipt"] = receiptPath
+		data["receiptPath"] = receiptPath
 	}
 	eventCh <- Event{Type: "error", Data: "Max iterations reached"}
 	terminal.Fail(RunTerminalMaxIterations, "max_iterations", "Max iterations reached", data)

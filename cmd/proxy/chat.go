@@ -1108,6 +1108,7 @@ func (c *chatClient) flushPendingToolInput(turn *chatTurnState) {
 type approvalRequiredEvent struct {
 	ID            string `json:"id"`
 	SessionID     string `json:"sessionId"`
+	ToolCallID    string `json:"toolCallId"`
 	ToolName      string `json:"toolName"`
 	RedactedInput string `json:"redactedInput"`
 	DangerLevel   string `json:"dangerLevel"`

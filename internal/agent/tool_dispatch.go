@@ -803,6 +803,7 @@ func requestToolApproval(
 			"sessionId":       pending.SessionID,
 			"sessionRevision": pending.SessionRevision,
 			"runId":           pending.RunID,
+			"toolCallId":      pending.ToolCallID,
 			"toolName":        pending.ToolName,
 			"redactedInput":   pending.RedactedInput,
 			"inputDigest":     pending.InputDigest,

@@ -267,6 +267,8 @@ verification evidence, teams, memory, activity, and KAIROS background work.
 - Team plans describe tasks, dependencies, file scopes, provider/model choices,
   resource reservations, and verification commands.
 - Dependency waves run with bounded capacity and hard file ownership.
+- CLI `team run` has no approval prompt, so tools that need approval are denied;
+  use the web Team page or a pre-approved execution mode for those tasks.
 - Subagents, Team, Chronos, Bridge, profiler, HTTP, and ACP converge on the same
   kernel and terminal finalizer rather than maintaining alternate loops.
 - KAIROS schedules background tasks, watches Git state, and emits notifications.

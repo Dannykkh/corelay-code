@@ -399,6 +399,7 @@ func normalizeChatOutputEvent(ev agentWireEvent, emitter *chatOutputEmitter, sho
 		return "approval_required", map[string]string{
 			"id":            sanitize(payload.ID, 256),
 			"sessionId":     sanitize(payload.SessionID, 256),
+			"toolCallId":    sanitize(payload.ToolCallID, 128),
 			"toolName":      sanitize(payload.ToolName, 128),
 			"redactedInput": sanitize(payload.RedactedInput, 4096),
 			"dangerLevel":   sanitize(payload.DangerLevel, 64),

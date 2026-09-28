@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { fetchJSON, putJSON, type ProviderInfo } from '../lib/api';
+import { Server, Sparkles, Bot } from 'lucide-react';
 import { t } from '../lib/i18n';
 
 interface AppConfig {
@@ -90,7 +91,7 @@ export function SettingsPage() {
             onClick={() => { if (ollamaModels.length > 0) quickStart('ollama', defaultOllamaModel); }}
             className={`p-4 rounded-xl border text-left transition-all hover:border-[var(--color-accent)] ${config?.provider === 'ollama' ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border)] bg-[var(--color-surface)]'}`}
           >
-            <div className="text-2xl mb-2">🏠</div>
+            <div className="mb-2 text-[var(--color-accent)]"><Server className="w-6 h-6" /></div>
             <div className="text-sm font-semibold">Local (Ollama)</div>
             <div className="text-[10px] text-[var(--color-text2)] mt-1">Free, private, no API key</div>
             <div className="text-[9px] text-[var(--color-accent)] mt-2">
@@ -102,7 +103,7 @@ export function SettingsPage() {
             onClick={() => { setSelProvider('openai'); setSelModel('gpt-5.5-mini'); setShowAdvanced(false); }}
             className={`p-4 rounded-xl border text-left transition-all hover:border-[var(--color-accent)] ${config?.provider === 'openai' ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border)] bg-[var(--color-surface)]'}`}
           >
-            <div className="text-2xl mb-2">🟢</div>
+            <div className="mb-2 text-[var(--color-green)]"><Sparkles className="w-6 h-6" /></div>
             <div className="text-sm font-semibold">OpenAI</div>
             <div className="text-[10px] text-[var(--color-text2)] mt-1">API key needed</div>
             <div className="text-[9px] text-[var(--color-accent)] mt-2">GPT-5.5 / o4</div>
@@ -112,7 +113,7 @@ export function SettingsPage() {
             onClick={() => { setSelProvider('anthropic'); setSelModel('claude-sonnet-4-6'); setShowAdvanced(false); }}
             className={`p-4 rounded-xl border text-left transition-all hover:border-[var(--color-accent)] ${config?.provider === 'anthropic' ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10' : 'border-[var(--color-border)] bg-[var(--color-surface)]'}`}
           >
-            <div className="text-2xl mb-2">🟠</div>
+            <div className="mb-2 text-[var(--color-orange)]"><Bot className="w-6 h-6" /></div>
             <div className="text-sm font-semibold">Anthropic</div>
             <div className="text-[10px] text-[var(--color-text2)] mt-1">API key needed</div>
             <div className="text-[9px] text-[var(--color-accent)] mt-2">Claude Opus 4.8 / Sonnet 4.6</div>
@@ -165,11 +166,11 @@ export function SettingsPage() {
         <h3 className="text-sm font-semibold mb-3">{t('settings.language')}</h3>
         <div className="flex gap-2 flex-wrap">
           {[
-            { id: 'auto', label: '🌐 Auto' },
-            { id: 'ko', label: '🇰🇷 한국어' },
-            { id: 'en', label: '🇺🇸 English' },
-            { id: 'ja', label: '🇯🇵 日本語' },
-            { id: 'zh', label: '🇨🇳 中文' },
+            { id: 'auto', label: 'Auto' },
+            { id: 'ko', label: '한국어' },
+            { id: 'en', label: 'English' },
+            { id: 'ja', label: '日本語' },
+            { id: 'zh', label: '中文' },
           ].map((lang) => (
             <button
               key={lang.id}

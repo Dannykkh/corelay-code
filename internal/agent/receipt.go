@@ -256,6 +256,17 @@ func receiptVerification(testResult string) ReceiptVerification {
 	}
 }
 
+// receiptTerminalState keeps the stored receipt consistent with the run
+// terminal: a blocked completion contract or a run-mode max_cycles stop fails
+// the run, so the receipt must not keep an evidence-derived "verified" that the
+// History view would present as a success.
+func receiptTerminalState(evidenceState string, completionBlocked bool, runModeStopReason string) string {
+	if completionBlocked || runModeStopReason == "max_cycles" {
+		return EvidenceTerminalBlocked
+	}
+	return evidenceState
+}
+
 func receiptTime(value time.Time) string {
 	if value.IsZero() {
 		return ""

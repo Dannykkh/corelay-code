@@ -48,7 +48,7 @@ export function MemoryPage() {
     <div className="p-6 w-full">
       <div className="flex items-center justify-between mb-2">
         <h1 className="text-xl font-semibold">Memory</h1>
-        <button onClick={dream} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm">
+        <button onClick={dream} className="px-4 py-2 bg-[var(--color-accent)] hover:bg-[var(--color-accent2)] transition-colors text-white rounded-lg text-sm">
           Run Dream Cycle
         </button>
       </div>

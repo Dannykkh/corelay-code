@@ -311,6 +311,11 @@ func TestDispatchToolCallsApprovalRoundTripAndNilFailClosed(t *testing.T) {
 		events[2].Type != "tool_execution_start" {
 		t.Fatalf("approval events = %#v", events)
 	}
+	approvalEvent, ok := events[1].Data.(map[string]interface{})
+	input, inputOK := events[0].Data.(map[string]interface{})
+	if !ok || !inputOK || approvalEvent["toolCallId"] != call.ID || input["id"] != call.ID {
+		t.Fatalf("approval event is not linked to its tool_input call: %#v", events[:2])
+	}
 	execution, ok := events[2].Data.(map[string]string)
 	if !ok || execution["id"] != call.ID || execution["name"] != call.Name ||
 		execution["inputDigest"] != toolInputDigest(call) || execution["runId"] != "run-test" {

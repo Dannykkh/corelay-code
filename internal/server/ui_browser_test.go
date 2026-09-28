@@ -109,7 +109,8 @@ func TestS10BrowserUIProjectFilesAndStaleStreams(t *testing.T) {
 		payload := "data: {\"type\":\"text\",\"data\":\"FRESH_RESPONSE_MARKER\"}\n\n" +
 			"data: {\"type\":\"diff\",\"data\":{\"file\":\"changed.txt\",\"diff\":\"+changed\"}}\n\n" +
 			"data: {\"type\":\"undo_preview\",\"data\":{\"entries\":[{\"id\":\"cp-1\",\"path\":\"changed.txt\",\"status\":\"restorable\"}]}}\n\n" +
-			"data: {\"type\":\"done\",\"data\":{}}\n\n" +
+			// A blocked completion whose verification command passed must not read as a success.
+			"data: {\"type\":\"done\",\"data\":{\"terminalState\":\"blocked\",\"verificationStatus\":\"passed\",\"stopReason\":\"completion_blocked\",\"completionBlocked\":true}}\n\n" +
 			"data: {\"type\":\"stream_end\",\"data\":{}}\n\n"
 		if request == 1 {
 			payload = strings.Replace(payload, "FRESH_RESPONSE_MARKER", "STALE_RESPONSE_MARKER", 1)
@@ -141,7 +142,8 @@ func TestS10BrowserUIProjectFilesAndStaleStreams(t *testing.T) {
 	if !strings.Contains(body, "Permission unknown") || !strings.Contains(body, "Project") {
 		t.Fatalf("context strip did not render: %s", body)
 	}
-	page.MustElement(`button[title="Files"], button[title="파일"]`).MustClick()
+	// Files live in the workspace side panel (the activity bar has three destinations).
+	page.MustElementR("button", "^(Files|파일 트리)$").MustClick()
 	time.Sleep(200 * time.Millisecond)
 	body = page.MustEval(`() => document.body.innerText`).Str()
 	if !strings.Contains(body, "readme.txt") {
@@ -238,7 +240,8 @@ func TestS10BrowserUIProjectFilesAndStaleStreams(t *testing.T) {
 	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{Width: 420, Height: 800, DeviceScaleFactor: 1, Mobile: true}); err != nil {
 		t.Fatal(err)
 	}
-	page.MustElement(`button[title="Chat"], button[title="채팅"]`).MustClick()
+	page.MustElement(`button[aria-label^="Workspace"], button[aria-label^="작업 공간"]`).MustClick()
+	page.MustElementR("button", "^(Sessions|대화 목록)$").MustClick()
 	textarea := page.MustElement("textarea")
 	textarea.MustClick().MustInput("keyboard probe")
 	value := page.MustEval(`() => document.querySelector('textarea')?.value || ''`).Str()
@@ -256,8 +259,15 @@ func TestS10BrowserUIProjectFilesAndStaleStreams(t *testing.T) {
 	if !strings.Contains(body, "Changes") || !strings.Contains(body, "changed.txt") || !strings.Contains(body, "Restore") {
 		t.Fatalf("diff/restore UI did not render: %s", body)
 	}
+	blocked := page.MustElement(`[data-receipt-tone="danger"]`)
+	if text := blocked.MustText(); !strings.Contains(text, "Blocked") {
+		t.Fatalf("blocked completion badge = %q, want Blocked", text)
+	}
+	if has, _, _ := page.Has(`[data-receipt-tone="success"]`); has {
+		t.Fatalf("a blocked completion rendered a success receipt: %s", page.MustEval(`() => document.body.innerText`).Str())
+	}
 	page.MustElementR("button", "Restore|복원").MustClick()
-	page.MustElement(`button[title="Theme"]`).MustClick()
+	page.MustElement(`button[aria-label="Toggle theme"], button[aria-label="테마 전환"]`).MustClick()
 	if got := page.MustEval(`() => document.documentElement.getAttribute('data-theme')`).Str(); got != "light" {
 		t.Fatalf("theme toggle = %q, want light", got)
 	}

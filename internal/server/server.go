@@ -1952,10 +1952,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, tracker.Compute(window))
 }
 
-func (d *Server) handleKairosGitStatus(w http.ResponseWriter, _ *http.Request) {
-	d.mu.RLock()
-	workDir := d.workDir
-	d.mu.RUnlock()
+func (d *Server) handleKairosGitStatus(w http.ResponseWriter, r *http.Request) {
+	// Git status runs commands in the requested directory, so it is scoped to
+	// the server default or a registered project like the file handlers.
+	workDir, err := d.requestProjectWorkspace(r, "")
+	if err != nil {
+		writeProjectWorkspaceScopeError(w, err)
+		return
+	}
 
 	status, err := kairos.CheckGitStatus(workDir)
 	if err != nil {

@@ -11,6 +11,7 @@
   --color-accent2: #4a6adf;
   --color-green: #34d399;
   --color-yellow: #fbbf24;
+  --color-warning: #fbbf24;
   --color-red: #f87171;
   --color-orange: #fb923c;
 
@@ -35,8 +36,13 @@
   --color-brand-700: #3454c5;
 }
 
+:root {
+  color-scheme: dark;
+}
+
 /* Light theme */
 [data-theme="light"] {
+  color-scheme: light;
   --color-bg: #f8f9fb;
   --color-surface: #ffffff;
   --color-surface2: #f0f1f4;
@@ -46,7 +52,9 @@
   --color-accent: #4a6adf;
   --color-accent2: #3454c5;
   --color-green: #059669;
-  --color-yellow: #d97706;
+  /* amber-800: ≥ 6:1 on #ffffff and #f0f1f4 for the small warning labels. */
+  --color-yellow: #92400e;
+  --color-warning: #92400e;
   --color-red: #dc2626;
   --color-orange: #ea580c;
 
@@ -77,6 +85,18 @@ body {
   color: var(--color-text);
   font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
   transition: background 0.3s, color 0.3s;
+}
+
+/* Honour the OS reduced-motion setting for every spinner, pulse and bounce. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 #root {

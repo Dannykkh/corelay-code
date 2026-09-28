@@ -72,10 +72,11 @@ func TestReadRecentEvidenceReceipts(t *testing.T) {
 			"internal/agent/evidence.go",
 		},
 		"verification": map[string]any{
-			"status": "passed",
-			"source": "auto-verify",
-			"gate":   "allow",
-			"mode":   "deep",
+			"status":        "passed",
+			"terminalState": "verified",
+			"source":        "auto-verify",
+			"gate":          "allow",
+			"mode":          "deep",
 		},
 	})
 	writeReceiptFile(t, filepath.Join(receiptDir, "team.json"), map[string]any{
@@ -87,9 +88,10 @@ func TestReadRecentEvidenceReceipts(t *testing.T) {
 		"model":         "fake-model",
 		"verifyCommand": "go test ./...",
 		"verification": map[string]any{
-			"status":  "failed",
-			"source":  "team-verify",
-			"summary": "tests failed",
+			"status":        "failed",
+			"terminalState": "blocked",
+			"source":        "team-verify",
+			"summary":       "tests failed",
 		},
 	})
 	writeReceiptFile(t, filepath.Join(receiptDir, "other.json"), map[string]any{
@@ -124,6 +126,10 @@ func TestReadRecentEvidenceReceipts(t *testing.T) {
 	}
 	if currentItems[1].Kind != "agent" || currentItems[1].Gate != "allow" || len(currentItems[1].EditedFiles) != 1 {
 		t.Fatalf("agent item not parsed: %+v", currentItems[1])
+	}
+	if currentItems[0].TerminalState != "blocked" || currentItems[1].TerminalState != "verified" || items[0].TerminalState != "" {
+		t.Fatalf("receipt terminal states not surfaced: team=%q agent=%q legacy=%q",
+			currentItems[0].TerminalState, currentItems[1].TerminalState, items[0].TerminalState)
 	}
 	if currentItems[1].Summary != "1 edited file(s), no successful verification evidence" ||
 		currentItems[1].EditedFileCount != 1 {

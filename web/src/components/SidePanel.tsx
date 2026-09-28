@@ -4,6 +4,7 @@ import { getLang } from '../lib/i18n';
 import { listSessions, type SessionSummary } from '../lib/sessions';
 import { showToast } from '../lib/toast';
 import { sameWorkspacePath } from '../lib/workspace';
+import { X } from 'lucide-react';
 
 // parentPath returns the parent of a filesystem path, handling Windows drive
 // roots correctly: `D:/git` -> `D:/`, NOT `D:` (which Windows treats as the
@@ -51,10 +52,11 @@ function FileTreeNode({ node, depth, onFileClick }: { node: TreeNode; depth: num
   }
 
   const ext = node.name.split('.').pop() || '';
+  // Theme tokens keep file-type hints readable in both light and dark themes.
   const extColors: Record<string, string> = {
-    go: 'text-blue-400', ts: 'text-blue-300', tsx: 'text-blue-300',
-    js: 'text-yellow-300', json: 'text-yellow-200', md: 'text-gray-400',
-    py: 'text-green-300', rs: 'text-orange-300', css: 'text-pink-300',
+    go: 'text-[var(--color-accent)]', ts: 'text-[var(--color-accent)]', tsx: 'text-[var(--color-accent)]',
+    js: 'text-[var(--color-warning)]', json: 'text-[var(--color-warning)]', md: 'text-[var(--color-text2)]',
+    py: 'text-[var(--color-green)]', rs: 'text-[var(--color-orange)]', css: 'text-[var(--color-red)]',
   };
 
   return (
@@ -76,6 +78,7 @@ function FileTreeNode({ node, depth, onFileClick }: { node: TreeNode; depth: num
 interface Props {
   visible: boolean;
   mode: 'files' | 'chat';
+  onModeChange?: (mode: 'files' | 'chat') => void;
   selectedWorkspace: string;
   onFileClick?: (path: string) => void;
   onSessionClick?: (id: string) => void;
@@ -106,7 +109,7 @@ function errorMessage(err: unknown): string | undefined {
   return err instanceof Error ? err.message : undefined;
 }
 
-export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSessionClick, onNewChat, onProjectSwitch }: Props) {
+export function SidePanel({ visible, mode, onModeChange, selectedWorkspace, onFileClick, onSessionClick, onNewChat, onProjectSwitch }: Props) {
   const [sessionSearch, setSessionSearch] = useState('');
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -236,7 +239,7 @@ export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSes
   if (!visible) return null;
 
   const projectTypes: Record<string, string> = {
-    go: '🔵', node: '🟢', python: '🐍', rust: '🦀', java: '☕', dotnet: '🟣',
+    go: 'GO', node: 'JS', python: 'PY', rust: 'RS', java: 'JV', dotnet: '.NET',
   };
 
   return (
@@ -281,10 +284,10 @@ export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSes
                 {sameWorkspacePath(p.path, selectedWorkspace) && <span className="text-[9px] text-[var(--color-accent)]">●</span>}
                 <button
                   onClick={(e) => removeProject(p.path, e)}
-                  className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] px-1"
+                  className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] px-1 flex items-center"
                   title={ko ? '제거' : 'Remove'}
                 >
-                  ✕
+                  <X className="w-3 h-3" />
                 </button>
               </div>
             ))}
@@ -351,6 +354,32 @@ export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSes
         )}
       </div>
 
+      {/* SidePanel Mode Tabs: Sessions vs Files */}
+      <div className="flex border-b border-[var(--color-border)] bg-[var(--color-surface2)]/40 p-1 gap-1">
+        <button
+          type="button"
+          onClick={() => onModeChange?.('chat')}
+          className={`flex-1 py-1 rounded text-xs font-medium text-center transition-colors ${
+            mode === 'chat'
+              ? 'bg-[var(--color-surface)] text-[var(--color-text)] shadow-sm font-semibold'
+              : 'text-[var(--color-text2)] hover:text-[var(--color-text)]'
+          }`}
+        >
+          {ko ? '대화 목록' : 'Sessions'}
+        </button>
+        <button
+          type="button"
+          onClick={() => onModeChange?.('files')}
+          className={`flex-1 py-1 rounded text-xs font-medium text-center transition-colors ${
+            mode === 'files'
+              ? 'bg-[var(--color-surface)] text-[var(--color-text)] shadow-sm font-semibold'
+              : 'text-[var(--color-text2)] hover:text-[var(--color-text)]'
+          }`}
+        >
+          {ko ? '파일 트리' : 'Files'}
+        </button>
+      </div>
+
       {mode === 'files' ? (
         /* File Tree */
         <div className="flex-1 overflow-y-auto">
@@ -406,10 +435,10 @@ export function SidePanel({ visible, mode, selectedWorkspace, onFileClick, onSes
                         await fetchJSON(`/api/sessions/${s.id}`, { method: 'DELETE' });
                         loadWorkspaceData(selectedWorkspace);
                       }}
-                      className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] opacity-0 group-hover:opacity-100 transition-opacity ml-1 shrink-0"
+                      className="text-[10px] text-[var(--color-text2)] hover:text-[var(--color-red)] opacity-0 group-hover:opacity-100 transition-opacity ml-1 shrink-0 flex items-center"
                       title={ko ? '삭제' : 'Delete'}
                     >
-                      ✕
+                      <X className="w-3 h-3" />
                     </button>
                   </div>
                   <div className="text-[10px] text-[var(--color-text2)] truncate">{s.preview}</div>

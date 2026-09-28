@@ -1,23 +1,6 @@
 export type Lang = 'ko' | 'en';
 
 const translations = {
-  // ── Sidebar ──
-  'nav.chat': { ko: '채팅', en: 'Chat' },
-  'nav.settings': { ko: '설정', en: 'Settings' },
-  'nav.routes': { ko: '라우팅 규칙', en: 'Routes' },
-  'nav.costs': { ko: '활동', en: 'Activity' },
-  'nav.kairos': { ko: 'KAIROS', en: 'KAIROS' },
-  'nav.workspace': { ko: '워크스페이스', en: 'Workspace' },
-  'nav.explorer': { ko: '파일 탐색기', en: 'Explorer' },
-  'nav.memory': { ko: '메모리', en: 'Memory' },
-  'nav.team': { ko: '팀', en: 'Team' },
-
-  // ── Sidebar status ──
-  'status.online': { ko: '온라인', en: 'Online' },
-  'status.offline': { ko: '오프라인', en: 'Offline' },
-  'status.routerOn': { ko: '라우터 ON', en: 'Router ON' },
-  'status.singleModel': { ko: '단일 모델', en: 'Single model' },
-
   // ── Chat ──
   'chat.title': { ko: '코딩 에이전트', en: 'Coding Agent' },
   'chat.turns': { ko: '턴', en: 'turns' },

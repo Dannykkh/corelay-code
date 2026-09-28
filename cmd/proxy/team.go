@@ -124,6 +124,9 @@ func runTeamRun(args []string) {
 		fmt.Fprintf(os.Stderr, "team: invalid execution mode: %v\n", err)
 		os.Exit(2)
 	}
+	// The CLI Team runner has no approval requester; say so up front instead
+	// of letting approval-gated tools fail one by one.
+	fmt.Fprintln(os.Stderr, "note: CLI team runs have no approval prompt; tools that need approval will be denied — use the web Team page or a pre-approved execution mode")
 	runner := agent.NewTeam(provider, *model, *workDir, *baseDir, agent.TeamConfig{
 		Name:            plan.Name,
 		VerifyCommand:   plan.VerifyCommand,

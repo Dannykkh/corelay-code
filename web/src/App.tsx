@@ -1,13 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
+import { ChevronDown, ChevronUp, CircleDot, Circle } from 'lucide-react';
 import { ActivityBar } from './components/ActivityBar';
 import { SidePanel } from './components/SidePanel';
 import { Toast } from './components/Toast';
 import { ChatPage } from './pages/Chat';
-import { RoutesPage } from './pages/Routes';
-import { CostsPage } from './pages/Costs';
-import { KairosPage } from './pages/Kairos';
+import { HistoryPage, type HistoryTab } from './pages/History';
 import { SettingsPage } from './pages/RuntimeSettings';
-import { MemoryPage } from './pages/Memory';
 import { TeamPage } from './pages/Team';
 import { fetchJSON, putJSON } from './lib/api';
 import { fileResponseContent, isEditableFileType, readWorkspaceFile, type FileReadKind } from './lib/files';
@@ -64,6 +62,11 @@ function loadTheme(): Theme {
 
 function App() {
   const [page, setPage] = useState('chat');
+  // A new key per history request remounts HistoryPage on the requested tab.
+  const [historyRequest, setHistoryRequest] = useState<{ tab: HistoryTab; key: number }>({ tab: 'costs', key: 0 });
+  // Chat and Team stay mounted while hidden, so a pending decision is surfaced here.
+  const [chatApprovalPending, setChatApprovalPending] = useState(false);
+  const [teamApprovalPending, setTeamApprovalPending] = useState(false);
   const [theme, setTheme] = useState<Theme>(loadTheme);
   const [status, setStatus] = useState<AppConfig | null>(null);
   const [loadSessionId, setLoadSessionId] = useState<string | null>(null);
@@ -145,9 +148,18 @@ function App() {
       {/* Activity Bar (always visible) */}
       <ActivityBar
         active={page}
-        onNavigate={setPage}
+        onNavigate={(id) => {
+          // The workspace badge can come from a Team approval; land where the decision is.
+          if (id === 'chat' && teamApprovalPending && !chatApprovalPending) {
+            setPage('team');
+            return;
+          }
+          if (id === 'history') setHistoryRequest((prev) => ({ tab: 'costs', key: prev.key + 1 }));
+          setPage(id);
+        }}
         onThemeToggle={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
         theme={theme}
+        attention={{ chat: chatApprovalPending || teamApprovalPending }}
       />
 
       {/* Side Panel (for chat + files) */}
@@ -155,6 +167,7 @@ function App() {
         <SidePanel
           visible={true}
           mode={sidePanelMode as 'files' | 'chat'}
+          onModeChange={(m) => setPage(m)}
           selectedWorkspace={selectedWorkspace}
           onNewChat={() => setLoadSessionId('__new__')}
           onSessionClick={(id) => setLoadSessionId(id)}
@@ -181,75 +194,92 @@ function App() {
 
       {/* Main Content */}
       <main className="flex-1 min-w-0 h-[calc(100vh-24px)] overflow-hidden flex">
-        {page === 'chat' && <ChatPage selectedWorkspace={selectedWorkspace} loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />}
-        {page === 'files' && (
-          viewingFile ? (
-            <div className="flex flex-col h-full w-full">
-              <div className="px-4 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-surface)] flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="text-xs font-mono text-[var(--color-accent)]">{viewingFile.path}</div>
-                  {editMode && <span className="text-[9px] bg-yellow-500/20 text-yellow-400 px-1.5 py-0.5 rounded">EDITING</span>}
-                  {!editMode && <span className="text-[9px] text-[var(--color-text2)]">{viewingFile.type}{viewingFile.size > 0 ? ` · ${viewingFile.size} B` : ''}</span>}
-                </div>
-                <div className="flex items-center gap-2">
-                  {editMode ? (
-                    <>
-                      <button
-                        onClick={async () => {
-                          await fetch('/api/file/write', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ path: viewingFile.path, content: editContent, workDir: viewingFile.workspace }),
-                          });
-                          setViewingFile({ ...viewingFile, content: editContent });
-                          setEditMode(false);
-                        }}
-                        className="text-xs px-2 py-0.5 bg-[var(--color-green)] text-white rounded hover:opacity-80"
-                      >Save</button>
-                      <button onClick={() => { setEditMode(false); setEditContent(''); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Cancel</button>
-                    </>
-                  ) : isEditableFileType(viewingFile.type) ? (
-                    <button
-                      onClick={() => { setEditMode(true); setEditContent(viewingFile.content); }}
-                      className="text-xs px-2 py-0.5 bg-[var(--color-surface2)] text-[var(--color-text)] rounded hover:bg-[var(--color-border)]"
-                    >Edit</button>
-                  ) : null}
-                  <button onClick={() => { setViewingFile(null); setEditMode(false); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Close</button>
-                </div>
+        <div className={(page === 'chat' || (page === 'files' && !viewingFile)) ? 'h-full flex-1 flex flex-col min-w-0' : 'hidden'}>
+          <ChatPage
+            selectedWorkspace={selectedWorkspace}
+            loadSessionId={loadSessionId}
+            onSessionLoaded={() => setLoadSessionId(null)}
+            onApprovalPendingChange={setChatApprovalPending}
+            onWorkspaceModeChange={(mode) => setPage(mode === 'team' ? 'team' : 'chat')}
+            workspaceModeAttention={{ team: teamApprovalPending }}
+            onOpenHistory={(tab = 'costs') => {
+              setHistoryRequest((prev) => ({ tab, key: prev.key + 1 }));
+              setPage('history');
+            }}
+          />
+        </div>
+
+        {page === 'files' && viewingFile && (
+          <div className="flex flex-col h-full w-full">
+            <div className="px-4 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-surface)] flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="text-xs font-mono text-[var(--color-accent)]">{viewingFile.path}</div>
+                {editMode && <span className="text-[9px] border border-[var(--color-warning)]/50 text-[var(--color-warning)] px-1.5 py-0.5 rounded">EDITING</span>}
+                {!editMode && <span className="text-[9px] text-[var(--color-text2)]">{viewingFile.type}{viewingFile.size > 0 ? ` · ${viewingFile.size} B` : ''}</span>}
               </div>
-              {editMode ? (
-                <textarea
-                  value={editContent}
-                  onChange={(e) => setEditContent(e.target.value)}
-                  className="flex-1 p-4 text-xs font-mono text-[var(--color-text)] bg-[var(--color-bg)] leading-relaxed resize-none focus:outline-none"
-                  spellCheck={false}
-                />
-              ) : (
-                <pre className="flex-1 overflow-auto p-4 text-xs font-mono text-[var(--color-text)] bg-[var(--color-bg)] leading-relaxed whitespace-pre-wrap">{viewingFile.content}</pre>
-              )}
+              <div className="flex items-center gap-2">
+                {editMode ? (
+                  <>
+                    <button
+                      onClick={async () => {
+                        await fetch('/api/file/write', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ path: viewingFile.path, content: editContent, workDir: viewingFile.workspace }),
+                        });
+                        setViewingFile({ ...viewingFile, content: editContent });
+                        setEditMode(false);
+                      }}
+                      className="text-xs px-2 py-0.5 border border-[var(--color-green)] text-[var(--color-text)] rounded hover:bg-[var(--color-green)]/10"
+                    >Save</button>
+                    <button onClick={() => { setEditMode(false); setEditContent(''); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Cancel</button>
+                  </>
+                ) : isEditableFileType(viewingFile.type) ? (
+                  <button
+                    onClick={() => { setEditMode(true); setEditContent(viewingFile.content); }}
+                    className="text-xs px-2 py-0.5 bg-[var(--color-surface2)] text-[var(--color-text)] rounded hover:bg-[var(--color-border)]"
+                  >Edit</button>
+                ) : null}
+                <button onClick={() => { setViewingFile(null); setEditMode(false); }} className="text-xs text-[var(--color-text2)] hover:text-[var(--color-text)]">Close</button>
+              </div>
             </div>
+            {editMode ? (
+              <textarea
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                className="flex-1 p-4 text-xs font-mono text-[var(--color-text)] bg-[var(--color-bg)] leading-relaxed resize-none focus:outline-none"
+                spellCheck={false}
+              />
             ) : (
-            <ChatPage selectedWorkspace={selectedWorkspace} loadSessionId={loadSessionId} onSessionLoaded={() => setLoadSessionId(null)} />
-          )
-        )}
-        {page === 'routes' && <RoutesPage />}
-        {page === 'costs' && <CostsPage />}
-        {page === 'kairos' && <KairosPage />}
-        {page === 'settings' && (
-          <div className="overflow-y-auto h-full w-full">
-            <SettingsPage />
+              <pre className="flex-1 overflow-auto p-4 text-xs font-mono text-[var(--color-text)] bg-[var(--color-bg)] leading-relaxed whitespace-pre-wrap">{viewingFile.content}</pre>
+            )}
           </div>
         )}
-        {page === 'memory' && (
-          <div className="overflow-y-auto h-full w-full">
-            <MemoryPage />
+        {(page === 'history' || page === 'costs' || page === 'kairos') && (
+          <div className="h-full w-full overflow-hidden flex flex-col">
+            <HistoryPage
+              key={historyRequest.key}
+              initialTab={page === 'kairos' ? 'notifications' : historyRequest.tab}
+            />
           </div>
         )}
-        {page === 'team' && (
+        {(page === 'settings' || page === 'routes' || page === 'memory') && (
           <div className="overflow-y-auto h-full w-full">
-            <TeamPage />
+            <SettingsPage
+              key={page}
+              initialTab={page === 'memory' ? 'memory' : page === 'routes' ? 'routing' : 'quickstart'}
+            />
           </div>
         )}
+        {/* Kept mounted like ChatPage: leaving the page must not orphan a live run. */}
+        <div className={page === 'team' ? 'overflow-y-auto h-full w-full' : 'hidden'}>
+          <TeamPage
+            selectedWorkspace={selectedWorkspace}
+            onApprovalPendingChange={setTeamApprovalPending}
+            onWorkspaceModeChange={(mode) => setPage(mode === 'team' ? 'team' : 'chat')}
+            workspaceModeAttention={{ single: chatApprovalPending }}
+          />
+        </div>
       </main>
 
       {/* Status Bar */}
@@ -261,7 +291,7 @@ function App() {
           >
             <div className={`w-1.5 h-1.5 rounded-full ${status ? 'bg-[var(--color-green)]' : 'bg-[var(--color-red)]'}`} />
             {status ? `${status.provider} / ${status.model}` : 'Offline'}
-            <span className="text-[8px]">▾</span>
+            <ChevronDown className="w-2.5 h-2.5 text-[var(--color-text2)] ml-0.5" />
           </button>
           {showModelPicker && (
             <div className="absolute bottom-6 left-0 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-lg min-w-56 max-h-60 overflow-y-auto z-50">
@@ -301,7 +331,7 @@ function App() {
             className="flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-[var(--color-surface2)] transition-colors"
           >
             <span>{activeProject ? `${activeProject.name}` : 'No Project'}</span>
-            <span>{showProjectPicker ? '▴' : '▾'}</span>
+            {showProjectPicker ? <ChevronUp className="w-2.5 h-2.5" /> : <ChevronDown className="w-2.5 h-2.5" />}
           </button>
           {showProjectPicker && projects.length > 0 && (
             <div className="absolute bottom-6 left-0 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-lg min-w-48 max-h-60 overflow-y-auto z-50">
@@ -311,7 +341,11 @@ function App() {
                   onClick={() => switchProject(p.path)}
                   className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-[var(--color-surface2)] transition-colors flex items-center gap-2 ${sameWorkspacePath(p.path, selectedWorkspace) ? 'text-[var(--color-accent)]' : ''}`}
                 >
-                  <span>{sameWorkspacePath(p.path, selectedWorkspace) ? '●' : '○'}</span>
+                  {sameWorkspacePath(p.path, selectedWorkspace) ? (
+                    <CircleDot className="w-3 h-3 text-[var(--color-accent)] shrink-0" />
+                  ) : (
+                    <Circle className="w-3 h-3 text-[var(--color-text2)] opacity-40 shrink-0" />
+                  )}
                   <span className="truncate">{p.name}</span>
                   <span className="text-[9px] text-[var(--color-text2)] ml-auto">{p.type}</span>
                 </button>
