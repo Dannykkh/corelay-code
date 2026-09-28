@@ -128,35 +128,56 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 	if err := page.WaitLoad(); err != nil {
 		t.Fatal(err)
 	}
-	page = page.Timeout(20 * time.Second)
+	// Each step gets its own deadline; one page-wide timeout would let slow setup
+	// on a busy runner eat the time budget of later waits.
+	step := func() *rod.Page { return page.Timeout(20 * time.Second) }
 	bodyText := func() string { return page.MustEval(`() => document.body.innerText`).Str() }
+	providerCalls := func() int {
+		provider.mu.Lock()
+		defer provider.mu.Unlock()
+		return provider.calls
+	}
+	// waitFor reports what the page showed instead of a bare deadline panic, and
+	// the provider call count tells a UI-binding problem (1 call, run waiting)
+	// apart from a tool call that never needed approval (2 calls, run finished).
+	waitFor := func(selector string) *rod.Element {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if has, element, _ := page.Has(selector); has {
+				return element
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("%s did not appear (provider calls=%d); page text:\n%s", selector, providerCalls(), bodyText())
+		return nil
+	}
 
-	page.MustElement("textarea").MustInput("run the probe tool")
-	page.MustElementR("button", "전송|Send").MustClick()
+	step().MustElement("textarea").MustInput("run the probe tool")
+	step().MustElementR("button", "전송|Send").MustClick()
 
 	// The approval is linked to its step card by toolCallId and the card stays open.
-	card := page.MustElement(`[data-pending-approval="true"]`)
+	card := waitFor(`[data-pending-approval="true"]`)
 	cardText := card.MustText()
 	for _, want := range []string{"Bash", "Allow once", "Deny"} {
 		if !strings.Contains(cardText, want) {
 			t.Fatalf("pending approval card missing %q: %s", want, cardText)
 		}
 	}
-	page.MustElementR("button", "승인 필요")
+	step().MustElementR("button", "승인 필요")
 
 	// A pending decision is badged on the workspace while another page is shown.
-	page.MustElement(`button[aria-label^="Settings"], button[aria-label^="설정"]`).MustClick()
-	page.MustElement(`[data-approval-badge="chat"]`)
-	page.MustElementR("button", "^Server Memory$").MustClick()
-	page.MustElementR("h1", "^Memory$")
-	page.MustElementR("button", "Run Dream Cycle")
-	page.MustElement(`button[aria-label^="Workspace"], button[aria-label^="작업 공간"]`).MustClick()
+	step().MustElement(`button[aria-label^="Settings"], button[aria-label^="설정"]`).MustClick()
+	step().MustElement(`[data-approval-badge="chat"]`)
+	step().MustElementR("button", "^Server Memory$").MustClick()
+	step().MustElementR("h1", "^Memory$")
+	step().MustElementR("button", "Run Dream Cycle")
+	step().MustElement(`button[aria-label^="Workspace"], button[aria-label^="작업 공간"]`).MustClick()
 
-	card = page.MustElement(`[data-pending-approval="true"]`)
+	card = waitFor(`[data-pending-approval="true"]`)
 	card.MustElementR("button", "^Deny$").MustClick()
 
 	var body string
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 600; i++ {
 		body = bodyText()
 		if strings.Contains(body, "APPROVAL_FLOW_DONE") {
 			break
@@ -178,7 +199,7 @@ func TestOverhaulBrowserApprovalFlowAndDestinations(t *testing.T) {
 		t.Fatal("approval badge remained after the decision")
 	}
 	// No verification ran, so the receipt must not look like a success.
-	tone := page.MustElement(`[data-receipt-tone]`).MustAttribute("data-receipt-tone")
+	tone := step().MustElement(`[data-receipt-tone]`).MustAttribute("data-receipt-tone")
 	if tone == nil || *tone == "success" {
 		t.Fatalf("receipt tone for an unverified run = %v, body: %s", tone, body)
 	}
